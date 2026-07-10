@@ -100,6 +100,34 @@ make test-unit
 make test-e2e
 ```
 
+## Sysbench compatibility check
+
+Run the PostgreSQL `oltp_read_write` compatibility check against the Docker
+Burrows with:
+
+```bash
+make test-sysbench
+```
+
+The command starts or reuses the Docker Burrows, launches an isolated
+Hamstergres Proxy on random local ports, and runs locally installed sysbench
+1.0.20 through it for schema `prepare`, a two-thread three-second read/write
+workload, and `cleanup`. Install the required version on macOS with:
+
+```bash
+brew install sysbench
+```
+
+The test validates the installed sysbench version, then checks the Proxy's
+process-owned status data to ensure every recorded sysbench query was scattered
+to both Burrows, with both `SELECT` and `UPDATE` statements present.
+
+This is intentionally a known-failing compatibility test today: sysbench uses
+the PostgreSQL extended-query protocol, while the current Proxy supports only
+simple-query messages. The test is opt-in so `make test` stays green; it
+becomes a passing gate as the outstanding sysbench issues add extended-query,
+session, write-result, schema-preparation, and fan-out-contract support.
+
 ## Run the gateway
 
 Start the Burrows first, then run the Proxy in a separate terminal:
