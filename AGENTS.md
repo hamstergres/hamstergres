@@ -1,0 +1,55 @@
+# Hamstergres contributor conventions
+
+## Product language
+
+Hamstergres is the overall PostgreSQL sharding system: **Tiny paws, many
+shards.** Use the agreed component names consistently in user-facing text,
+configuration examples, service names, logs, status pages, and new binaries.
+
+- **Hamstergres Proxy** (`hamstergres-proxy`) accepts PostgreSQL clients and
+  routes SQL.
+- **Hamstergres Keeper** (`hamstergres-keeper`) will coordinate topology,
+  health, reconciliation, and failover awareness.
+- **Hamstergres Nest** (`hamstergres-nest`) is the control-plane metadata area;
+  it is never a data shard.
+- **Hamstergres Migrations** (`hamstergres-migrations`) owns schema migration
+  state and execution.
+- **Hamstergres Mover** (`hamstergres-mover`) will perform resharding and data
+  movement.
+- A **Burrow** is one physical PostgreSQL shard or shard cluster. **Burrows**
+  are the whole data fleet. Name them `burrow-01`, `burrow-02`, and so on.
+- A **Tunnel** is a logical routing path from a Proxy to a Burrow.
+- Keep the established technical term **vshard** for virtual shards, named
+  `vshard-00001`, `vshard-00002`, and so on.
+
+The concise model is: **Proxy routes, Keeper coordinates, Nest remembers,
+Migrations changes schemas, Mover moves data, and Burrows store the data.**
+Read [`docs/architecture.md`](docs/architecture.md) before introducing a new
+component or changing topology behavior.
+
+## Code and interface conventions
+
+- Use the product names in operator-facing interfaces. The current Compose
+  services and configuration IDs are `burrow-01` and `burrow-02`; status pages
+  should say “Burrows.”
+- Standard technical terms such as `shard`, `shard key`, and `vshard` remain
+  appropriate inside generic routing and PostgreSQL implementation code. Do not
+  call Nest a shard or Burrow a metadata store.
+- Keep `hamstergres-proxy` PostgreSQL-compatible. The current PoC supports only
+  simple-query protocol and deliberately scatters every query; document any
+  change to that contract.
+- Keep statistics process-owned. Status HTML, JSON, and CLI must consume the
+  same in-process collector, never invoke `psql` or parse external logs.
+- Query summaries show normalized SQL structure and a stable fingerprint; they
+  replace string and numeric literals with `?`.
+
+## Testing
+
+- Run `go test ./...` for every change. It includes Docker-backed end-to-end
+  coverage when Docker is available.
+- Use `make test-unit` for quick unit checks and `make test-e2e` for the
+  compiled gateway, PostgreSQL frontend, Docker Burrows, status UI/API, and CLI.
+- Keep end-to-end tests read-only against Burrows and run the gateway on random
+  local ports so they can coexist with a developer's gateway.
+- Run `go test -race ./...` for changes touching concurrency, sessions,
+  statistics, pooling, or routing.

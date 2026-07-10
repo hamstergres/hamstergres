@@ -1,0 +1,13 @@
+-- This schema is deliberately installed on every physical Burrow.
+-- Shard placement is enforced by the future Hamstergres proxy, not by PostgreSQL.
+
+CREATE TABLE accounts (
+    tenant_id BIGINT NOT NULL,
+    account_id BIGINT NOT NULL,
+    balance NUMERIC(18, 2) NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, account_id),
+    CHECK (balance >= 0)
+);
+
+CREATE INDEX accounts_tenant_id_idx ON accounts (tenant_id);

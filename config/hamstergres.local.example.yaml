@@ -1,0 +1,13 @@
+# Host-run gateway configuration for the Docker Compose development Burrows.
+listen:
+  address: "127.0.0.1:6432"
+
+status:
+  address: "127.0.0.1:8080"
+
+sharding:
+  physical_shards:
+    burrow-01:
+      dsn: "postgres://hamster:hamster@localhost:5541/hamstergres?sslmode=disable"
+    burrow-02:
+      dsn: "postgres://hamster:hamster@localhost:5542/hamstergres?sslmode=disable"

@@ -1,0 +1,45 @@
+# This is intentionally static for the first proof of concept.  A future
+# control plane will replace the virtual-shard map with dynamic metadata.
+listen:
+  address: "0.0.0.0:6432"
+
+# The operator status page and JSON status API. Keep this on a private network
+# or behind your usual access control in any non-development deployment.
+status:
+  address: "127.0.0.1:8080"
+
+sharding:
+  virtual_shards: 16
+
+  tables:
+    accounts:
+      shard_key: tenant_id
+
+  # A physical_shard is called a Burrow in Hamstergres operator language.
+  physical_shards:
+    burrow-01:
+      # Docker-network address. Use localhost:5541 from the host instead.
+      dsn: "postgres://hamster:hamster@burrow-01:5432/hamstergres?sslmode=disable"
+    burrow-02:
+      # Docker-network address. Use localhost:5542 from the host instead.
+      dsn: "postgres://hamster:hamster@burrow-02:5432/hamstergres?sslmode=disable"
+
+  # tenant_id % virtual_shards selects an entry in this map. This transparent,
+  # deliberately simple algorithm is for the PoC only.
+  virtual_shard_map:
+    0: burrow-01
+    1: burrow-01
+    2: burrow-01
+    3: burrow-01
+    4: burrow-01
+    5: burrow-01
+    6: burrow-01
+    7: burrow-01
+    8: burrow-02
+    9: burrow-02
+    10: burrow-02
+    11: burrow-02
+    12: burrow-02
+    13: burrow-02
+    14: burrow-02
+    15: burrow-02
