@@ -89,6 +89,69 @@ func TestGatewayEndToEnd(t *testing.T) {
 	}
 }
 
+const sysbenchVersion = "1.0.20"
+
+// TestSysbenchReadWriteEndToEnd is an opt-in compatibility test. Sysbench uses
+// the PostgreSQL extended-query protocol, which the current Proxy deliberately
+// does not implement. Keep the test failing when explicitly requested so the
+// remaining sysbench compatibility work has one repeatable acceptance check,
+// while the default Go test suite remains usable during development.
+func TestSysbenchReadWriteEndToEnd(t *testing.T) {
+	if os.Getenv("HAMSTERGRES_SYSBENCH_E2E") != "1" {
+		t.Skip("set HAMSTERGRES_SYSBENCH_E2E=1 to run the local sysbench compatibility test")
+	}
+
+	repoRoot := repositoryRoot(t)
+	ensureDockerBurrows(t, repoRoot)
+	sysbench := ensureSysbench(t)
+
+	frontendAddress := availableAddress(t)
+	statusAddress := availableAddress(t)
+	binary := buildGateway(t, repoRoot)
+	configPath := writeGatewayConfig(t, frontendAddress, statusAddress)
+	logs := startGateway(t, binary, configPath)
+	statusURL := "http://" + statusAddress
+	waitForHealthyGateway(t, statusURL, logs)
+
+	cleanupNeeded := true
+	cleanup := func() error {
+		output, err := runSysbench(sysbench, frontendAddress, "cleanup")
+		if err != nil {
+			return fmt.Errorf("sysbench cleanup: %w\n%s", err, output)
+		}
+		cleanupNeeded = false
+		return nil
+	}
+	t.Cleanup(func() {
+		if cleanupNeeded {
+			if err := cleanup(); err != nil {
+				t.Log(err)
+			}
+		}
+	})
+
+	if output, err := runSysbench(sysbench, frontendAddress, "prepare"); err != nil {
+		t.Fatalf("sysbench prepare: %v\n%s", err, output)
+	}
+	if output, err := runSysbench(sysbench, frontendAddress, "run"); err != nil {
+		t.Fatalf("sysbench oltp_read_write workload: %v\n%s", err, output)
+	}
+	if err := cleanup(); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot := gatewaySnapshot(t, statusURL+"/api/v1/status")
+	if snapshot.QueryMetrics.Total.Queries == 0 || snapshot.QueryMetrics.Total.FailedQueries != 0 {
+		t.Fatalf("sysbench query counters = %#v, want successful queries", snapshot.QueryMetrics.Total)
+	}
+	if snapshot.QueryMetrics.Total.ScatteredQueries != snapshot.QueryMetrics.Total.Queries || snapshot.QueryMetrics.Total.SingleShardQueries != 0 {
+		t.Fatalf("sysbench routing counters = %#v, want every query scattered", snapshot.QueryMetrics.Total)
+	}
+	assertShardExecutions(t, snapshot.QueryMetrics.Total, snapshot.QueryMetrics.ShardExecutions, snapshot.QueryMetrics.Total.Queries)
+	assertStatement(t, snapshot.QueryMetrics.QuerySummaries, "SELECT")
+	assertStatement(t, snapshot.QueryMetrics.QuerySummaries, "UPDATE")
+}
+
 func repositoryRoot(t *testing.T) string {
 	t.Helper()
 	workingDirectory, err := os.Getwd()
@@ -263,4 +326,58 @@ func assertSummary(t *testing.T, summaries []statistics.QuerySummary, shape stri
 		}
 	}
 	t.Fatalf("query shape %q was not summarized: %#v", shape, summaries)
+}
+
+func assertStatement(t *testing.T, summaries []statistics.QuerySummary, statement string) {
+	t.Helper()
+	for _, summary := range summaries {
+		if summary.Statement == statement && summary.Statistics.Queries > 0 {
+			return
+		}
+	}
+	t.Fatalf("%s was not recorded in query summaries: %#v", statement, summaries)
+}
+
+func ensureSysbench(t *testing.T) string {
+	t.Helper()
+	sysbench, err := exec.LookPath("sysbench")
+	if err != nil {
+		t.Fatalf("sysbench %s is required; install it with `brew install sysbench`", sysbenchVersion)
+	}
+	output, err := exec.Command(sysbench, "--version").CombinedOutput()
+	if err != nil {
+		t.Fatalf("read sysbench version: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "sysbench "+sysbenchVersion) {
+		t.Fatalf("sysbench version = %q, want sysbench %s", strings.TrimSpace(string(output)), sysbenchVersion)
+	}
+	return sysbench
+}
+
+func runSysbench(sysbench, frontendAddress, action string) (string, error) {
+	_, port, err := net.SplitHostPort(frontendAddress)
+	if err != nil {
+		return "", err
+	}
+	context, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	command := exec.CommandContext(context, sysbench,
+		"--db-driver=pgsql",
+		"--pgsql-host=127.0.0.1",
+		"--pgsql-port="+port,
+		"--pgsql-user=hamster",
+		"--pgsql-password=hamster",
+		"--pgsql-db=hamstergres",
+		"--tables=2",
+		"--table-size=10",
+		"--threads=2",
+		"--time=3",
+		"--events=0",
+		"--report-interval=0",
+		"--rand-seed=1",
+		"oltp_read_write",
+		action,
+	)
+	output, err := command.CombinedOutput()
+	return string(output), err
 }
