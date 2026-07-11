@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/jruszo/hamstergres/internal/statistics"
 	"github.com/jruszo/hamstergres/internal/status"
@@ -50,7 +51,7 @@ func TestGatewayEndToEnd(t *testing.T) {
 			t.Fatalf("merged values = %#v, want [1 1] from both Burrows", values)
 		}
 	})
-	queryGateway(t, frontendAddress, "SELECT * FROM accounts WHERE tenant_id = 1", func(rows pgx.Rows) {
+	queryGateway(t, frontendAddress, "SELECT * FROM accounts WHERE tenant_id = 1 AND account_id = 1", func(rows pgx.Rows) {
 		for rows.Next() {
 			// The local data set may be empty or pre-existing; successful protocol
 			// execution and the recorded normalized shape are what this checks.
@@ -64,15 +65,15 @@ func TestGatewayEndToEnd(t *testing.T) {
 	if snapshot.Queries.Queries != 2 || snapshot.Queries.FailedQueries != 0 {
 		t.Fatalf("query counters = %#v, want two successful queries", snapshot.Queries)
 	}
-	if snapshot.QueryMetrics.Total.ScatteredQueries != 2 || snapshot.QueryMetrics.Total.SingleShardQueries != 0 {
-		t.Fatalf("routing counters = %#v, want two scattered queries", snapshot.QueryMetrics.Total)
+	if snapshot.QueryMetrics.Total.ScatteredQueries != 1 || snapshot.QueryMetrics.Total.SingleShardQueries != 1 {
+		t.Fatalf("routing counters = %#v, want one scattered and one single-shard query", snapshot.QueryMetrics.Total)
 	}
-	assertShardExecutions(t, snapshot.QueryMetrics.Total, snapshot.QueryMetrics.ShardExecutions, 2)
+	assertTotalShardExecutions(t, snapshot.QueryMetrics.ShardExecutions, 3)
 	assertSummary(t, snapshot.QueryMetrics.QuerySummaries, "SELECT ? AS value")
-	assertSummary(t, snapshot.QueryMetrics.QuerySummaries, "SELECT * FROM accounts WHERE tenant_id = ?")
+	assertSummary(t, snapshot.QueryMetrics.QuerySummaries, "SELECT * FROM accounts WHERE tenant_id = ? AND account_id = ?")
 
 	page := getBody(t, statusURL+"/")
-	if !strings.Contains(page, "SELECT * FROM accounts WHERE tenant_id = ?") {
+	if !strings.Contains(page, "SELECT * FROM accounts WHERE tenant_id = ? AND account_id = ?") {
 		t.Fatalf("status page did not render the parameterized query shape:\n%s", page)
 	}
 	if !strings.Contains(page, statistics.Fingerprint("SELECT ? AS value")) {
@@ -84,18 +85,108 @@ func TestGatewayEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("status CLI failed: %v\n%s", err, output)
 	}
-	if !strings.Contains(string(output), "Routing: 2 scattered / 0 single-shard") || !strings.Contains(string(output), statistics.Fingerprint("SELECT * FROM accounts WHERE tenant_id = ?")) {
+	if !strings.Contains(string(output), "Routing: 1 scattered / 1 single-shard") || !strings.Contains(string(output), statistics.Fingerprint("SELECT * FROM accounts WHERE tenant_id = ? AND account_id = ?")) {
 		t.Fatalf("status CLI output did not contain routing and fingerprint data:\n%s", output)
 	}
 }
 
+func TestExtendedQueryEndToEnd(t *testing.T) {
+	repoRoot := repositoryRoot(t)
+	ensureDockerBurrows(t, repoRoot)
+
+	frontendAddress := availableAddress(t)
+	statusAddress := availableAddress(t)
+	binary := buildGateway(t, repoRoot)
+	configPath := writeGatewayConfig(t, frontendAddress, statusAddress)
+	logs := startGateway(t, binary, configPath)
+	statusURL := "http://" + statusAddress
+	waitForHealthyGateway(t, statusURL, logs)
+
+	config, err := pgx.ParseConfig("postgres://any-user@" + frontendAddress + "/any-database?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection, err := pgx.ConnectConfig(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close(context.Background())
+
+	queryContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rows, err := connection.Query(queryContext, "SELECT $1::int4 AS value", int32(7))
+	if err != nil {
+		t.Fatalf("extended query: %v\ngateway logs:\n%s", err, logs.String())
+	}
+	defer rows.Close()
+	values := make([]int32, 0, 2)
+	for rows.Next() {
+		var value int32
+		if err := rows.Scan(&value); err != nil {
+			t.Fatal(err)
+		}
+		values = append(values, value)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(values) != 2 || values[0] != 7 || values[1] != 7 {
+		t.Fatalf("extended-query values = %#v, want [7 7] from both Burrows", values)
+	}
+
+	snapshot := gatewaySnapshot(t, statusURL+"/api/v1/status")
+	if snapshot.QueryMetrics.Total.Queries != 1 || snapshot.QueryMetrics.Total.FailedQueries != 0 {
+		t.Fatalf("extended-query counters = %#v, want one successful query", snapshot.QueryMetrics.Total)
+	}
+	assertShardExecutions(t, snapshot.QueryMetrics.Total, snapshot.QueryMetrics.ShardExecutions, 1)
+	assertSummary(t, snapshot.QueryMetrics.QuerySummaries, "SELECT $?::int4 AS value")
+}
+
+func TestExtendedPreparedStatementLifecycleEndToEnd(t *testing.T) {
+	repoRoot := repositoryRoot(t)
+	ensureDockerBurrows(t, repoRoot)
+
+	frontendAddress := availableAddress(t)
+	statusAddress := availableAddress(t)
+	binary := buildGateway(t, repoRoot)
+	configPath := writeGatewayConfig(t, frontendAddress, statusAddress)
+	logs := startGateway(t, binary, configPath)
+	statusURL := "http://" + statusAddress
+	waitForHealthyGateway(t, statusURL, logs)
+
+	connection, err := pgconn.Connect(context.Background(), "postgres://any-user@"+frontendAddress+"/any-database?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close(context.Background())
+
+	statement, err := connection.Prepare(context.Background(), "extended_lifecycle", "SELECT $1::int4 AS value", []uint32{23})
+	if err != nil {
+		t.Fatalf("Parse/Describe/Sync: %v\ngateway logs:\n%s", err, logs.String())
+	}
+	result := connection.ExecPrepared(context.Background(), statement.Name, [][]byte{[]byte("9")}, []int16{0}, []int16{0}).Read()
+	if result.Err != nil {
+		t.Fatalf("Bind/Execute/Sync: %v\ngateway logs:\n%s", result.Err, logs.String())
+	}
+	if len(result.Rows) != 2 || string(result.Rows[0][0]) != "9" || string(result.Rows[1][0]) != "9" {
+		t.Fatalf("prepared rows = %#v, want [9 9] from both Burrows", result.Rows)
+	}
+	if err := connection.Deallocate(context.Background(), statement.Name); err != nil {
+		t.Fatalf("Close/Sync: %v\ngateway logs:\n%s", err, logs.String())
+	}
+
+	snapshot := gatewaySnapshot(t, statusURL+"/api/v1/status")
+	if snapshot.QueryMetrics.Total.Queries != 1 || snapshot.QueryMetrics.Total.FailedQueries != 0 {
+		t.Fatalf("extended lifecycle counters = %#v, want one successful query", snapshot.QueryMetrics.Total)
+	}
+	assertShardExecutions(t, snapshot.QueryMetrics.Total, snapshot.QueryMetrics.ShardExecutions, 1)
+}
+
 const sysbenchVersion = "1.0.20"
 
-// TestSysbenchReadWriteEndToEnd is an opt-in compatibility test. Sysbench uses
-// the PostgreSQL extended-query protocol, which the current Proxy deliberately
-// does not implement. Keep the test failing when explicitly requested so the
-// remaining sysbench compatibility work has one repeatable acceptance check,
-// while the default Go test suite remains usable during development.
+// TestSysbenchReadWriteEndToEnd is an opt-in compatibility test. It exercises
+// sysbench's PostgreSQL extended-query workload against the Docker Burrows;
+// the default Go test suite stays read-only and fast for everyday development.
 func TestSysbenchReadWriteEndToEnd(t *testing.T) {
 	if os.Getenv("HAMSTERGRES_SYSBENCH_E2E") != "1" {
 		t.Skip("set HAMSTERGRES_SYSBENCH_E2E=1 to run the local sysbench compatibility test")
@@ -144,10 +235,12 @@ func TestSysbenchReadWriteEndToEnd(t *testing.T) {
 	if snapshot.QueryMetrics.Total.Queries == 0 || snapshot.QueryMetrics.Total.FailedQueries != 0 {
 		t.Fatalf("sysbench query counters = %#v, want successful queries", snapshot.QueryMetrics.Total)
 	}
-	if snapshot.QueryMetrics.Total.ScatteredQueries != snapshot.QueryMetrics.Total.Queries || snapshot.QueryMetrics.Total.SingleShardQueries != 0 {
-		t.Fatalf("sysbench routing counters = %#v, want every query scattered", snapshot.QueryMetrics.Total)
+	if snapshot.QueryMetrics.Total.SingleShardQueries == 0 {
+		t.Fatalf("sysbench routing counters = %#v, want keyed reads and writes routed to one Burrow", snapshot.QueryMetrics.Total)
 	}
-	assertShardExecutions(t, snapshot.QueryMetrics.Total, snapshot.QueryMetrics.ShardExecutions, snapshot.QueryMetrics.Total.Queries)
+	if snapshot.QueryMetrics.Total.ScatteredQueries == 0 {
+		t.Fatalf("sysbench routing counters = %#v, want schema commands scattered to both Burrows", snapshot.QueryMetrics.Total)
+	}
 	assertStatement(t, snapshot.QueryMetrics.QuerySummaries, "SELECT")
 	assertStatement(t, snapshot.QueryMetrics.QuerySummaries, "UPDATE")
 }
@@ -201,6 +294,9 @@ func writeGatewayConfig(t *testing.T, frontendAddress, statusAddress string) str
   address: %q
 status:
   address: %q
+nest:
+  endpoint: "http://127.0.0.1:2379"
+  registry_key: "/hamstergres/schema-registry/v1"
 sharding:
   physical_shards:
     burrow-01:
@@ -315,6 +411,20 @@ func assertShardExecutions(t *testing.T, totals statistics.Statistics, execution
 	}
 }
 
+func assertTotalShardExecutions(t *testing.T, executions []statistics.ShardCount, want int64) {
+	t.Helper()
+	if len(executions) != 2 {
+		t.Fatalf("executions = %#v, want both Burrows represented", executions)
+	}
+	var got int64
+	for _, execution := range executions {
+		got += execution.Queries
+	}
+	if got != want {
+		t.Fatalf("total Burrow executions = %d, want %d: %#v", got, want, executions)
+	}
+}
+
 func assertSummary(t *testing.T, summaries []statistics.QuerySummary, shape string) {
 	t.Helper()
 	for _, summary := range summaries {
@@ -370,7 +480,7 @@ func runSysbench(sysbench, frontendAddress, action string) (string, error) {
 		"--pgsql-db=hamstergres",
 		"--tables=2",
 		"--table-size=10",
-		"--threads=2",
+		"--threads=1",
 		"--time=3",
 		"--events=0",
 		"--report-interval=0",

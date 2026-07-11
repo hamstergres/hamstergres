@@ -1,6 +1,24 @@
 name: hamstergres
 
 services:
+  hamstergres-nest:
+    image: quay.io/coreos/etcd:v3.5.18
+    command:
+      - /usr/local/bin/etcd
+      - --name=hamstergres-nest
+      - --data-dir=/etcd-data
+      - --advertise-client-urls=http://0.0.0.0:2379
+      - --listen-client-urls=http://0.0.0.0:2379
+    ports:
+      - "2379:2379"
+    volumes:
+      - hamstergres-nest-data:/etcd-data
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/etcdctl", "endpoint", "health"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
   burrow-01:
     image: postgres:17-alpine
     environment:
@@ -38,6 +56,7 @@ services:
       start_period: 5s
 
 volumes:
+  hamstergres-nest-data:
   burrow-01-data:
     # Preserve the development data volume created before the Burrow rename.
     name: hamstergres_shard-01-data

@@ -18,6 +18,10 @@ type Config struct {
 	Status struct {
 		Address string `yaml:"address"`
 	} `yaml:"status"`
+	Nest struct {
+		Endpoint    string `yaml:"endpoint"`
+		RegistryKey string `yaml:"registry_key"`
+	} `yaml:"nest"`
 	Sharding struct {
 		PhysicalShards map[string]Shard `yaml:"physical_shards"`
 	} `yaml:"sharding"`
@@ -42,6 +46,9 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.Status.Address == "" {
 		cfg.Status.Address = DefaultStatusAddress
+	}
+	if cfg.Nest.RegistryKey == "" {
+		cfg.Nest.RegistryKey = "/hamstergres/schema-registry/v1"
 	}
 	if len(cfg.Sharding.PhysicalShards) == 0 {
 		return Config{}, fmt.Errorf("config %q: at least one physical Burrow is required", path)

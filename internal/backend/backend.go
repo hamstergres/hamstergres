@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +15,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/jruszo/hamstergres/internal/config"
+	"github.com/jruszo/hamstergres/internal/nest"
+	"github.com/jruszo/hamstergres/internal/schema"
 	"github.com/jruszo/hamstergres/internal/statistics"
 )
 
@@ -26,6 +29,7 @@ type Result struct {
 
 type shard struct {
 	name string
+	dsn  string
 	pool *pgxpool.Pool
 	last shardHealth
 }
@@ -39,7 +43,9 @@ type shardHealth struct {
 type Manager struct {
 	shards  []*shard
 	mu      sync.RWMutex
+	writeMu sync.Mutex
 	metrics *statistics.Collector
+	schema  schema.Registry
 }
 
 func New(ctx context.Context, cfg config.Config) (*Manager, error) {
@@ -56,9 +62,264 @@ func New(ctx context.Context, cfg config.Config) (*Manager, error) {
 			m.Close()
 			return nil, fmt.Errorf("create pool for shard %q: %w", name, err)
 		}
-		m.shards = append(m.shards, &shard{name: name, pool: pool})
+		m.shards = append(m.shards, &shard{name: name, dsn: cfg.Sharding.PhysicalShards[name].DSN, pool: pool})
+	}
+	registry, err := m.loadSchema(ctx)
+	if err != nil {
+		m.Close()
+		return nil, err
+	}
+	m.schema = registry
+	if cfg.Nest.Endpoint != "" {
+		if err := nest.NewRegistryStore(cfg.Nest.Endpoint, cfg.Nest.RegistryKey).VerifyOrSeed(ctx, registry); err != nil {
+			m.Close()
+			return nil, err
+		}
 	}
 	return m, nil
+}
+
+const primaryKeyQuery = `
+SELECT n.nspname, c.relname, array_agg(a.attname ORDER BY key_column.ordinality)
+FROM pg_index i
+JOIN pg_class c ON c.oid = i.indrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+JOIN unnest(i.indkey) WITH ORDINALITY AS key_column(attnum, ordinality) ON true
+JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = key_column.attnum
+WHERE i.indisprimary AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+GROUP BY n.nspname, c.relname
+ORDER BY n.nspname, c.relname`
+
+func (m *Manager) loadSchema(ctx context.Context) (schema.Registry, error) {
+	var expected schema.Registry
+	for index, shard := range m.shards {
+		rows, err := shard.pool.Query(ctx, primaryKeyQuery)
+		if err != nil {
+			return schema.Registry{}, fmt.Errorf("inspect schema on Burrow %s: %w", shard.name, err)
+		}
+		tables := make(map[string][]string)
+		for rows.Next() {
+			var namespace, table string
+			var columns []string
+			if err := rows.Scan(&namespace, &table, &columns); err != nil {
+				rows.Close()
+				return schema.Registry{}, fmt.Errorf("read schema on Burrow %s: %w", shard.name, err)
+			}
+			tables[namespace+"."+table] = columns
+			if namespace == "public" {
+				tables[table] = columns
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return schema.Registry{}, fmt.Errorf("read schema on Burrow %s: %w", shard.name, err)
+		}
+		rows.Close()
+		registry := schema.New(tables)
+		if index == 0 {
+			expected = registry
+			continue
+		}
+		if err := expected.Equal(registry); err != nil {
+			return schema.Registry{}, fmt.Errorf("schema registry mismatch at Burrow %s: %w", shard.name, err)
+		}
+	}
+	return expected, nil
+}
+
+// Session owns one PostgreSQL connection to every Burrow for the lifetime of a
+// frontend session. PostgreSQL prepared statements and portals live on a
+// backend connection, so extended-query messages must not be sent through the
+// regular query pools independently.
+type Session struct {
+	shards      []*sessionShard
+	writeMu     *sync.Mutex
+	writeLocked bool
+}
+
+type sessionShard struct {
+	name string
+	conn *pgconn.PgConn
+}
+
+// NewSession establishes an affinity connection to each Burrow. The caller
+// must close the returned session.
+func (m *Manager) NewSession(ctx context.Context) (*Session, error) {
+	session := &Session{shards: make([]*sessionShard, 0, len(m.shards)), writeMu: &m.writeMu}
+	for _, shard := range m.shards {
+		conn, err := pgconn.Connect(ctx, shard.dsn)
+		if err != nil {
+			session.Close(context.Background())
+			return nil, fmt.Errorf("connect session to Burrow %s: %w", shard.name, err)
+		}
+		session.shards = append(session.shards, &sessionShard{name: shard.name, conn: conn})
+	}
+	return session, nil
+}
+
+// LockWrites serializes scattered writes so every Burrow observes them in the
+// same process-wide order. The returned function must be called when the write
+// is complete.
+func (m *Manager) LockWrites() func() {
+	m.writeMu.Lock()
+	return m.writeMu.Unlock
+}
+
+// LockWrites holds the process-wide write lock for this affinity session until
+// UnlockWrites or Close. Repeated calls while already locked are no-ops.
+func (s *Session) LockWrites() {
+	if s.writeLocked || s.writeMu == nil {
+		return
+	}
+	s.writeMu.Lock()
+	s.writeLocked = true
+}
+
+// UnlockWrites releases the process-wide write lock if this session holds it.
+func (s *Session) UnlockWrites() {
+	if !s.writeLocked || s.writeMu == nil {
+		return
+	}
+	s.writeLocked = false
+	s.writeMu.Unlock()
+}
+
+// Send broadcasts one frontend protocol message to every Burrow before
+// flushing, keeping their prepared-statement and portal state in lockstep.
+func (s *Session) Send(message pgproto3.FrontendMessage) error {
+	for _, shard := range s.shards {
+		shard.conn.Frontend().Send(message)
+		// The frontend connection is processed one protocol message at a time.
+		// PostgreSQL is allowed to hold an extended-query response until a Sync
+		// or Flush arrives, so inject Flush after each forwarded message to make
+		// Parse, Bind, Describe, Execute, and Close observable immediately.
+		shard.conn.Frontend().Send(&pgproto3.Flush{})
+	}
+	for _, shard := range s.shards {
+		if err := shard.conn.Frontend().Flush(); err != nil {
+			return fmt.Errorf("send to Burrow %s: %w", shard.name, err)
+		}
+	}
+	return nil
+}
+
+// SendTo forwards one frontend protocol message to a single Burrow while
+// preserving that Burrow's prepared-statement and portal state.
+func (s *Session) SendTo(name string, message pgproto3.FrontendMessage) error {
+	shard := s.shardByName(name)
+	if shard == nil {
+		return fmt.Errorf("unknown Burrow %s", name)
+	}
+	shard.conn.Frontend().Send(message)
+	shard.conn.Frontend().Send(&pgproto3.Flush{})
+	if err := shard.conn.Frontend().Flush(); err != nil {
+		return fmt.Errorf("send to Burrow %s: %w", shard.name, err)
+	}
+	return nil
+}
+
+// ReceiveUntil reads each Burrow's response through its terminating message.
+// The outer slice is ordered by configured Burrow name, just like QueryAll.
+func (s *Session) ReceiveUntil(ctx context.Context, done func(pgproto3.BackendMessage) bool) ([][]pgproto3.BackendMessage, error) {
+	responses := make([][]pgproto3.BackendMessage, len(s.shards))
+	for index, shard := range s.shards {
+		response, err := receiveUntil(ctx, shard, done)
+		if err != nil {
+			return nil, err
+		}
+		responses[index] = response
+	}
+	return responses, nil
+}
+
+// ReceiveUntilFrom reads one Burrow's response through its terminating message.
+func (s *Session) ReceiveUntilFrom(ctx context.Context, name string, done func(pgproto3.BackendMessage) bool) ([][]pgproto3.BackendMessage, error) {
+	shard := s.shardByName(name)
+	if shard == nil {
+		return nil, fmt.Errorf("unknown Burrow %s", name)
+	}
+	response, err := receiveUntil(ctx, shard, done)
+	if err != nil {
+		return nil, err
+	}
+	return [][]pgproto3.BackendMessage{response}, nil
+}
+
+func (s *Session) shardByName(name string) *sessionShard {
+	for _, shard := range s.shards {
+		if shard.name == name {
+			return shard
+		}
+	}
+	return nil
+}
+
+func receiveUntil(ctx context.Context, shard *sessionShard, done func(pgproto3.BackendMessage) bool) ([]pgproto3.BackendMessage, error) {
+	var response []pgproto3.BackendMessage
+	for {
+		message, err := shard.conn.ReceiveMessage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("receive from Burrow %s: %w", shard.name, err)
+		}
+		// pgproto3 reuses message storage on the next Receive call. The proxy
+		// merges responses after every Burrow has replied, so retain copies.
+		response = append(response, cloneBackendMessage(message))
+		if done(message) {
+			return response, nil
+		}
+	}
+}
+
+func cloneBackendMessage(message pgproto3.BackendMessage) pgproto3.BackendMessage {
+	switch message := message.(type) {
+	case *pgproto3.RowDescription:
+		copy := *message
+		copy.Fields = make([]pgproto3.FieldDescription, len(message.Fields))
+		for index, field := range message.Fields {
+			copy.Fields[index] = field
+			copy.Fields[index].Name = append([]byte(nil), field.Name...)
+		}
+		return &copy
+	case *pgproto3.DataRow:
+		copy := *message
+		copy.Values = make([][]byte, len(message.Values))
+		for index, value := range message.Values {
+			copy.Values[index] = append([]byte(nil), value...)
+		}
+		return &copy
+	case *pgproto3.CommandComplete:
+		copy := *message
+		copy.CommandTag = append([]byte(nil), message.CommandTag...)
+		return &copy
+	case *pgproto3.ParameterDescription:
+		copy := *message
+		copy.ParameterOIDs = append([]uint32(nil), message.ParameterOIDs...)
+		return &copy
+	case *pgproto3.CopyData:
+		copy := *message
+		copy.Data = append([]byte(nil), message.Data...)
+		return &copy
+	case *pgproto3.ErrorResponse:
+		copy := *message
+		if message.UnknownFields != nil {
+			copy.UnknownFields = make(map[byte]string, len(message.UnknownFields))
+			for key, value := range message.UnknownFields {
+				copy.UnknownFields[key] = value
+			}
+		}
+		return &copy
+	default:
+		return message
+	}
+}
+
+// Close releases every affinity connection. It is safe after a partial
+// NewSession failure.
+func (s *Session) Close(ctx context.Context) {
+	s.UnlockWrites()
+	for _, shard := range s.shards {
+		_ = shard.conn.Close(ctx)
+	}
 }
 
 func (m *Manager) Close() {
@@ -120,6 +381,35 @@ func (m *Manager) QueryAll(ctx context.Context, sql string) (Result, error) {
 	success = err == nil
 	return merged, err
 }
+
+// QueryOne runs sql against one Burrow and records it as a single-shard query.
+func (m *Manager) QueryOne(ctx context.Context, sql, name string) (Result, error) {
+	started := time.Now()
+	targets := []string{name}
+	success := false
+	defer func() {
+		m.metrics.Record(statistics.QueryEvent{SQL: sql, Success: success, Duration: time.Since(started), Shards: targets})
+	}()
+
+	for _, shard := range m.shards {
+		if shard.name != name {
+			continue
+		}
+		result, err := queryShard(ctx, shard.pool, sql)
+		success = err == nil
+		return result, err
+	}
+	return Result{}, fmt.Errorf("unknown Burrow %s", name)
+}
+
+// ShardNames returns the configured Burrow names in routing order.
+func (m *Manager) ShardNames() []string {
+	return m.shardNames()
+}
+
+// Schema returns the primary-key registry validated across all Burrows at
+// startup. The Proxy uses it to make routing decisions.
+func (m *Manager) Schema() schema.Registry { return m.schema }
 
 func (m *Manager) shardNames() []string {
 	names := make([]string, 0, len(m.shards))
@@ -199,6 +489,9 @@ func mergedTag(results []Result, rowCount int) string {
 	if len(results) > 0 && strings.HasPrefix(results[0].CommandTag, "SELECT") {
 		return fmt.Sprintf("SELECT %d", rowCount)
 	}
+	if tag, ok := mergeRowCountTags(resultTags(results)); ok {
+		return tag
+	}
 	first := results[0].CommandTag
 	for _, result := range results[1:] {
 		if result.CommandTag != first {
@@ -206,6 +499,44 @@ func mergedTag(results []Result, rowCount int) string {
 		}
 	}
 	return first
+}
+
+func resultTags(results []Result) []string {
+	tags := make([]string, 0, len(results))
+	for _, result := range results {
+		tags = append(tags, result.CommandTag)
+	}
+	return tags
+}
+
+func mergeRowCountTags(tags []string) (string, bool) {
+	if len(tags) == 0 {
+		return "", false
+	}
+	prefix, rows, ok := splitRowCountTag(tags[0])
+	if !ok {
+		return "", false
+	}
+	for _, tag := range tags[1:] {
+		nextPrefix, nextRows, ok := splitRowCountTag(tag)
+		if !ok || nextPrefix != prefix {
+			return "", false
+		}
+		rows += nextRows
+	}
+	return fmt.Sprintf("%s %d", prefix, rows), true
+}
+
+func splitRowCountTag(tag string) (string, int64, bool) {
+	parts := strings.Fields(tag)
+	if len(parts) < 2 {
+		return "", 0, false
+	}
+	rows, err := strconv.ParseInt(parts[len(parts)-1], 10, 64)
+	if err != nil {
+		return "", 0, false
+	}
+	return strings.Join(parts[:len(parts)-1], " "), rows, true
 }
 
 // Statistics reports process-lifetime gateway query counts.
@@ -220,6 +551,20 @@ func (m *Manager) Statistics() Statistics {
 
 func (m *Manager) QueryMetrics() QueryMetrics {
 	return m.metrics.Snapshot()
+}
+
+// RecordQuery records a query executed through an affinity Session. QueryAll
+// records its own work; this is for extended-query executions whose backend
+// state must stay pinned to a frontend session.
+func (m *Manager) RecordQuery(sql string, success bool, duration time.Duration) {
+	m.RecordQueryTargets(sql, success, duration, m.shardNames())
+}
+
+// RecordQueryTargets records an affinity-session query with the selected Burrows.
+func (m *Manager) RecordQueryTargets(sql string, success bool, duration time.Duration, shards []string) {
+	m.metrics.Record(statistics.QueryEvent{
+		SQL: sql, Success: success, Duration: duration, Shards: shards,
+	})
 }
 
 // ShardStatus is a safe, presentation-ready snapshot of one backend pool.

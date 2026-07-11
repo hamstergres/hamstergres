@@ -10,7 +10,7 @@ operators.
 | --- | --- | --- |
 | Hamstergres Proxy | Accepts PostgreSQL connections and routes SQL by shard key. | `hamstergres-proxy` |
 | Hamstergres Keeper | Coordinates topology, health, reconciliation, and failover awareness. | `hamstergres-keeper` |
-| Hamstergres Nest | Holds control-plane metadata: the shard map, routing rules, schema versions, and migration state. | `hamstergres-nest` |
+| Hamstergres Nest | etcd-backed control-plane metadata: the shard map, routing rules, schema registry, and migration state. | `hamstergres-nest` |
 | Hamstergres Migrations | Changes schemas and records migration state. | `hamstergres-migrations` |
 | Hamstergres Mover | Moves data during resharding. | `hamstergres-mover` |
 | Hamstergres Burrows | The fleet of physical PostgreSQL shards. | infrastructure |
@@ -42,10 +42,26 @@ Nest contains the map that says which data belongs to which Burrow.
 ## Routing vocabulary
 
 Use the familiar technical term `vshard` for virtual shards, named like
-`vshard-00001`. A vshard maps to a Burrow. The current development Proxy has no
-real routing logic yet: it deliberately scatters every simple query to every
-configured Burrow and merges compatible result rows. The future Proxy will use
-Nest metadata to choose a Tunnel and target the appropriate Burrow.
+`vshard-00001`. A vshard maps to a Burrow. At startup, each Proxy reads the
+primary-key registry from every Burrow's PostgreSQL catalogs and refuses to
+start if they disagree. It routes reads and writes using the discovered primary
+key (all columns for a composite key), with the static 64k-vshard map. It
+scatters only reads without a usable primary key and schema commands that must
+reach every Burrow. A write without one unambiguous primary key is rejected;
+it is never broadcast as a substitute for distributed transactions. Within a
+transaction, the first routed statement pins the session to one Burrow and a
+statement for another Burrow (or a scatter query) is rejected. The future Proxy
+will use Nest metadata to choose a Tunnel and target the appropriate Burrow.
+
+## Schema registry contract
+
+Hamstergres Nest persists the validated primary-key registry at
+`/hamstergres/schema-registry/v1` by default. On first startup, a Proxy seeds
+an empty registry from the live Burrow catalogs. Later startup compares the
+live registry with both every other Burrow and the Nest snapshot. Any mismatch
+is a startup error: the Proxy never guesses which schema is authoritative or
+applies DDL itself. Hamstergres Migrations is responsible for an intentional
+schema change and for updating the Nest snapshot as part of that workflow.
 
 ## Naming rules
 

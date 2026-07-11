@@ -35,9 +35,10 @@ component or changing topology behavior.
 - Standard technical terms such as `shard`, `shard key`, and `vshard` remain
   appropriate inside generic routing and PostgreSQL implementation code. Do not
   call Nest a shard or Burrow a metadata store.
-- Keep `hamstergres-proxy` PostgreSQL-compatible. The current PoC supports only
-  simple-query protocol and deliberately scatters every query; document any
-  change to that contract.
+- Keep `hamstergres-proxy` PostgreSQL-compatible. The current PoC supports
+  simple-query and the core extended-query lifecycle (Parse, Bind, Describe,
+  Execute, Close, Sync, and Flush) and deliberately scatters every execution;
+  document any change to that contract.
 - Keep statistics process-owned. Status HTML, JSON, and CLI must consume the
   same in-process collector, never invoke `psql` or parse external logs.
 - Query summaries show normalized SQL structure and a stable fingerprint; they

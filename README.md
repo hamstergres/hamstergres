@@ -2,10 +2,11 @@
 
 Hamstergres is an experimental PostgreSQL sharding system: **Tiny paws, many
 shards.** Its current component is the **Hamstergres Proxy**, a development
-gateway that speaks the PostgreSQL frontend protocol, fans each simple query
-out to every configured **Burrow**, and appends compatible result rows. Real
-shard-key routing and Nest-backed metadata management come next; this fan-out
-behavior is intentionally temporary. See [the architecture and naming
+gateway that speaks the PostgreSQL frontend protocol and routes single-key
+queries to their owning **Burrow**. Reads without a usable shard key are
+scattered and compatible result rows are appended. It supports simple queries
+and the core extended-query lifecycle used by prepared, parameterized
+PostgreSQL clients. Nest-backed metadata management comes next. See [the architecture and naming
 reference](docs/architecture.md) for the component model.
 
 ## Layout
@@ -71,10 +72,11 @@ make up
 [`config/hamstergres.example.yaml`](config/hamstergres.example.yaml) records
 the initial routing contract for the future Go proxy:
 
-- `accounts` is distributed by `tenant_id`.
-- `tenant_id % 16` selects a virtual shard.
-- Virtual shards `0` through `7` belong to `burrow-01`; `8` through `15`
-  belong to `burrow-02`.
+- `accounts` is distributed by its PostgreSQL primary key: `(tenant_id, account_id)`.
+- `hash(primary_key_tuple) % 65536` selects a vshard.
+- Vshards are placed by one-indexed modulo over Burrows. In the two-Burrow
+  fixture, odd vshards belong to `burrow-01` and even vshards belong to
+  `burrow-02`.
 
 The DSNs in that file use Docker service names so a future Proxy container can
 connect to the Burrows. When running a Go process directly on the host, use
@@ -119,14 +121,13 @@ brew install sysbench
 ```
 
 The test validates the installed sysbench version, then checks the Proxy's
-process-owned status data to ensure every recorded sysbench query was scattered
-to both Burrows, with both `SELECT` and `UPDATE` statements present.
+process-owned status data for both single-Burrow and scattered routes, with
+both `SELECT` and `UPDATE` statements present.
 
-This is intentionally a known-failing compatibility test today: sysbench uses
-the PostgreSQL extended-query protocol, while the current Proxy supports only
-simple-query messages. The test is opt-in so `make test` stays green; it
-becomes a passing gate as the outstanding sysbench issues add extended-query,
-session, write-result, schema-preparation, and fan-out-contract support.
+The Proxy supports sysbench's Parse, Bind, Describe, Execute, Close, Sync, and
+Flush protocol flow, including text and binary parameter/result formats. The
+test is opt-in because it prepares, runs, and cleans up a short mutating
+workload against the local Docker Burrows.
 
 ## Run the gateway
 
@@ -145,18 +146,33 @@ cp config/hamstergres.local.example.yaml config/hamstergres.local.yaml
 go run ./cmd/hamstergres-proxy -config config/hamstergres.local.yaml
 ```
 
-Connect a normal PostgreSQL simple-query client to the gateway:
+Connect a PostgreSQL client to the gateway:
 
 ```bash
 psql "postgres://anything@localhost:6432/anything?sslmode=disable" -c 'SELECT * FROM accounts'
 ```
 
-Every query currently executes on both Burrows concurrently. `SELECT` rows are
-appended in Burrow-name order. Each Burrow must return the same columns and data
-types. Writes and DDL are also fanned out, but they are not a distributed
-transaction: a failed Burrow can leave another Burrow changed. Prepared
-statements, extended-query protocol, authentication, TLS, cancellation, and
-transaction semantics are deliberately outside this initial gateway milestone.
+At startup, the Proxy reads primary-key definitions from every Burrow and
+refuses to start if the registry differs. `SELECT`, `INSERT`, `UPDATE`, and
+`DELETE` route to one Burrow only when they provide the full discovered primary
+key (including every column of a composite key); other reads are scattered and
+their rows are appended in Burrow-name order. Ambiguous writes are rejected
+instead of being duplicated across the fleet. DDL is still applied to every
+Burrow. A transaction is pinned to the
+first Burrow it touches, and cross-Burrow statements are rejected; Hamstergres
+does not claim distributed transaction support. Prepared statements and portals
+are pinned to the frontend session and retain supplied text or binary parameter
+and result formats. Authentication, TLS, cancellation, and COPY remain outside
+this initial gateway milestone.
+
+### Schema registry in Hamstergres Nest
+
+The development Compose environment includes an etcd-backed **Hamstergres
+Nest** on port 2379. On the first successful Proxy startup, it stores the
+catalog-derived primary-key registry in Nest. Later Proxy startups compare the
+live Burrows with that snapshot and fail closed if either has drifted. The Proxy
+does not reconcile schema drift automatically; run an explicit Hamstergres
+Migrations workflow to change Burrows and the Nest registry together.
 
 This is a local-development gateway. Its frontend currently accepts every
 startup user without a password and the example listener is reachable on all

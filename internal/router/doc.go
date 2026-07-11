@@ -1,2 +1,2 @@
-// Package router will map a shard key and vshard to a physical Burrow.
+// Package router maps shard keys and vshards to physical Burrows.
 package router

@@ -1,0 +1,62 @@
+package nest
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"sync"
+	"testing"
+
+	"github.com/jruszo/hamstergres/internal/schema"
+)
+
+func TestVerifyOrSeedSeedsThenRejectsDrift(t *testing.T) {
+	var mu sync.Mutex
+	var value string
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		switch request.URL.Path {
+		case "/v3/kv/range":
+			if value == "" {
+				_, _ = writer.Write([]byte(`{}`))
+				return
+			}
+			_, _ = writer.Write([]byte(`{"kvs":[{"value":"` + value + `"}]}`))
+		case "/v3/kv/put":
+			var payload map[string]string
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatal(err)
+			}
+			value = payload["value"]
+			_, _ = writer.Write([]byte(`{}`))
+		default:
+			writer.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	store := NewRegistryStore(server.URL, "/registry")
+	live := schema.New(map[string][]string{"accounts": {"id"}})
+	if err := store.VerifyOrSeed(t.Context(), live); err != nil {
+		t.Fatal(err)
+	}
+	if value == "" {
+		t.Fatal("store was not seeded")
+	}
+	if _, err := base64.StdEncoding.DecodeString(value); err != nil {
+		t.Fatalf("stored value is not base64: %v", err)
+	}
+	if err := store.VerifyOrSeed(t.Context(), live); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.VerifyOrSeed(t.Context(), schema.New(map[string][]string{"accounts": {"other_id"}})); err == nil {
+		t.Fatal("schema drift was accepted")
+	}
+}

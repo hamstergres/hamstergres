@@ -5,6 +5,10 @@ listen:
 status:
   address: "127.0.0.1:8080"
 
+nest:
+  endpoint: "http://127.0.0.1:2379"
+  registry_key: "/hamstergres/schema-registry/v1"
+
 sharding:
   physical_shards:
     burrow-01:
