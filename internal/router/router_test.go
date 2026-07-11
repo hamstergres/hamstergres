@@ -32,3 +32,26 @@ func TestBurrowForKeyUsesOneIndexedModuloPlacement(t *testing.T) {
 		}
 	}
 }
+
+func TestRewriteGeneratedInsertAddsOmittedPrimaryKey(t *testing.T) {
+	registry := schema.NewWithGenerated(map[string][]string{"widgets": {"id"}}, map[string]schema.GeneratedPrimary{"widgets": {Column: "id", Kind: "identity"}})
+	result, ok := RewriteGeneratedInsert("INSERT INTO widgets (name) VALUES ($1) RETURNING id", registry, "$2")
+	if !ok || result.SQL != `INSERT INTO widgets (name, "id") VALUES ($1, $2) RETURNING id` {
+		t.Fatalf("RewriteGeneratedInsert = %#v, %t", result, ok)
+	}
+	target, routed := TargetForSchema(result.SQL, [][]byte{[]byte("wheel"), []byte("42")}, registry, []string{"burrow-01", "burrow-02"})
+	if !routed || target != BurrowForKey("42", []string{"burrow-01", "burrow-02"}) {
+		t.Fatal("rewritten INSERT was not routed by generated id")
+	}
+}
+
+func TestRewriteGeneratedInsertReplacesDefaultButPreservesExplicitKey(t *testing.T) {
+	registry := schema.NewWithGenerated(map[string][]string{"widgets": {"id"}}, map[string]schema.GeneratedPrimary{"widgets": {Column: "id", Kind: "sequence"}})
+	result, ok := RewriteGeneratedInsert("INSERT INTO widgets (id, name) VALUES (DEFAULT, 'x')", registry, "7")
+	if !ok || result.SQL != "INSERT INTO widgets (id, name) VALUES (7, 'x')" {
+		t.Fatalf("got %q, %t", result.SQL, ok)
+	}
+	if _, ok := RewriteGeneratedInsert("INSERT INTO widgets (id, name) VALUES (9, 'x')", registry, "7"); ok {
+		t.Fatal("explicit key was rewritten")
+	}
+}

@@ -15,6 +15,54 @@ var (
 	tableReference = regexp.MustCompile(`(?is)^\s*(?:SELECT\b.*?\bFROM|UPDATE|DELETE\s+FROM|INSERT\s+INTO)\s+([a-zA-Z_][\w]*(?:\.[a-zA-Z_][\w]*)?)`)
 )
 
+// GeneratedInsert is a rewritten single-row INSERT whose generated primary
+// key is now explicit, allowing the Proxy to route before contacting a Burrow.
+type GeneratedInsert struct {
+	SQL    string
+	Table  string
+	Column string
+}
+
+// RewriteGeneratedInsert injects valueExpression when an eligible generated
+// primary key is omitted or specified as DEFAULT. Explicit keys are untouched.
+func RewriteGeneratedInsert(sql string, registry schema.Registry, valueExpression string) (GeneratedInsert, bool) {
+	if firstSQLKeyword(sql) != "INSERT" {
+		return GeneratedInsert{}, false
+	}
+	tableMatch := tableReference.FindStringSubmatch(sql)
+	match := insertValues.FindStringSubmatchIndex(sql)
+	if len(tableMatch) != 2 || len(match) != 6 {
+		return GeneratedInsert{}, false
+	}
+	generated, ok := registry.GeneratedPrimaryKey(tableMatch[1])
+	if !ok {
+		return GeneratedInsert{}, false
+	}
+	columnsText, valuesText := sql[match[2]:match[3]], sql[match[4]:match[5]]
+	columns, values := strings.Split(columnsText, ","), strings.Split(valuesText, ",")
+	if len(columns) != len(values) {
+		return GeneratedInsert{}, false
+	}
+	for index, column := range columns {
+		if strings.EqualFold(strings.Trim(strings.TrimSpace(column), `"`), generated.Column) {
+			if !strings.EqualFold(strings.TrimSpace(values[index]), "DEFAULT") {
+				return GeneratedInsert{}, false
+			}
+			values[index] = valueExpression
+			start, end := match[4], match[5]
+			return GeneratedInsert{SQL: sql[:start] + strings.Join(values, ",") + sql[end:], Table: tableMatch[1], Column: generated.Column}, true
+		}
+	}
+	columnsText += ", " + quoteIdentifier(generated.Column)
+	valuesText += ", " + valueExpression
+	rewritten := sql[:match[2]] + columnsText + sql[match[3]:match[4]] + valuesText + sql[match[5]:]
+	return GeneratedInsert{SQL: rewritten, Table: tableMatch[1], Column: generated.Column}, true
+}
+
+func quoteIdentifier(value string) string {
+	return `"` + strings.ReplaceAll(value, `"`, `""`) + `"`
+}
+
 // TargetForSchema routes a read or write using the table's discovered primary
 // key. It returns false for tables without a primary key and for ambiguous
 // predicates, leaving the Proxy to apply its safe scatter/rejection policy.

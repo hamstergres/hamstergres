@@ -41,11 +41,14 @@ type shardHealth struct {
 
 // Manager owns one connection pool per physical shard.
 type Manager struct {
-	shards  []*shard
-	mu      sync.RWMutex
-	writeMu sync.Mutex
-	metrics *statistics.Collector
-	schema  schema.Registry
+	shards        []*shard
+	mu            sync.RWMutex
+	writeMu       sync.Mutex
+	metrics       *statistics.Collector
+	schemaMu      sync.RWMutex
+	schema        schema.Registry
+	globalIDs     *nest.SequenceStore
+	registryStore *nest.RegistryStore
 }
 
 func New(ctx context.Context, cfg config.Config) (*Manager, error) {
@@ -71,24 +74,28 @@ func New(ctx context.Context, cfg config.Config) (*Manager, error) {
 	}
 	m.schema = registry
 	if cfg.Nest.Endpoint != "" {
-		if err := nest.NewRegistryStore(cfg.Nest.Endpoint, cfg.Nest.RegistryKey).VerifyOrSeed(ctx, registry); err != nil {
+		m.registryStore = nest.NewRegistryStore(cfg.Nest.Endpoint, cfg.Nest.RegistryKey)
+		if err := m.registryStore.VerifyOrSeed(ctx, registry); err != nil {
 			m.Close()
 			return nil, err
 		}
+		m.globalIDs = nest.NewSequenceStore(cfg.Nest.Endpoint, cfg.Nest.SequenceKey)
 	}
 	return m, nil
 }
 
 const primaryKeyQuery = `
-SELECT n.nspname, c.relname, array_agg(a.attname ORDER BY key_column.ordinality)
+SELECT n.nspname, c.relname, a.attname, key_column.ordinality,
+	   a.attidentity::text, COALESCE(pg_get_expr(ad.adbin, ad.adrelid), ''),
+       format_type(a.atttypid, a.atttypmod)
 FROM pg_index i
 JOIN pg_class c ON c.oid = i.indrelid
 JOIN pg_namespace n ON n.oid = c.relnamespace
 JOIN unnest(i.indkey) WITH ORDINALITY AS key_column(attnum, ordinality) ON true
 JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = key_column.attnum
+LEFT JOIN pg_attrdef ad ON ad.adrelid = c.oid AND ad.adnum = a.attnum
 WHERE i.indisprimary AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-GROUP BY n.nspname, c.relname
-ORDER BY n.nspname, c.relname`
+ORDER BY n.nspname, c.relname, key_column.ordinality`
 
 func (m *Manager) loadSchema(ctx context.Context) (schema.Registry, error) {
 	var expected schema.Registry
@@ -98,16 +105,31 @@ func (m *Manager) loadSchema(ctx context.Context) (schema.Registry, error) {
 			return schema.Registry{}, fmt.Errorf("inspect schema on Burrow %s: %w", shard.name, err)
 		}
 		tables := make(map[string][]string)
+		generated := make(map[string]schema.GeneratedPrimary)
 		for rows.Next() {
-			var namespace, table string
-			var columns []string
-			if err := rows.Scan(&namespace, &table, &columns); err != nil {
+			var namespace, table, column, identity, defaultExpression, dataType string
+			var ordinality int
+			if err := rows.Scan(&namespace, &table, &column, &ordinality, &identity, &defaultExpression, &dataType); err != nil {
 				rows.Close()
 				return schema.Registry{}, fmt.Errorf("read schema on Burrow %s: %w", shard.name, err)
 			}
-			tables[namespace+"."+table] = columns
+			qualified := namespace + "." + table
+			tables[qualified] = append(tables[qualified], column)
 			if namespace == "public" {
-				tables[table] = columns
+				tables[table] = append(tables[table], column)
+			}
+			kind := ""
+			if identity != "" {
+				kind = "identity"
+			} else if strings.HasPrefix(defaultExpression, "nextval(") {
+				kind = "sequence"
+			}
+			if kind != "" && (dataType == "bigint" || dataType == "integer" || dataType == "smallint") {
+				value := schema.GeneratedPrimary{Column: column, Kind: kind}
+				generated[qualified] = value
+				if namespace == "public" {
+					generated[table] = value
+				}
 			}
 		}
 		if err := rows.Err(); err != nil {
@@ -115,7 +137,15 @@ func (m *Manager) loadSchema(ctx context.Context) (schema.Registry, error) {
 			return schema.Registry{}, fmt.Errorf("read schema on Burrow %s: %w", shard.name, err)
 		}
 		rows.Close()
-		registry := schema.New(tables)
+		// A generated component of a composite key cannot be safely synthesized
+		// without values for every other component, so expose only single-column
+		// generated primary keys to the rewrite path.
+		for table := range generated {
+			if len(tables[table]) != 1 {
+				delete(generated, table)
+			}
+		}
+		registry := schema.NewWithGenerated(tables, generated)
 		if index == 0 {
 			expected = registry
 			continue
@@ -409,7 +439,38 @@ func (m *Manager) ShardNames() []string {
 
 // Schema returns the primary-key registry validated across all Burrows at
 // startup. The Proxy uses it to make routing decisions.
-func (m *Manager) Schema() schema.Registry { return m.schema }
+func (m *Manager) Schema() schema.Registry {
+	m.schemaMu.RLock()
+	defer m.schemaMu.RUnlock()
+	return m.schema
+}
+
+// RefreshSchema validates the post-DDL catalogs on every Burrow, publishes the
+// intentional transition to Nest, and makes it immediately routable here.
+func (m *Manager) RefreshSchema(ctx context.Context) error {
+	registry, err := m.loadSchema(ctx)
+	if err != nil {
+		return err
+	}
+	if m.registryStore != nil {
+		if err := m.registryStore.Replace(ctx, registry); err != nil {
+			return err
+		}
+	}
+	m.schemaMu.Lock()
+	m.schema = registry
+	m.schemaMu.Unlock()
+	return nil
+}
+
+// NextGlobalID allocates through Hamstergres Nest. A Proxy without a Nest
+// endpoint deliberately cannot generate fleet-wide keys.
+func (m *Manager) NextGlobalID(ctx context.Context) (int64, error) {
+	if m.globalIDs == nil {
+		return 0, fmt.Errorf("generated primary keys require Hamstergres Nest")
+	}
+	return m.globalIDs.Next(ctx)
+}
 
 func (m *Manager) shardNames() []string {
 	names := make([]string, 0, len(m.shards))
