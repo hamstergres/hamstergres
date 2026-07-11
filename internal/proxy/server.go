@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -16,7 +17,9 @@ import (
 	"github.com/jackc/pgx/v5/pgproto3"
 
 	"github.com/jruszo/hamstergres/internal/backend"
+	"github.com/jruszo/hamstergres/internal/ddl"
 	"github.com/jruszo/hamstergres/internal/router"
+	"github.com/jruszo/hamstergres/internal/schema"
 )
 
 // Server exposes the PostgreSQL frontend protocol for Hamstergres.
@@ -90,7 +93,7 @@ func (s *Server) sendStartup(frontend *pgproto3.Backend) error {
 }
 
 func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
-	state := extendedState{statements: make(map[string]string), portals: make(map[string]portalState)}
+	state := extendedState{statements: make(map[string]statementState), portals: make(map[string]portalState)}
 	var session *backend.Session
 	defer func() {
 		if session != nil {
@@ -120,8 +123,14 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 		switch message := message.(type) {
 		case *pgproto3.Parse:
 			if active, ok := ensureSession(); ok && !state.failed {
-				if s.handleParse(frontend, active, message) {
-					state.statements[message.Name] = message.Query
+				prepared, err := prepareStatement(message, s.backends.Schema())
+				if err != nil {
+					s.sendExtendedError(frontend, "42601", err.Error())
+					state.failed = true
+					break
+				}
+				if s.handleParse(frontend, active, prepared.message) {
+					state.statements[message.Name] = prepared
 				} else {
 					state.failed = true
 				}
@@ -138,10 +147,18 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 			}
 		case *pgproto3.Bind:
 			if active, ok := ensureSession(); ok && !state.failed {
-				if s.handleBind(frontend, active, message) {
+				statement := state.statements[message.PreparedStatement]
+				bound, parameters, err := s.prepareBind(message, statement)
+				if err != nil {
+					s.sendExtendedError(frontend, "55000", err.Error())
+					state.failed = true
+					break
+				}
+				if s.handleBind(frontend, active, bound) {
 					state.portals[message.DestinationPortal] = portalState{
-						sql:        state.statements[message.PreparedStatement],
-						parameters: cloneParameters(message.Parameters),
+						sql:        statement.sql,
+						parameters: parameters,
+						schema:     statement.schema,
 					}
 				} else {
 					state.failed = true
@@ -149,7 +166,8 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 			}
 		case *pgproto3.Describe:
 			if active, ok := ensureSession(); ok && !state.failed {
-				if !s.handleDescribe(frontend, active, message) {
+				generated := message.ObjectType == 'S' && state.statements[message.Name].generated
+				if !s.handleDescribe(frontend, active, message, generated) {
 					state.failed = true
 				}
 			}
@@ -197,11 +215,97 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 }
 
 type extendedState struct {
-	statements  map[string]string
+	statements  map[string]statementState
 	portals     map[string]portalState
 	failed      bool
 	transaction bool
 	target      string
+	schemaDirty bool
+}
+
+type statementState struct {
+	sql       string
+	generated bool
+	schema    bool
+	message   *pgproto3.Parse
+}
+
+func prepareStatement(message *pgproto3.Parse, registry schema.Registry) (statementState, error) {
+	normalized, err := normalizeDDL(message.Query)
+	if err != nil {
+		return statementState{}, err
+	}
+	parameter := maxParameter(normalized.sql) + 1
+	rewritten, generated := router.RewriteGeneratedInsert(normalized.sql, registry, fmt.Sprintf("$%d", parameter))
+	if !generated {
+		if normalized.sql == message.Query {
+			return statementState{sql: message.Query, schema: normalized.schema, message: message}, nil
+		}
+		prepared := *message
+		prepared.Query = normalized.sql
+		return statementState{sql: normalized.sql, schema: normalized.schema, message: &prepared}, nil
+	}
+	oids := append([]uint32(nil), message.ParameterOIDs...)
+	for len(oids) < parameter {
+		oids = append(oids, 0)
+	}
+	prepared := *message
+	prepared.Query = rewritten.SQL
+	prepared.ParameterOIDs = oids
+	return statementState{sql: rewritten.SQL, generated: true, schema: normalized.schema, message: &prepared}, nil
+}
+
+type normalizedSQL struct {
+	sql    string
+	schema bool
+}
+
+func normalizeDDL(sql string) (normalizedSQL, error) {
+	keyword := firstSQLKeyword(sql)
+	if keyword != "CREATE" && keyword != "ALTER" {
+		return normalizedSQL{sql: sql}, nil
+	}
+	result, err := ddl.Normalize(sql)
+	if err != nil {
+		return normalizedSQL{}, err
+	}
+	return normalizedSQL{sql: result.SQL, schema: result.Schema}, nil
+}
+
+var parameterReference = regexp.MustCompile(`\$(\d+)`)
+
+func maxParameter(sql string) int {
+	maximum := 0
+	for _, match := range parameterReference.FindAllStringSubmatch(sql, -1) {
+		value, _ := strconv.Atoi(match[1])
+		if value > maximum {
+			maximum = value
+		}
+	}
+	return maximum
+}
+
+func (s *Server) prepareBind(message *pgproto3.Bind, statement statementState) (*pgproto3.Bind, [][]byte, error) {
+	if !statement.generated {
+		return message, cloneParameters(message.Parameters), nil
+	}
+	id, err := s.backends.NextGlobalID(context.Background())
+	if err != nil {
+		return nil, nil, fmt.Errorf("allocate globally unique primary key: %w", err)
+	}
+	bound := *message
+	bound.Parameters = cloneParameters(message.Parameters)
+	if len(message.ParameterFormatCodes) == 1 {
+		bound.ParameterFormatCodes = make([]int16, len(message.Parameters), len(message.Parameters)+1)
+		for index := range bound.ParameterFormatCodes {
+			bound.ParameterFormatCodes[index] = message.ParameterFormatCodes[0]
+		}
+		bound.ParameterFormatCodes = append(bound.ParameterFormatCodes, 0)
+	} else if len(message.ParameterFormatCodes) > 1 {
+		bound.ParameterFormatCodes = append(append([]int16(nil), message.ParameterFormatCodes...), 0)
+	}
+	bound.Parameters = append(bound.Parameters, []byte(strconv.FormatInt(id, 10)))
+	return &bound, cloneParameters(bound.Parameters), nil
 }
 
 func (s extendedState) txStatus() byte {
@@ -214,6 +318,7 @@ func (s extendedState) txStatus() byte {
 type portalState struct {
 	sql        string
 	parameters [][]byte
+	schema     bool
 }
 
 func cloneParameters(parameters [][]byte) [][]byte {
@@ -237,8 +342,17 @@ func (s *Server) handleBind(frontend *pgproto3.Backend, session *backend.Session
 	return s.relayUniform(frontend, responses, err, "Bind")
 }
 
-func (s *Server) handleDescribe(frontend *pgproto3.Backend, session *backend.Session, message *pgproto3.Describe) bool {
+func (s *Server) handleDescribe(frontend *pgproto3.Backend, session *backend.Session, message *pgproto3.Describe, generated bool) bool {
 	responses, err := exchange(session, message, isDescribeDone)
+	if generated {
+		for _, response := range responses {
+			for _, wireMessage := range response {
+				if parameters, ok := wireMessage.(*pgproto3.ParameterDescription); ok && len(parameters.ParameterOIDs) > 0 {
+					parameters.ParameterOIDs = parameters.ParameterOIDs[:len(parameters.ParameterOIDs)-1]
+				}
+			}
+		}
+	}
 	return s.relayUniform(frontend, responses, err, "Describe")
 }
 
@@ -258,6 +372,14 @@ func (s *Server) handleSync(frontend *pgproto3.Backend, session *backend.Session
 	if err != nil {
 		s.sendExtendedError(frontend, "08006", err.Error())
 		return false
+	}
+	if state.schemaDirty {
+		if err := s.backends.RefreshSchema(context.Background()); err != nil {
+			frontend.Send(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "55000", Message: fmt.Sprintf("refresh schema registry after DDL: %v", err)})
+			frontend.Send(&pgproto3.ReadyForQuery{TxStatus: state.txStatus()})
+			return true
+		}
+		state.schemaDirty = false
 	}
 	if !s.relaySync(frontend, responses, state.txStatus()) {
 		return false
@@ -360,6 +482,9 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 		frontend.Send(&pgproto3.EmptyQueryResponse{})
 	}
 	success = true
+	if portal.schema {
+		state.schemaDirty = true
+	}
 	updateTransactionState(state, portal.sql)
 	return true
 }
@@ -600,6 +725,26 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 		frontend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 		return true
 	}
+	normalized, err := normalizeDDL(sql)
+	if err != nil {
+		s.sendSessionError(frontend, state.txStatus(), "42601", err.Error())
+		return false
+	}
+	sql = normalized.sql
+	var generationErr error
+	if rewritten, generated := router.RewriteGeneratedInsert(sql, s.backends.Schema(), "0"); generated {
+		id, err := s.backends.NextGlobalID(context.Background())
+		if err != nil {
+			generationErr = err
+		} else {
+			rewritten, _ = router.RewriteGeneratedInsert(sql, s.backends.Schema(), strconv.FormatInt(id, 10))
+			sql = rewritten.SQL
+		}
+	}
+	if generationErr != nil {
+		s.sendSessionError(frontend, state.txStatus(), "55000", fmt.Sprintf("allocate globally unique primary key: %v", generationErr))
+		return false
+	}
 
 	started := time.Now()
 	success := false
@@ -609,7 +754,6 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 	}()
 
 	var responses [][]pgproto3.BackendMessage
-	var err error
 	target, routed := s.routeSQL(sql, targets)
 	if state.transaction && !isTransactionControl(sql) {
 		if !routed {
@@ -672,6 +816,12 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 				s.sendError(frontend, "08P01", fmt.Sprintf("unexpected Query response %T", wireMessage))
 				return false
 			}
+		}
+	}
+	if normalized.schema {
+		if err := s.backends.RefreshSchema(context.Background()); err != nil {
+			s.sendSessionError(frontend, state.txStatus(), "55000", fmt.Sprintf("refresh schema registry after DDL: %v", err))
+			return false
 		}
 	}
 	if description != nil {
@@ -793,12 +943,26 @@ func (s *Server) handleQuery(frontend *pgproto3.Backend, sql string) {
 		frontend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 		return
 	}
+	normalized, err := normalizeDDL(sql)
+	if err != nil {
+		s.sendError(frontend, "42601", err.Error())
+		return
+	}
+	sql = normalized.sql
+	if _, generated := router.RewriteGeneratedInsert(sql, s.backends.Schema(), "0"); generated {
+		id, err := s.backends.NextGlobalID(context.Background())
+		if err != nil {
+			s.sendError(frontend, "55000", fmt.Sprintf("allocate globally unique primary key: %v", err))
+			return
+		}
+		rewritten, _ := router.RewriteGeneratedInsert(sql, s.backends.Schema(), strconv.FormatInt(id, 10))
+		sql = rewritten.SQL
+	}
 	if requiresGlobalWriteOrder(sql) && !requiresRoutedWrite(sql) {
 		unlock := s.backends.LockWrites()
 		defer unlock()
 	}
 	var result backend.Result
-	var err error
 	target, routed := s.routeSQL(sql, s.backends.ShardNames())
 	if requiresRoutedWrite(sql) && !routed {
 		s.sendError(frontend, "0A000", "write must include a single id or tenant_id shard key")
@@ -812,6 +976,12 @@ func (s *Server) handleQuery(frontend *pgproto3.Backend, sql string) {
 	if err != nil {
 		s.sendError(frontend, "XX000", err.Error())
 		return
+	}
+	if normalized.schema {
+		if err := s.backends.RefreshSchema(context.Background()); err != nil {
+			s.sendError(frontend, "55000", fmt.Sprintf("refresh schema registry after DDL: %v", err))
+			return
+		}
 	}
 	if len(result.Fields) > 0 {
 		frontend.Send(&pgproto3.RowDescription{Fields: result.Fields})

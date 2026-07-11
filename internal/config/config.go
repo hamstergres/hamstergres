@@ -21,6 +21,7 @@ type Config struct {
 	Nest struct {
 		Endpoint    string `yaml:"endpoint"`
 		RegistryKey string `yaml:"registry_key"`
+		SequenceKey string `yaml:"sequence_key"`
 	} `yaml:"nest"`
 	Sharding struct {
 		PhysicalShards map[string]Shard `yaml:"physical_shards"`
@@ -49,6 +50,9 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.Nest.RegistryKey == "" {
 		cfg.Nest.RegistryKey = "/hamstergres/schema-registry/v1"
+	}
+	if cfg.Nest.SequenceKey == "" {
+		cfg.Nest.SequenceKey = "/hamstergres/sequences/global-id/v1"
 	}
 	if len(cfg.Sharding.PhysicalShards) == 0 {
 		return Config{}, fmt.Errorf("config %q: at least one physical Burrow is required", path)

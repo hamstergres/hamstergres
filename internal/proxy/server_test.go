@@ -1,6 +1,11 @@
 package proxy
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/jackc/pgx/v5/pgproto3"
+	"github.com/jruszo/hamstergres/internal/schema"
+)
 
 func TestMergedCommandTagCountsSelectRows(t *testing.T) {
 	got := mergedCommandTag([]string{"SELECT 1", "SELECT 1"}, 2)
@@ -71,5 +76,25 @@ func TestTransactionStatePinsAndClearsTarget(t *testing.T) {
 	updateTransactionState(&state, "COMMIT")
 	if state.transaction || state.target != "" || state.txStatus() != 'I' {
 		t.Fatalf("COMMIT state = %#v, want idle and unpinned", state)
+	}
+}
+
+func TestPrepareStatementAddsHiddenGeneratedParameter(t *testing.T) {
+	registry := schema.NewWithGenerated(map[string][]string{"widgets": {"id"}}, map[string]schema.GeneratedPrimary{"widgets": {Column: "id", Kind: "identity"}})
+	prepared, err := prepareStatement(&pgproto3.Parse{Name: "insert_widget", Query: "INSERT INTO widgets (name) VALUES ($1) RETURNING id", ParameterOIDs: []uint32{25}}, registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !prepared.generated || prepared.sql != `INSERT INTO widgets (name, "id") VALUES ($1, $2) RETURNING id` {
+		t.Fatalf("prepared statement = %#v", prepared)
+	}
+	if len(prepared.message.ParameterOIDs) != 2 || prepared.message.ParameterOIDs[1] != 0 {
+		t.Fatalf("parameter OIDs = %#v, want client parameter plus inferred generated parameter", prepared.message.ParameterOIDs)
+	}
+}
+
+func TestMaxParameterHandlesUnspecifiedParseOIDs(t *testing.T) {
+	if got := maxParameter("INSERT INTO widgets (name, category) VALUES ($2, $7)"); got != 7 {
+		t.Fatalf("maxParameter = %d, want 7", got)
 	}
 }

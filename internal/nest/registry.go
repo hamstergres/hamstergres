@@ -41,6 +41,15 @@ func (s *RegistryStore) VerifyOrSeed(ctx context.Context, live schema.Registry) 
 	return nil
 }
 
+// Replace records an intentional schema transition after the same DDL has
+// succeeded on every Burrow.
+func (s *RegistryStore) Replace(ctx context.Context, live schema.Registry) error {
+	if err := s.put(ctx, live); err != nil {
+		return fmt.Errorf("update Hamstergres Nest schema registry: %w", err)
+	}
+	return nil
+}
+
 type rangeResponse struct {
 	KVs []struct {
 		Value string `json:"value"`
