@@ -23,11 +23,20 @@ transactions:
 # hostname when the Proxy runs in Compose, or localhost:2379 from the host.
 nest:
   endpoint: "http://hamstergres-nest:2379"
-  registry_key: "/hamstergres/schema-registry/v1"
+  registry_key: "/hamstergres/schema-registry/v2"
   sequence_key: "/hamstergres/sequences/global-id/v1"
 
 sharding:
   virtual_shards: 65536
+
+  # Tables are sharded only when one or more columns have the exact PostgreSQL
+  # comment 'hamstergres.shard_key'. Multiple markers form an ordered compound
+  # shard key. Tables without that marker follow this fleet-wide
+  # policy. primary sends every read and write to one Burrow. replicated sends
+  # writes to every Burrow and load-balances reads across Burrows.
+  unsharded_tables:
+    mode: "primary"
+    primary_burrow: "burrow-01"
 
   # A physical_shard is called a Burrow in Hamstergres operator language.
   physical_shards:
@@ -38,6 +47,6 @@ sharding:
       # Docker-network address. Use localhost:5542 from the host instead.
       dsn: "postgres://hamster:hamster@burrow-02:5432/hamstergres?sslmode=disable"
 
-  # The Proxy discovers primary keys from PostgreSQL catalogs at startup. A
-  # complete primary-key value hashes into 64k vshards. Vshards are placed by
+  # The Proxy discovers annotated shard keys from PostgreSQL catalogs. A
+  # shard-key value hashes into 64k vshards. Vshards are placed by
   # one-indexed modulo over Burrows in this fixture.

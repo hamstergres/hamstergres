@@ -72,13 +72,25 @@ func TestGatewayEndToEnd(t *testing.T) {
 	queryGatewayError(t, frontendAddress, "SELECT * FROM hamstergres_missing_table", "XX000")
 
 	snapshot := gatewaySnapshot(t, statusURL+"/api/v1/status")
+	if snapshot.Sharding.Source != "hamstergres-nest" || snapshot.Sharding.VirtualShards != router.VirtualShards {
+		t.Fatalf("sharding inventory metadata = %#v", snapshot.Sharding)
+	}
+	accountsFound := false
+	for _, table := range snapshot.Sharding.Tables {
+		if table.Table == "public.accounts" && table.Sharded && strings.Join(table.ShardKeys, ",") == "tenant_id" {
+			accountsFound = true
+		}
+	}
+	if !accountsFound {
+		t.Fatalf("accounts missing from sharding inventory: %#v", snapshot.Sharding.Tables)
+	}
 	if snapshot.Queries.Queries != 3 || snapshot.Queries.FailedQueries != 1 {
 		t.Fatalf("query counters = %#v, want two successful and one failed query", snapshot.Queries)
 	}
-	if snapshot.QueryMetrics.Total.ScatteredQueries != 2 || snapshot.QueryMetrics.Total.SingleShardQueries != 1 {
-		t.Fatalf("routing counters = %#v, want two scattered and one single-shard query", snapshot.QueryMetrics.Total)
+	if snapshot.QueryMetrics.Total.ScatteredQueries != 1 || snapshot.QueryMetrics.Total.SingleShardQueries != 2 {
+		t.Fatalf("routing counters = %#v, want one scattered and two single-Burrow queries", snapshot.QueryMetrics.Total)
 	}
-	assertTotalShardExecutions(t, snapshot.QueryMetrics.ShardExecutions, 5)
+	assertTotalShardExecutions(t, snapshot.QueryMetrics.ShardExecutions, 4)
 	assertSummary(t, snapshot.QueryMetrics.QuerySummaries, "SELECT ? AS value")
 	assertSummary(t, snapshot.QueryMetrics.QuerySummaries, "SELECT * FROM accounts WHERE tenant_id = ? AND account_id = ?")
 	metrics := getBody(t, statusURL+"/metrics")
@@ -90,10 +102,11 @@ func TestGatewayEndToEnd(t *testing.T) {
 		`hamstergres_proxy_queries_total{outcome="success"} 2`,
 		`hamstergres_proxy_queries_total{outcome="failure"} 1`,
 		`hamstergres_proxy_query_failures_total{category="sql_error"} 1`,
-		`hamstergres_proxy_query_routes_total{route="single_burrow"} 1`,
-		`hamstergres_proxy_query_routes_total{route="scatter"} 2`,
+		`hamstergres_proxy_query_routes_total{route="single_burrow"} 2`,
+		`hamstergres_proxy_query_routes_total{route="scatter"} 1`,
 		`hamstergres_proxy_burrow_executions_total{burrow="burrow-01"}`,
 		`hamstergres_proxy_query_duration_seconds_count 3`,
+		`hamstergres_proxy_table_sharded{table="public.accounts"} 1`,
 		"# EOF",
 	} {
 		if !strings.Contains(metrics, want) {
@@ -105,6 +118,9 @@ func TestGatewayEndToEnd(t *testing.T) {
 	if !strings.Contains(page, "SELECT * FROM accounts WHERE tenant_id = ? AND account_id = ?") {
 		t.Fatalf("status page did not render the parameterized query shape:\n%s", page)
 	}
+	if !strings.Contains(page, "Sharding inventory") || !strings.Contains(page, "public.accounts") {
+		t.Fatalf("status page lacks Nest inventory:\n%s", page)
+	}
 	if !strings.Contains(page, statistics.Fingerprint("SELECT ? AS value")) {
 		t.Fatalf("status page did not render a query fingerprint:\n%s", page)
 	}
@@ -114,10 +130,60 @@ func TestGatewayEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("status CLI failed: %v\n%s", err, output)
 	}
-	if !strings.Contains(string(output), "Routing: 2 scattered / 1 single-shard") || !strings.Contains(string(output), statistics.Fingerprint("SELECT * FROM accounts WHERE tenant_id = ? AND account_id = ?")) {
+	if !strings.Contains(string(output), "Routing: 1 scattered / 2 single-shard") || !strings.Contains(string(output), statistics.Fingerprint("SELECT * FROM accounts WHERE tenant_id = ? AND account_id = ?")) {
 		t.Fatalf("status CLI output did not contain routing and fingerprint data:\n%s", output)
 	}
 	assertConcurrentQueriesAndMetricScrapes(t, frontendAddress, statusURL+"/metrics")
+}
+
+func TestReplicatedUnshardedTablesEndToEnd(t *testing.T) {
+	repoRoot := repositoryRoot(t)
+	ensureDockerBurrows(t, repoRoot)
+	frontendAddress, statusAddress := availableAddress(t), availableAddress(t)
+	configPath := writeGatewayConfig(t, frontendAddress, statusAddress)
+	contents, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents = bytes.Replace(contents, []byte("sharding:\n"), []byte("sharding:\n  unsharded_tables:\n    mode: replicated\n"), 1)
+	if err := os.WriteFile(configPath, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logs := startGateway(t, buildGateway(t, repoRoot), configPath)
+	waitForHealthyGateway(t, "http://"+statusAddress, logs)
+	queryGateway(t, frontendAddress, "DROP TABLE IF EXISTS replicated_e2e; CREATE TABLE replicated_e2e (value bigint)", func(rows pgx.Rows) {})
+	queryGateway(t, frontendAddress, "INSERT INTO replicated_e2e (value) VALUES (42)", func(rows pgx.Rows) {})
+	for _, port := range []string{"5541", "5542"} {
+		connection, err := pgx.Connect(context.Background(), "postgres://hamster:hamster@localhost:"+port+"/hamstergres?sslmode=disable")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var count int
+		err = connection.QueryRow(context.Background(), "SELECT count(*) FROM replicated_e2e WHERE value = 42").Scan(&count)
+		connection.Close(context.Background())
+		if err != nil || count != 1 {
+			t.Fatalf("Burrow %s count = %d, err = %v", port, count, err)
+		}
+	}
+	queryGateway(t, frontendAddress, "SELECT value FROM replicated_e2e", func(rows pgx.Rows) {
+		count := 0
+		for rows.Next() {
+			count++
+		}
+		if count != 1 {
+			t.Fatalf("replicated read returned %d rows, want one Burrow's row", count)
+		}
+	})
+	snapshot := gatewaySnapshot(t, "http://"+statusAddress+"/api/v1/status")
+	found := false
+	for _, table := range snapshot.Sharding.Tables {
+		if table.Table == "public.replicated_e2e" && !table.Sharded {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("unsharded table missing from Nest inventory: %#v", snapshot.Sharding.Tables)
+	}
 }
 
 func TestTracingAndObservabilityFailureEndToEnd(t *testing.T) {
@@ -284,10 +350,19 @@ func assertExportedTraceShape(t *testing.T, spans []*tracepb.Span) {
 	if !failedQuery {
 		t.Fatal("failed frontend query did not export error status")
 	}
+	scattered, single := 0, 0
 	for parent := range parents {
-		if len(tunnelsByParent[parent]) != 2 {
-			t.Fatalf("query %x selected Tunnel spans = %#v, want both Burrows", parent, tunnelsByParent[parent])
+		switch len(tunnelsByParent[parent]) {
+		case 2:
+			scattered++
+		case 1:
+			single++
+		default:
+			t.Fatalf("query %x selected no Tunnel", parent)
 		}
+	}
+	if scattered != 1 || single != 1 {
+		t.Fatalf("Tunnel routes = %d scattered and %d single-Burrow, want one of each", scattered, single)
 	}
 }
 
@@ -461,7 +536,7 @@ func TestCrossBurrowTransactionUsesTwoPhaseCommit(t *testing.T) {
 	if _, err := connection.Exec(context.Background(), "DROP TABLE IF EXISTS two_pc_e2e"); err != nil {
 		t.Fatalf("drop 2PC table: %v", err)
 	}
-	if _, err := connection.Exec(context.Background(), "CREATE TABLE two_pc_e2e (id bigint PRIMARY KEY, value text)"); err != nil {
+	if _, err := connection.Exec(context.Background(), "CREATE TABLE two_pc_e2e (id bigint PRIMARY KEY, value text); COMMENT ON COLUMN two_pc_e2e.id IS 'hamstergres.shard_key'"); err != nil {
 		t.Fatalf("prepare 2PC table: %v", err)
 	}
 	keys := keysForDifferentBurrows()
@@ -527,7 +602,7 @@ func TestCrossBurrowTransactionCanDisableTwoPhaseCommit(t *testing.T) {
 	if _, err := connection.Exec(context.Background(), "DROP TABLE IF EXISTS no_two_pc_e2e"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := connection.Exec(context.Background(), "CREATE TABLE no_two_pc_e2e (id bigint PRIMARY KEY, value text)"); err != nil {
+	if _, err := connection.Exec(context.Background(), "CREATE TABLE no_two_pc_e2e (id bigint PRIMARY KEY, value text); COMMENT ON COLUMN no_two_pc_e2e.id IS 'hamstergres.shard_key'"); err != nil {
 		t.Fatal(err)
 	}
 	transaction, err := connection.Begin(context.Background())
@@ -564,6 +639,7 @@ func TestFrontendDisconnectCancelsBlockedBurrowTransaction(t *testing.T) {
 
 	queryGateway(t, frontendAddress, "DROP TABLE IF EXISTS disconnect_e2e", func(rows pgx.Rows) {})
 	queryGateway(t, frontendAddress, "CREATE TABLE disconnect_e2e (id bigint PRIMARY KEY, value bigint)", func(rows pgx.Rows) {})
+	queryGateway(t, frontendAddress, "COMMENT ON COLUMN disconnect_e2e.id IS 'hamstergres.shard_key'", func(rows pgx.Rows) {})
 	queryGateway(t, frontendAddress, "INSERT INTO disconnect_e2e (id, value) VALUES (1, 0)", func(rows pgx.Rows) {})
 	target := router.BurrowForKey("1", []string{"burrow-01", "burrow-02"})
 	port := "5541"
@@ -736,6 +812,9 @@ func prepareGeneratedIDTable(t *testing.T) {
 		if _, err := connection.Exec(context.Background(), "CREATE TABLE generated_id_e2e (id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, payload INTEGER NOT NULL)"); err != nil {
 			t.Fatal(err)
 		}
+		if _, err := connection.Exec(context.Background(), "COMMENT ON COLUMN generated_id_e2e.id IS 'hamstergres.shard_key'"); err != nil {
+			t.Fatal(err)
+		}
 		connection.Close(context.Background())
 	}
 	t.Cleanup(func() {
@@ -813,6 +892,7 @@ func TestSysbenchReadWriteEndToEnd(t *testing.T) {
 	if output, err := runSysbench(sysbench, frontendAddress, "prepare"); err != nil {
 		t.Fatalf("sysbench prepare: %v\n%s", err, output)
 	}
+	queryGateway(t, frontendAddress, "COMMENT ON COLUMN sbtest1.id IS 'hamstergres.shard_key'", func(rows pgx.Rows) {})
 	if output, err := runSysbench(sysbench, frontendAddress, "run"); err != nil {
 		t.Fatalf("sysbench oltp_read_write workload: %v\n%s", err, output)
 	}

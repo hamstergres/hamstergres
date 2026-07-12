@@ -6,15 +6,25 @@ import (
 	"github.com/jruszo/hamstergres/internal/schema"
 )
 
-func TestTargetForSchemaUsesDiscoveredPrimaryKey(t *testing.T) {
+func TestTargetForSchemaUsesCompoundShardKeyWithText(t *testing.T) {
 	burrows := []string{"burrow-01", "burrow-02"}
-	registry := schema.New(map[string][]string{"accounts": {"tenant_id", "account_id"}})
-	target, ok := TargetForSchema("SELECT * FROM accounts WHERE tenant_id = 42 AND account_id = 9", nil, registry, burrows)
-	if !ok || target != BurrowForKey("42\x009", burrows) {
-		t.Fatalf("TargetForSchema = %q, %t; want composite primary-key target", target, ok)
+	registry := schema.New(map[string][]string{"accounts": {"region", "tenant_id"}})
+	target, ok := TargetForSchema("SELECT * FROM accounts WHERE tenant_id = 42 AND region = 'eu-west'", nil, registry, burrows)
+	if !ok || target != BurrowForKey("eu-west\x0042", burrows) {
+		t.Fatalf("TargetForSchema = %q, %t; want compound shard-key target", target, ok)
 	}
 	if _, ok := TargetForSchema("SELECT * FROM accounts WHERE tenant_id = 42", nil, registry, burrows); ok {
-		t.Fatal("partial composite primary key was routed")
+		t.Fatal("partial compound shard key was routed")
+	}
+	target, ok = TargetForSchema("INSERT INTO accounts (tenant_id, region) VALUES ($1, $2)", [][]byte{[]byte("42"), []byte("eu-west")}, registry, burrows)
+	if !ok || target != BurrowForKey("eu-west\x0042", burrows) {
+		t.Fatalf("bound compound TargetForSchema = %q, %t", target, ok)
+	}
+}
+
+func TestTableForSQL(t *testing.T) {
+	if table, ok := TableForSQL("UPDATE public.accounts SET balance = 1"); !ok || table != "public.accounts" {
+		t.Fatalf("TableForSQL = %q, %v", table, ok)
 	}
 }
 

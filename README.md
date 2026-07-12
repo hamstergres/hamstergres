@@ -164,13 +164,17 @@ Connect a PostgreSQL client to the gateway:
 psql "postgres://anything@localhost:6432/anything?sslmode=disable" -c 'SELECT * FROM accounts'
 ```
 
-At startup, the Proxy reads primary-key definitions from every Burrow and
-refuses to start if the registry differs. `SELECT`, `INSERT`, `UPDATE`, and
-`DELETE` route to one Burrow only when they provide the full discovered primary
-key (including every column of a composite key); other reads are scattered and
-their rows are appended in Burrow-name order. Ambiguous writes are rejected
+At startup, the Proxy reads explicit shard-key comments from every Burrow and
+refuses to start if the registry differs. Mark shard-key columns with `COMMENT ON
+COLUMN accounts.tenant_id IS 'hamstergres.shard_key'`. Multiple marked columns
+form an ordered compound key and may contain text, numeric, or mixed PostgreSQL
+types; tables without any marker are unsharded. `SELECT`, `INSERT`, `UPDATE`,
+and `DELETE` route to one Burrow when they provide the complete annotated key.
+Ambiguous or partial-key writes to sharded tables are rejected
 instead of being duplicated across the fleet. DDL is still applied to every
-Burrow. Extended-protocol portals with a complete bound primary key use one
+Burrow. The `sharding.unsharded_tables` configuration selects either one
+primary Burrow for all unsharded traffic or replicated writes with randomly
+load-balanced reads. Extended-protocol portals with a complete bound shard key use one
 Tunnel for Bind, Describe, Execute, and Close; unkeyed read portals retain
 deterministic scatter behavior. The Proxy preserves an extended request through
 Flush or Sync, so Bind, optional Describe, Execute, and Sync use one backend
@@ -202,7 +206,7 @@ before applying the schema to every Burrow, then refreshes the Nest registry.
 
 The development Compose environment includes an etcd-backed **Hamstergres
 Nest** on port 2379. On the first successful Proxy startup, it stores the
-catalog-derived primary-key registry in Nest. Later Proxy startups compare the
+catalog-derived table inventory, shard-key, and vshard registry in Nest. Later Proxy startups compare the
 live Burrows with that snapshot and fail closed if either has drifted. DDL sent
 through the Proxy is an intentional transition and refreshes the registry after
 all Burrows agree. Out-of-band schema changes still require an explicit

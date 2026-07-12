@@ -17,13 +17,14 @@ import (
 )
 
 type Snapshot struct {
-	Now           time.Time             `json:"now"`
-	StartedAt     time.Time             `json:"started_at"`
-	UptimeSeconds int64                 `json:"uptime_seconds"`
-	Queries       backend.Statistics    `json:"queries"`
-	QueryMetrics  backend.QueryMetrics  `json:"query_metrics"`
-	Frontend      proxy.Statistics      `json:"frontend"`
-	Burrows       []backend.ShardStatus `json:"burrows"`
+	Now           time.Time                 `json:"now"`
+	StartedAt     time.Time                 `json:"started_at"`
+	UptimeSeconds int64                     `json:"uptime_seconds"`
+	Queries       backend.Statistics        `json:"queries"`
+	QueryMetrics  backend.QueryMetrics      `json:"query_metrics"`
+	Frontend      proxy.Statistics          `json:"frontend"`
+	Burrows       []backend.ShardStatus     `json:"burrows"`
+	Sharding      backend.ShardingInventory `json:"sharding"`
 }
 
 // Collector is the gateway's in-process source of operational state. Future
@@ -44,7 +45,7 @@ func NewCollector(backends *backend.Manager, frontend *proxy.Server) *Collector 
 func (c *Collector) Snapshot(ctx context.Context) Snapshot {
 	now := time.Now().UTC()
 	metrics := c.backends.QueryMetrics()
-	return Snapshot{Now: now, StartedAt: c.started, UptimeSeconds: int64(now.Sub(c.started).Seconds()), Queries: metrics.Total, QueryMetrics: metrics, Frontend: c.frontend.Statistics(), Burrows: c.backends.ShardStatuses(ctx)}
+	return Snapshot{Now: now, StartedAt: c.started, UptimeSeconds: int64(now.Sub(c.started).Seconds()), Queries: metrics.Total, QueryMetrics: metrics, Frontend: c.frontend.Statistics(), Burrows: c.backends.ShardStatuses(ctx), Sharding: c.backends.ShardingInventory()}
 }
 
 type Server struct {
@@ -98,6 +99,14 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(&out, "hamstergres_proxy_operations_total{operation=%q,outcome=%q} %d\n", item.Operation, item.Outcome, item.Count)
 	}
 	metric("hamstergres_proxy_burrow_up", "gauge", "Whether the latest Burrow health check succeeded.")
+	metric("hamstergres_proxy_table_sharded", "gauge", "Whether a table is sharded according to the cached Hamstergres Nest inventory.")
+	for _, table := range snapshot.Sharding.Tables {
+		value := 0
+		if table.Sharded {
+			value = 1
+		}
+		fmt.Fprintf(&out, "hamstergres_proxy_table_sharded{table=%q} %d\n", table.Table, value)
+	}
 	metric("hamstergres_proxy_backend_pool_connections", "gauge", "Backend pool connections by Burrow and state.")
 	metric("hamstergres_proxy_backend_pool_acquire_total", "counter", "Backend pool acquisition attempts by Burrow and outcome.")
 	metric("hamstergres_proxy_backend_pool_wait_total", "counter", "Backend pool acquisitions that had to wait for capacity.")
@@ -150,6 +159,7 @@ var pageTemplate = template.Must(template.New("status").Parse(`<!doctype html>
 <body><h1>Hamstergres</h1><p>Running for {{.UptimeSeconds}} seconds · updated <code>{{.Now}}</code></p>
 <h2>Gateway</h2><p>{{.Frontend.ActiveConnections}} active / {{.Frontend.Connections}} total frontend connections · {{.Queries.Queries}} queries · {{.Queries.FailedQueries}} failed queries · {{.Queries.AverageDurationMillis}}ms average query duration</p>
 <h2>Routing</h2><p>{{.QueryMetrics.Total.ScatteredQueries}} scattered queries · {{.QueryMetrics.Total.SingleShardQueries}} single-shard queries</p>
+<h2>Sharding inventory</h2><p class="muted">Source: {{.Sharding.Source}} · {{.Sharding.VirtualShards}} vshards · unsharded mode: <code>{{.Sharding.UnshardedMode}}</code>{{if .Sharding.PrimaryBurrow}} · primary Burrow: <code>{{.Sharding.PrimaryBurrow}}</code>{{end}}</p><table><thead><tr><th>Table</th><th>Status</th><th>Shard key</th></tr></thead><tbody>{{range .Sharding.Tables}}<tr><td><code>{{.Table}}</code></td><td>{{if .Sharded}}sharded{{else}}unsharded{{end}}</td><td>{{if .Sharded}}{{range $index, $key := .ShardKeys}}{{if $index}}, {{end}}<code>{{$key}}</code>{{end}}{{else}}uses fleet policy{{end}}</td></tr>{{else}}<tr><td colspan="3" class="muted">No tables in the Nest inventory.</td></tr>{{end}}</tbody></table>
 <h2>Rolling query traffic</h2><table><thead><tr><th>Window</th><th>Queries</th><th>Failures</th><th>Routing</th><th>Average</th><th>Burrow executions</th></tr></thead><tbody>{{range .QueryMetrics.Windows}}<tr><td>{{.Name}}</td><td>{{.Statistics.Queries}}</td><td>{{.Statistics.FailedQueries}}</td><td>{{.Statistics.ScatteredQueries}} scattered<br>{{.Statistics.SingleShardQueries}} single-shard</td><td>{{.Statistics.AverageDurationMillis}}ms</td><td><ul class="shards">{{range .ShardExecutions}}<li>{{.Name}}: {{.Queries}}</li>{{end}}</ul></td></tr>{{end}}</tbody></table>
 <h2>Query summaries</h2><p class="muted">Query shapes retain SQL structure but replace string and numeric values with <code>?</code>. Fingerprints are stable identifiers for searching and correlation.</p><table><thead><tr><th>Query shape</th><th>Fingerprint</th><th>Statement</th><th>Queries</th><th>Failures</th><th>Routing</th><th>Burrow executions</th><th>Last seen</th></tr></thead><tbody>{{range .QueryMetrics.QuerySummaries}}<tr><td><code>{{.QueryShape}}</code></td><td><code>{{.Fingerprint}}</code></td><td>{{.Statement}}</td><td>{{.Statistics.Queries}}</td><td>{{.Statistics.FailedQueries}}</td><td>{{.Statistics.ScatteredQueries}} scattered<br>{{.Statistics.SingleShardQueries}} single-shard</td><td><ul class="shards">{{range .ShardExecutions}}<li>{{.Name}}: {{.Queries}}</li>{{end}}</ul></td><td class="muted">{{.LastSeenAt}}</td></tr>{{else}}<tr><td colspan="8" class="muted">No queries have been recorded yet.</td></tr>{{end}}</tbody></table>
 <h2>Burrows</h2><table><thead><tr><th>Name</th><th>Health</th><th>Connections</th><th>Last check</th></tr></thead><tbody>{{range .Burrows}}<tr><td>{{.Name}}</td><td class="{{if .Healthy}}healthy{{else}}unhealthy{{end}}">{{if .Healthy}}healthy{{else}}unhealthy: {{.LastError}}{{end}}</td><td>{{.AcquiredConns}} acquired, {{.IdleConns}} idle, {{.TotalConns}} total</td><td>{{.LastCheckedAt}}</td></tr>{{end}}</tbody></table>

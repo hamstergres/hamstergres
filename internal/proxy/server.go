@@ -205,8 +205,8 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 					break
 				}
 				target, routed := s.routePortal(statement.sql, parameters, s.backends.ShardNames())
-				if requiresRoutedWrite(statement.sql) && !routed {
-					s.sendExtendedError(frontend, "0A000", "write must include a complete primary-key shard key")
+				if s.requiresKeyedWrite(statement.sql) && !routed {
+					s.sendExtendedError(frontend, "0A000", "write to a sharded table must include its annotated shard key")
 					state.failed = true
 					break
 				}
@@ -414,6 +414,9 @@ type normalizedSQL struct {
 
 func normalizeDDL(sql string) (normalizedSQL, error) {
 	keyword := firstSQLKeyword(sql)
+	if keyword == "COMMENT" {
+		return normalizedSQL{sql: sql, schema: true}, nil
+	}
 	if keyword != "CREATE" && keyword != "ALTER" {
 		return normalizedSQL{sql: sql}, nil
 	}
@@ -1008,9 +1011,9 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 	}
 
 	target, routed := portal.target, portal.routed
-	if requiresRoutedWrite(portal.sql) && !routed {
+	if s.requiresKeyedWrite(portal.sql) && !routed {
 		errorCategory = "unsafe_routing"
-		s.sendExtendedError(frontend, "0A000", "write must include a complete primary-key shard key")
+		s.sendExtendedError(frontend, "0A000", "write to a sharded table must include its annotated shard key")
 		return false
 	}
 	var responses [][]pgproto3.BackendMessage
@@ -1394,9 +1397,9 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 	var responses [][]pgproto3.BackendMessage
 	var tunnelSpans []trace.Span
 	target, routed := s.routeSQL(sql, targets)
-	if requiresRoutedWrite(sql) && !routed {
+	if s.requiresKeyedWrite(sql) && !routed {
 		errorCategory = "unsafe_routing"
-		s.sendSessionError(frontend, state.txStatus(), "0A000", "write must include a single id or tenant_id shard key")
+		s.sendSessionError(frontend, state.txStatus(), "0A000", "write to a sharded table must include its annotated shard key")
 		return false
 	}
 	if requiresGlobalWriteOrder(sql) && !session.LockWritesContext(session.Context()) {
@@ -1626,11 +1629,44 @@ func runTransactionCommand(session *backend.Session, burrow, sql string) *pgprot
 }
 
 func (s *Server) routeSQL(sql string, burrows []string) (string, bool) {
-	return router.TargetForSchema(sql, nil, s.backends.Schema(), burrows)
+	return s.route(sql, nil, burrows)
 }
 
 func (s *Server) routePortal(sql string, parameters [][]byte, burrows []string) (string, bool) {
-	return router.TargetForSchema(sql, parameters, s.backends.Schema(), burrows)
+	return s.route(sql, parameters, burrows)
+}
+
+func (s *Server) route(sql string, parameters [][]byte, burrows []string) (string, bool) {
+	registry := s.backends.Schema()
+	if target, ok := router.TargetForSchema(sql, parameters, registry, burrows); ok {
+		return target, true
+	}
+	table, ok := router.TableForSQL(sql)
+	if !ok || registry.IsSharded(table) {
+		return "", false
+	}
+	if s.backends.UnshardedMode() == "primary" {
+		return s.backends.PrimaryBurrow(), true
+	}
+	if requiresRoutedWrite(sql) {
+		return "", false
+	}
+	if len(burrows) == 0 {
+		return "", false
+	}
+	var value [8]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return burrows[0], true
+	}
+	return burrows[binary.LittleEndian.Uint64(value[:])%uint64(len(burrows))], true
+}
+
+func (s *Server) requiresKeyedWrite(sql string) bool {
+	if !requiresRoutedWrite(sql) {
+		return false
+	}
+	table, ok := router.TableForSQL(sql)
+	return !ok || s.backends.Schema().IsSharded(table)
 }
 
 func requiresRoutedWrite(sql string) bool {
@@ -1776,9 +1812,9 @@ func (s *Server) handleQuery(frontend *pgproto3.Backend, sql string) {
 	}
 	var result backend.Result
 	target, routed := s.routeSQL(sql, s.backends.ShardNames())
-	if requiresRoutedWrite(sql) && !routed {
+	if s.requiresKeyedWrite(sql) && !routed {
 		errorCategory = "unsafe_routing"
-		s.sendError(frontend, "0A000", "write must include a single id or tenant_id shard key")
+		s.sendError(frontend, "0A000", "write to a sharded table must include its annotated shard key")
 		return
 	}
 	targets := s.backends.ShardNames()

@@ -53,10 +53,20 @@ type Manager struct {
 	registryStore *nest.RegistryStore
 	preparedMu    sync.Mutex
 	prepared      map[string]map[string]struct{}
+	unshardedMode string
+	primaryBurrow string
 }
 
 func New(ctx context.Context, cfg config.Config) (*Manager, error) {
-	m := &Manager{metrics: statistics.NewCollector(), writeGate: newWriteGate(), prepared: make(map[string]map[string]struct{})}
+	mode := cfg.Sharding.Unsharded.Mode
+	if mode == "" {
+		mode = config.UnshardedPrimary
+	}
+	primary := cfg.Sharding.Unsharded.PrimaryBurrow
+	if primary == "" && len(cfg.ShardNames()) > 0 {
+		primary = cfg.ShardNames()[0]
+	}
+	m := &Manager{metrics: statistics.NewCollector(), writeGate: newWriteGate(), prepared: make(map[string]map[string]struct{}), unshardedMode: mode, primaryBurrow: primary}
 	for _, name := range cfg.ShardNames() {
 		poolConfig, err := pgxpool.ParseConfig(cfg.Sharding.PhysicalShards[name].DSN)
 		if err != nil {
@@ -103,6 +113,24 @@ WHERE i.indisprimary
   AND n.nspname !~ '^pg_'
 ORDER BY n.nspname, c.relname, key_column.ordinality`
 
+const shardKeyQuery = `
+SELECT n.nspname, c.relname, a.attname
+FROM pg_attribute a
+JOIN pg_class c ON c.oid = a.attrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE a.attnum > 0 AND NOT a.attisdropped
+  AND col_description(c.oid, a.attnum) = 'hamstergres.shard_key'
+  AND n.nspname <> 'information_schema' AND n.nspname !~ '^pg_'
+ORDER BY n.nspname, c.relname, a.attnum`
+
+const tableInventoryQuery = `
+SELECT n.nspname || '.' || c.relname
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('r', 'p')
+  AND n.nspname <> 'information_schema' AND n.nspname !~ '^pg_'
+ORDER BY n.nspname, c.relname`
+
 func (m *Manager) loadSchema(ctx context.Context) (schema.Registry, error) {
 	var expected schema.Registry
 	for index, shard := range m.shards {
@@ -110,7 +138,7 @@ func (m *Manager) loadSchema(ctx context.Context) (schema.Registry, error) {
 		if err != nil {
 			return schema.Registry{}, fmt.Errorf("inspect schema on Burrow %s: %w", shard.name, err)
 		}
-		tables := make(map[string][]string)
+		primaryKeys := make(map[string][]string)
 		generated := make(map[string]schema.GeneratedPrimary)
 		for rows.Next() {
 			var namespace, table, column, identity, defaultExpression, dataType string
@@ -120,9 +148,9 @@ func (m *Manager) loadSchema(ctx context.Context) (schema.Registry, error) {
 				return schema.Registry{}, fmt.Errorf("read schema on Burrow %s: %w", shard.name, err)
 			}
 			qualified := namespace + "." + table
-			tables[qualified] = append(tables[qualified], column)
+			primaryKeys[qualified] = append(primaryKeys[qualified], column)
 			if namespace == "public" {
-				tables[table] = append(tables[table], column)
+				primaryKeys[table] = append(primaryKeys[table], column)
 			}
 			kind := ""
 			if identity != "" {
@@ -147,11 +175,63 @@ func (m *Manager) loadSchema(ctx context.Context) (schema.Registry, error) {
 		// without values for every other component, so expose only single-column
 		// generated primary keys to the rewrite path.
 		for table := range generated {
-			if len(tables[table]) != 1 {
+			if len(primaryKeys[table]) != 1 {
 				delete(generated, table)
 			}
 		}
-		registry := schema.NewWithGenerated(tables, generated)
+		keyRows, err := shard.pool.Query(ctx, shardKeyQuery)
+		if err != nil {
+			return schema.Registry{}, fmt.Errorf("inspect shard keys on Burrow %s: %w", shard.name, err)
+		}
+		shardKeys := make(map[string][]string)
+		for keyRows.Next() {
+			var namespace, table, column string
+			if err := keyRows.Scan(&namespace, &table, &column); err != nil {
+				keyRows.Close()
+				return schema.Registry{}, err
+			}
+			appendShardKey(shardKeys, namespace, table, column)
+		}
+		if err := keyRows.Err(); err != nil {
+			keyRows.Close()
+			return schema.Registry{}, err
+		}
+		keyRows.Close()
+		inventoryRows, err := shard.pool.Query(ctx, tableInventoryQuery)
+		if err != nil {
+			return schema.Registry{}, fmt.Errorf("inspect table inventory on Burrow %s: %w", shard.name, err)
+		}
+		var allTables []string
+		for inventoryRows.Next() {
+			var table string
+			if err := inventoryRows.Scan(&table); err != nil {
+				inventoryRows.Close()
+				return schema.Registry{}, err
+			}
+			allTables = append(allTables, table)
+		}
+		if err := inventoryRows.Err(); err != nil {
+			inventoryRows.Close()
+			return schema.Registry{}, err
+		}
+		inventoryRows.Close()
+		for table, value := range generated {
+			keys := shardKeys[table]
+			if len(keys) != 1 || keys[0] != value.Column {
+				delete(generated, table)
+			}
+		}
+		owners := make([]string, 65536)
+		for vshard := range owners {
+			names := m.shardNames()
+			remainder := vshard % len(names)
+			if remainder == 0 {
+				owners[vshard] = names[len(names)-1]
+			} else {
+				owners[vshard] = names[remainder-1]
+			}
+		}
+		registry := schema.NewWithGenerated(shardKeys, generated).WithVShards(owners).WithAllTables(allTables)
 		if index == 0 {
 			expected = registry
 			continue
@@ -161,6 +241,14 @@ func (m *Manager) loadSchema(ctx context.Context) (schema.Registry, error) {
 		}
 	}
 	return expected, nil
+}
+
+func appendShardKey(keys map[string][]string, namespace, table, column string) {
+	qualified := namespace + "." + table
+	keys[qualified] = append(keys[qualified], column)
+	if namespace == "public" {
+		keys[table] = append(keys[table], column)
+	}
 }
 
 // Session owns one PostgreSQL connection to every Burrow for the lifetime of a
@@ -641,7 +729,26 @@ func (m *Manager) ShardNames() []string {
 	return m.shardNames()
 }
 
-// Schema returns the primary-key registry validated across all Burrows at
+func (m *Manager) UnshardedMode() string { return m.unshardedMode }
+func (m *Manager) PrimaryBurrow() string { return m.primaryBurrow }
+
+type ShardingInventory struct {
+	Source        string                  `json:"source"`
+	UnshardedMode string                  `json:"unsharded_mode"`
+	PrimaryBurrow string                  `json:"primary_burrow,omitempty"`
+	VirtualShards int                     `json:"virtual_shards"`
+	Tables        []schema.TableInventory `json:"tables"`
+}
+
+// ShardingInventory returns the process-owned copy of the Nest-validated
+// catalog. It performs no PostgreSQL or Nest request on the status path.
+func (m *Manager) ShardingInventory() ShardingInventory {
+	m.schemaMu.RLock()
+	defer m.schemaMu.RUnlock()
+	return ShardingInventory{Source: "hamstergres-nest", UnshardedMode: m.unshardedMode, PrimaryBurrow: m.primaryBurrow, VirtualShards: len(m.schema.VShardOwners()), Tables: m.schema.Inventory()}
+}
+
+// Schema returns the shard-key registry validated across all Burrows at
 // startup. The Proxy uses it to make routing decisions.
 func (m *Manager) Schema() schema.Registry {
 	m.schemaMu.RLock()
