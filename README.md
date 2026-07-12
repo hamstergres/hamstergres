@@ -156,14 +156,16 @@ At startup, the Proxy reads primary-key definitions from every Burrow and
 refuses to start if the registry differs. `SELECT`, `INSERT`, `UPDATE`, and
 `DELETE` route to one Burrow only when they provide the full discovered primary
 key (including every column of a composite key); other reads are scattered and
-their rows are appended in Burrow-name order. Ambiguous writes are rejected
-instead of being duplicated across the fleet. DDL is still applied to every
-Burrow. A transaction is pinned to the
-first Burrow it touches, and cross-Burrow statements are rejected; Hamstergres
-does not claim distributed transaction support. Prepared statements and portals
-are pinned to the frontend session and retain supplied text or binary parameter
-and result formats. Authentication, TLS, cancellation, and COPY remain outside
-this initial gateway milestone.
+their rows are appended in Burrow-name order. Ambiguous simple-query writes are
+rejected instead of being duplicated across the fleet. DDL is still applied to
+every Burrow. A simple-query transaction may touch multiple Burrows; when it
+does, Hamstergres Proxy commits it with PostgreSQL two-phase commit. The initial
+extended-query contract deliberately fans every execution out to all Burrows
+and also uses two-phase commit. Prepared statements and portals are pinned to
+the frontend session and retain supplied text or binary parameter and result
+formats. `COPY FROM STDIN` is streamed to every Burrow, while `COPY TO STDOUT`
+merges each Burrow's stream in configured order. Authentication, TLS,
+cancellation, and `COPY BOTH` remain outside this initial gateway milestone.
 
 Single-column integer identity and `serial`/`bigserial` primary keys may be
 omitted in a single-row insert. Hamstergres Proxy allocates a fleet-wide,

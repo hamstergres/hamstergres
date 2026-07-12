@@ -47,11 +47,30 @@ primary-key registry from every Burrow's PostgreSQL catalogs and refuses to
 start if they disagree. It routes reads and writes using the discovered primary
 key (all columns for a composite key), with the static 64k-vshard map. It
 scatters only reads without a usable primary key and schema commands that must
-reach every Burrow. A write without one unambiguous primary key is rejected;
-it is never broadcast as a substitute for distributed transactions. Within a
-transaction, the first routed statement pins the session to one Burrow and a
-statement for another Burrow (or a scatter query) is rejected. The future Proxy
-will use Nest metadata to choose a Tunnel and target the appropriate Burrow.
+reach every Burrow. A simple-query write without one unambiguous primary key is
+rejected; it is never broadcast as a substitute for distributed transactions.
+Within a simple-query transaction, statements may route to different Burrows.
+If more than one Burrow participates, Hamstergres Proxy prepares the transaction
+on the fleet and then issues `COMMIT PREPARED` to each Burrow. A preparation
+failure is rolled back. A commit-phase failure is reported with SQLSTATE
+`40003` and the generated transaction ID because manual reconciliation may be
+required. The current coordinator does not yet persist commit decisions, so an
+operator must inspect `pg_prepared_xacts` after a Proxy crash during commit.
+
+The initial extended-query contract deliberately fans every execution out so
+prepared clients such as sysbench can complete their normal
+Parse/Bind/Describe/Execute/Close/Sync lifecycle across the Burrows. Extended
+transactions use the same two-phase commit path. The future Proxy will use Nest
+metadata to choose a Tunnel and target the appropriate Burrow.
+
+## COPY protocol
+
+Hamstergres Proxy supports the PostgreSQL streaming COPY protocol for `COPY
+FROM STDIN` and `COPY TO STDOUT`. COPY input is deliberately fanned out to every
+Burrow, matching the current extended-query contract. COPY output is appended
+in configured Burrow order. Format metadata must agree across the fleet, and
+`COPY BOTH` remains unsupported. COPY inside a multi-Burrow transaction joins
+the same two-phase commit.
 
 ## Schema registry contract
 

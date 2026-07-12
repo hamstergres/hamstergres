@@ -93,7 +93,7 @@ func (s *Server) sendStartup(frontend *pgproto3.Backend) error {
 }
 
 func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
-	state := extendedState{statements: make(map[string]statementState), portals: make(map[string]portalState)}
+	state := extendedState{statements: make(map[string]statementState), portals: make(map[string]portalState), participants: make(map[string]struct{})}
 	var session *backend.Session
 	defer func() {
 		if session != nil {
@@ -137,7 +137,11 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 			}
 		case *pgproto3.Query:
 			if !state.failed {
-				if session != nil || isTransactionControl(message.String) {
+				if firstSQLKeyword(message.String) == "COPY" {
+					if active, ok := ensureSession(); ok {
+						s.handleCopyQuery(frontend, active, message.String, &state)
+					}
+				} else if session != nil || isTransactionControl(message.String) {
 					if active, ok := ensureSession(); ok {
 						s.handleSessionQuery(frontend, active, message.String, &state)
 					}
@@ -200,9 +204,21 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 			// Each message above is flushed to the Burrows and its response is
 			// returned before the next frontend message is read, so Flush has no
 			// additional observable work to do.
-		case *pgproto3.CopyData, *pgproto3.CopyDone, *pgproto3.CopyFail:
-			s.sendExtendedError(frontend, "0A000", "COPY is not supported by Hamstergres Proxy")
-			state.failed = true
+		case *pgproto3.CopyData:
+			if !state.copyIn || session == nil {
+				s.sendExtendedError(frontend, "08P01", "CopyData received outside COPY FROM STDIN")
+				state.failed = true
+			} else if err := session.SendCopy(message); err != nil {
+				s.sendExtendedError(frontend, "08006", err.Error())
+				state.failed = true
+			}
+		case *pgproto3.CopyDone, *pgproto3.CopyFail:
+			if !state.copyIn || session == nil {
+				s.sendExtendedError(frontend, "08P01", "COPY completion received outside COPY FROM STDIN")
+				state.failed = true
+			} else if !s.handleCopyCompletion(frontend, session, message, &state) {
+				state.failed = true
+			}
 		case *pgproto3.Terminate:
 			return nil
 		default:
@@ -215,12 +231,14 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 }
 
 type extendedState struct {
-	statements  map[string]statementState
-	portals     map[string]portalState
-	failed      bool
-	transaction bool
-	target      string
-	schemaDirty bool
+	statements   map[string]statementState
+	portals      map[string]portalState
+	failed       bool
+	transaction  bool
+	target       string
+	schemaDirty  bool
+	copyIn       bool
+	participants map[string]struct{}
 }
 
 type statementState struct {
@@ -361,14 +379,123 @@ func (s *Server) handleClose(frontend *pgproto3.Backend, session *backend.Sessio
 	return s.relayUniform(frontend, responses, err, "Close")
 }
 
-func (s *Server) handleSync(frontend *pgproto3.Backend, session *backend.Session, state *extendedState) bool {
-	var responses [][]pgproto3.BackendMessage
-	var err error
-	if state.target != "" {
-		responses, err = exchangeOne(session, state.target, &pgproto3.Sync{}, isSyncDone)
-	} else {
-		responses, err = exchange(session, &pgproto3.Sync{}, isSyncDone)
+func (s *Server) handleCopyQuery(frontend *pgproto3.Backend, session *backend.Session, sql string, state *extendedState) bool {
+	responses, err := exchange(session, &pgproto3.Query{String: sql}, isCopyStarted)
+	if err != nil {
+		s.sendExtendedError(frontend, "08006", err.Error())
+		return false
 	}
+	if response := firstError(responses); response != nil {
+		frontend.Send(response)
+		frontend.Send(&pgproto3.ReadyForQuery{TxStatus: state.txStatus()})
+		return false
+	}
+	if len(responses) == 0 || len(responses[0]) == 0 {
+		s.sendExtendedError(frontend, "XX000", "no Burrow COPY response")
+		return false
+	}
+	first := responses[0][len(responses[0])-1]
+	for _, response := range responses[1:] {
+		if len(response) == 0 || reflect.TypeOf(response[len(response)-1]) != reflect.TypeOf(first) {
+			s.sendExtendedError(frontend, "XX000", "incompatible COPY responses from Burrows")
+			return false
+		}
+	}
+	switch response := first.(type) {
+	case *pgproto3.CopyInResponse:
+		frontend.Send(response)
+		state.copyIn = true
+		s.markAllParticipants(state)
+		return true
+	case *pgproto3.CopyOutResponse:
+		frontend.Send(response)
+		s.markAllParticipants(state)
+		return s.handleCopyOut(frontend, session, state)
+	case *pgproto3.CopyBothResponse:
+		s.sendExtendedError(frontend, "0A000", "COPY BOTH is not supported by Hamstergres Proxy")
+		return false
+	default:
+		s.sendExtendedError(frontend, "08P01", fmt.Sprintf("unexpected COPY response %T", first))
+		return false
+	}
+}
+
+func (s *Server) markAllParticipants(state *extendedState) {
+	if !state.transaction {
+		return
+	}
+	for _, name := range s.backends.ShardNames() {
+		state.participants[name] = struct{}{}
+	}
+}
+
+func (s *Server) handleCopyOut(frontend *pgproto3.Backend, session *backend.Session, state *extendedState) bool {
+	responses, err := session.ReceiveUntil(context.Background(), isQueryDone)
+	if err != nil {
+		s.sendExtendedError(frontend, "08006", err.Error())
+		return false
+	}
+	if response := firstError(responses); response != nil {
+		frontend.Send(response)
+		frontend.Send(&pgproto3.ReadyForQuery{TxStatus: state.txStatus()})
+		return false
+	}
+	var tags []string
+	for _, response := range responses {
+		for _, message := range response {
+			switch message := message.(type) {
+			case *pgproto3.CopyData:
+				frontend.Send(message)
+			case *pgproto3.CommandComplete:
+				tags = append(tags, string(message.CommandTag))
+			case *pgproto3.CopyDone, *pgproto3.ReadyForQuery, *pgproto3.NoticeResponse:
+			default:
+				s.sendExtendedError(frontend, "08P01", fmt.Sprintf("unexpected COPY TO response %T", message))
+				return false
+			}
+		}
+	}
+	frontend.Send(&pgproto3.CopyDone{})
+	if len(tags) > 0 {
+		frontend.Send(&pgproto3.CommandComplete{CommandTag: []byte(mergedCommandTag(tags, 0))})
+	}
+	frontend.Send(&pgproto3.ReadyForQuery{TxStatus: state.txStatus()})
+	return true
+}
+
+func (s *Server) handleCopyCompletion(frontend *pgproto3.Backend, session *backend.Session, message pgproto3.FrontendMessage, state *extendedState) bool {
+	state.copyIn = false
+	if err := session.SendCopy(message); err != nil {
+		s.sendExtendedError(frontend, "08006", err.Error())
+		return false
+	}
+	responses, err := session.ReceiveUntil(context.Background(), isQueryDone)
+	if err != nil {
+		s.sendExtendedError(frontend, "08006", err.Error())
+		return false
+	}
+	if response := firstError(responses); response != nil {
+		frontend.Send(response)
+		frontend.Send(&pgproto3.ReadyForQuery{TxStatus: state.txStatus()})
+		return false
+	}
+	var tags []string
+	for _, response := range responses {
+		for _, wireMessage := range response {
+			if complete, ok := wireMessage.(*pgproto3.CommandComplete); ok {
+				tags = append(tags, string(complete.CommandTag))
+			}
+		}
+	}
+	if len(tags) > 0 {
+		frontend.Send(&pgproto3.CommandComplete{CommandTag: []byte(mergedCommandTag(tags, 0))})
+	}
+	frontend.Send(&pgproto3.ReadyForQuery{TxStatus: state.txStatus()})
+	return true
+}
+
+func (s *Server) handleSync(frontend *pgproto3.Backend, session *backend.Session, state *extendedState) bool {
+	responses, err := exchange(session, &pgproto3.Sync{}, isSyncDone)
 	if err != nil {
 		s.sendExtendedError(frontend, "08006", err.Error())
 		return false
@@ -402,31 +529,22 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 			s.backends.RecordQueryTargets(portal.sql, success, time.Since(started), targets)
 		}
 	}()
+	if state.transaction && (firstSQLKeyword(portal.sql) == "COMMIT" || firstSQLKeyword(portal.sql) == "END") {
+		if response := s.commitTwoPhase(session); response != nil {
+			frontend.Send(response)
+			return false
+		}
+		frontend.Send(&pgproto3.CommandComplete{CommandTag: []byte("COMMIT")})
+		state.transaction = false
+		clear(state.participants)
+		success = true
+		return true
+	}
 
-	var responses [][]pgproto3.BackendMessage
-	var err error
-	target, routed := s.routePortal(portal.sql, portal.parameters, targets)
-	if state.transaction && !isTransactionControl(portal.sql) {
-		if !routed {
-			s.sendExtendedError(frontend, "0A000", "cross-Burrow statements are not supported inside a transaction")
-			return false
-		}
-		if state.target != "" && state.target != target {
-			s.sendExtendedError(frontend, "0A000", "transaction is pinned to a different Burrow")
-			return false
-		}
-		state.target = target
-	}
-	if requiresRoutedWrite(portal.sql) && !routed {
-		s.sendExtendedError(frontend, "0A000", "write must include a single id or tenant_id shard key")
-		return false
-	}
-	if routed && !isTransactionControl(portal.sql) {
-		targets = []string{target}
-		responses, err = exchangeOne(session, target, message, isExecuteDone)
-	} else {
-		responses, err = exchange(session, message, isExecuteDone)
-	}
+	// The initial extended-query contract is deliberately fan-out. Keeping
+	// every affinity connection in the same Parse/Bind/Execute/Sync lifecycle
+	// also lets a transaction use multiple shard keys, as sysbench does.
+	responses, err := exchange(session, message, isExecuteDone)
 	if err != nil {
 		s.sendExtendedError(frontend, "08006", err.Error())
 		return false
@@ -671,6 +789,15 @@ func isExecuteDone(message pgproto3.BackendMessage) bool {
 	}
 }
 
+func isCopyStarted(message pgproto3.BackendMessage) bool {
+	switch message.(type) {
+	case *pgproto3.CopyInResponse, *pgproto3.CopyOutResponse, *pgproto3.CopyBothResponse, *pgproto3.ErrorResponse, *pgproto3.ReadyForQuery:
+		return true
+	default:
+		return false
+	}
+}
+
 func mergedCommandTag(tags []string, rowCount int) string {
 	if len(tags) == 0 {
 		return ""
@@ -725,6 +852,9 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 		frontend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 		return true
 	}
+	if state.transaction && (firstSQLKeyword(sql) == "COMMIT" || firstSQLKeyword(sql) == "END") && len(state.participants) > 1 {
+		return s.handleTwoPhaseCommit(frontend, session, state)
+	}
 	normalized, err := normalizeDDL(sql)
 	if err != nil {
 		s.sendSessionError(frontend, state.txStatus(), "42601", err.Error())
@@ -755,17 +885,6 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 
 	var responses [][]pgproto3.BackendMessage
 	target, routed := s.routeSQL(sql, targets)
-	if state.transaction && !isTransactionControl(sql) {
-		if !routed {
-			s.sendSessionError(frontend, state.txStatus(), "0A000", "cross-Burrow statements are not supported inside a transaction")
-			return false
-		}
-		if state.target != "" && state.target != target {
-			s.sendSessionError(frontend, state.txStatus(), "0A000", "transaction is pinned to a different Burrow")
-			return false
-		}
-		state.target = target
-	}
 	if requiresRoutedWrite(sql) && !routed {
 		s.sendSessionError(frontend, state.txStatus(), "0A000", "write must include a single id or tenant_id shard key")
 		return false
@@ -835,6 +954,15 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 	} else {
 		frontend.Send(&pgproto3.EmptyQueryResponse{})
 	}
+	if state.transaction && !isTransactionControl(sql) {
+		if routed {
+			state.participants[target] = struct{}{}
+		} else {
+			for _, name := range targets {
+				state.participants[name] = struct{}{}
+			}
+		}
+	}
 	updateTransactionState(state, sql)
 	frontend.Send(&pgproto3.ReadyForQuery{TxStatus: state.txStatus()})
 	if !state.transaction {
@@ -842,6 +970,60 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 	}
 	success = true
 	return true
+}
+
+func (s *Server) handleTwoPhaseCommit(frontend *pgproto3.Backend, session *backend.Session, state *extendedState) bool {
+	if response := s.commitTwoPhase(session); response != nil {
+		frontend.Send(response)
+		frontend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+		state.transaction = false
+		clear(state.participants)
+		session.UnlockWrites()
+		return false
+	}
+	state.transaction = false
+	state.target = ""
+	clear(state.participants)
+	session.UnlockWrites()
+	frontend.Send(&pgproto3.CommandComplete{CommandTag: []byte("COMMIT")})
+	frontend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+	return true
+}
+
+func (s *Server) commitTwoPhase(session *backend.Session) *pgproto3.ErrorResponse {
+	gid := fmt.Sprintf("hamstergres-%08x-%08x", randomUint32(), randomUint32())
+	burrows := s.backends.ShardNames()
+	prepared := make([]string, 0, len(burrows))
+	for _, name := range burrows {
+		if response := runTransactionCommand(session, name, "PREPARE TRANSACTION '"+gid+"'"); response != nil {
+			for _, preparedName := range prepared {
+				_ = runTransactionCommand(session, preparedName, "ROLLBACK PREPARED '"+gid+"'")
+			}
+			for _, rollbackName := range burrows[len(prepared):] {
+				_ = runTransactionCommand(session, rollbackName, "ROLLBACK")
+			}
+			return response
+		}
+		prepared = append(prepared, name)
+	}
+	for _, name := range prepared {
+		if response := runTransactionCommand(session, name, "COMMIT PREPARED '"+gid+"'"); response != nil {
+			return &pgproto3.ErrorResponse{
+				Severity: "ERROR",
+				Code:     "40003",
+				Message:  fmt.Sprintf("two-phase commit %s is in doubt after Burrow %s failed: %s", gid, name, response.Message),
+			}
+		}
+	}
+	return nil
+}
+
+func runTransactionCommand(session *backend.Session, burrow, sql string) *pgproto3.ErrorResponse {
+	responses, err := exchangeOne(session, burrow, &pgproto3.Query{String: sql}, isQueryDone)
+	if err != nil {
+		return &pgproto3.ErrorResponse{Severity: "ERROR", Code: "08006", Message: err.Error()}
+	}
+	return firstError(responses)
 }
 
 func (s *Server) routeSQL(sql string, burrows []string) (string, bool) {
@@ -866,9 +1048,11 @@ func updateTransactionState(state *extendedState, sql string) {
 	case "BEGIN", "START":
 		state.transaction = true
 		state.target = ""
+		clear(state.participants)
 	case "COMMIT", "END", "ROLLBACK", "ABORT":
 		state.transaction = false
 		state.target = ""
+		clear(state.participants)
 	}
 }
 

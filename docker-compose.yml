@@ -21,6 +21,7 @@ services:
 
   burrow-01:
     image: postgres:17-alpine
+    command: ["postgres", "-c", "max_prepared_transactions=32"]
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-hamster}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hamster}
@@ -39,6 +40,7 @@ services:
 
   burrow-02:
     image: postgres:17-alpine
+    command: ["postgres", "-c", "max_prepared_transactions=32"]
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-hamster}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hamster}

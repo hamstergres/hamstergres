@@ -55,3 +55,11 @@ func TestRewriteGeneratedInsertReplacesDefaultButPreservesExplicitKey(t *testing
 		t.Fatal("explicit key was rewritten")
 	}
 }
+
+func TestRewriteGeneratedInsertRejectsMultipleRows(t *testing.T) {
+	registry := schema.NewWithGenerated(map[string][]string{"widgets": {"id"}}, map[string]schema.GeneratedPrimary{"widgets": {Column: "id", Kind: "identity"}})
+	result, ok := RewriteGeneratedInsert("INSERT INTO widgets (name) VALUES ('first'), ('second')", registry, "42")
+	if ok {
+		t.Fatalf("RewriteGeneratedInsert = %#v, true; want unchanged multi-row insert", result)
+	}
+}
