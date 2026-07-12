@@ -1,0 +1,71 @@
+groups:
+  - name: hamstergres-demo
+    rules:
+      - record: hamstergres:proxy_error_ratio:5m
+        expr: sum(rate(hamstergres_proxy_queries_total{outcome="failure"}[5m])) / clamp_min(sum(rate(hamstergres_proxy_queries_total[5m])), 0.001)
+      - record: hamstergres:proxy_latency_p95_seconds:5m
+        expr: histogram_quantile(0.95, sum by (le) (rate(hamstergres_proxy_query_duration_seconds_bucket[5m])))
+      - alert: HamstergresProxyDown
+        expr: up{job="hamstergres-proxy"} == 0
+        for: 30s
+        annotations:
+          summary: Hamstergres Proxy metrics are unavailable
+          description: Prometheus has been unable to scrape Hamstergres Proxy for 30 seconds.
+      - alert: HamstergresBurrowExporterDown
+        expr: up{job="burrows"} == 0
+        for: 30s
+        annotations:
+          summary: "{{ $labels.burrow }} monitoring is unavailable"
+          description: The PostgreSQL exporter for this Burrow cannot be scraped.
+      - alert: HamstergresProxyHighErrorRate
+        expr: hamstergres:proxy_error_ratio:5m > 0.05
+        for: 2m
+        annotations:
+          summary: Hamstergres Proxy error rate is elevated
+          description: More than 5 percent of queries have failed over five minutes.
+      - alert: HamstergresProxyHighLatency
+        expr: hamstergres:proxy_latency_p95_seconds:5m > 0.5
+        for: 2m
+        annotations:
+          summary: Hamstergres Proxy p95 latency is elevated
+          description: Five-minute p95 query latency exceeds 500 ms.
+      - alert: HamstergresBackendPoolSaturated
+        expr: hamstergres_proxy_backend_pool_connections{state="in_use"} / clamp_min(hamstergres_proxy_backend_pool_connections{state="capacity"}, 1) > 0.9
+        for: 1m
+        annotations:
+          summary: "Backend pool for {{ $labels.burrow }} is saturated"
+          description: More than 90 percent of the Tunnel pool is in use.
+      - alert: HamstergresBurrowUnhealthy
+        expr: hamstergres_proxy_burrow_up == 0
+        for: 30s
+        annotations:
+          summary: "{{ $labels.burrow }} is unhealthy"
+          description: Hamstergres Proxy cannot reach this Burrow.
+      - alert: HamstergresBurrowRoutingImbalanced
+        expr: max(sum by (burrow) (rate(hamstergres_proxy_burrow_executions_total[5m]))) / clamp_min(min(sum by (burrow) (rate(hamstergres_proxy_burrow_executions_total[5m]))), 0.001) > 2
+        for: 5m
+        annotations:
+          summary: Burrow routing is imbalanced
+          description: The busiest Burrow has over twice the execution rate of the quietest Burrow.
+      - alert: HamstergresNestUnavailable
+        expr: up{job="hamstergres-nest"} == 0 or increase(hamstergres_proxy_operations_total{operation="nest_request",outcome="failure"}[5m]) > 0
+        for: 30s
+        annotations:
+          summary: Hamstergres Nest is unavailable
+          description: Nest scraping or a Proxy request to Nest has failed.
+      - alert: HamstergresSchemaRegistryFailure
+        expr: increase(hamstergres_proxy_operations_total{operation=~"schema_registry_mismatch|schema_registry_refresh",outcome=~"detected|failure"}[5m]) > 0
+        annotations:
+          summary: Schema registry validation or refresh failed
+          description: Hamstergres detected schema drift or could not refresh the registry.
+      - alert: HamstergresPreparedTransactionUncertain
+        expr: increase(hamstergres_proxy_operations_total{operation="two_phase_commit",outcome=~"prepare_failure|uncertain"}[5m]) > 0 or max(pg_prepared_transactions_count) > 0
+        for: 1m
+        annotations:
+          summary: A distributed transaction needs attention
+          description: A two-phase commit failed, became uncertain, or remained prepared for over one minute.
+      - alert: HamstergresGeneratedIDAllocationFailure
+        expr: increase(hamstergres_proxy_operations_total{operation="generated_id_allocation",outcome="failure"}[5m]) > 0
+        annotations:
+          summary: Generated ID allocation failed
+          description: Hamstergres Proxy could not allocate a fleet-wide generated ID through Nest.

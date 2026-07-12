@@ -9,8 +9,9 @@ services:
       - --data-dir=/etcd-data
       - --advertise-client-urls=http://0.0.0.0:2379
       - --listen-client-urls=http://0.0.0.0:2379
+      - --listen-metrics-urls=http://0.0.0.0:2381
     ports:
-      - "2379:2379"
+      - "127.0.0.1:${NEST_PORT:-2379}:2379"
     volumes:
       - hamstergres-nest-data:/etcd-data
     healthcheck:
@@ -26,8 +27,10 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-hamster}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hamster}
       POSTGRES_DB: ${POSTGRES_DB:-hamstergres}
+      POSTGRES_MONITORING_USER: ${POSTGRES_MONITORING_USER:-hamstergres_monitor}
+      POSTGRES_MONITORING_PASSWORD: ${POSTGRES_MONITORING_PASSWORD:-hamstergres_monitor}
     ports:
-      - "5541:5432"
+      - "127.0.0.1:${BURROW_01_PORT:-5541}:5432"
     volumes:
       - burrow-01-data:/var/lib/postgresql/data
       - ./db/init:/docker-entrypoint-initdb.d:ro
@@ -45,8 +48,10 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-hamster}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hamster}
       POSTGRES_DB: ${POSTGRES_DB:-hamstergres}
+      POSTGRES_MONITORING_USER: ${POSTGRES_MONITORING_USER:-hamstergres_monitor}
+      POSTGRES_MONITORING_PASSWORD: ${POSTGRES_MONITORING_PASSWORD:-hamstergres_monitor}
     ports:
-      - "5542:5432"
+      - "127.0.0.1:${BURROW_02_PORT:-5542}:5432"
     volumes:
       - burrow-02-data:/var/lib/postgresql/data
       - ./db/init:/docker-entrypoint-initdb.d:ro
@@ -57,11 +62,115 @@ services:
       retries: 15
       start_period: 5s
 
+  hamstergres-proxy:
+    profiles: ["observability"]
+    build:
+      context: .
+    command: ["-config", "/etc/hamstergres/config.yaml"]
+    ports:
+      - "127.0.0.1:${HAMSTERGRES_PROXY_PORT:-6432}:6432"
+      - "127.0.0.1:${HAMSTERGRES_STATUS_PORT:-8080}:8080"
+    volumes:
+      - ./config/hamstergres.compose.yaml:/etc/hamstergres/config.yaml:ro
+    depends_on:
+      hamstergres-nest:
+        condition: service_healthy
+      burrow-01:
+        condition: service_healthy
+      burrow-02:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  burrow-01-exporter:
+    profiles: ["observability"]
+    image: prometheuscommunity/postgres-exporter:v0.17.1
+    environment:
+      DATA_SOURCE_NAME: "postgresql://${POSTGRES_MONITORING_USER:-hamstergres_monitor}:${POSTGRES_MONITORING_PASSWORD:-hamstergres_monitor}@burrow-01:5432/${POSTGRES_DB:-hamstergres}?sslmode=disable"
+      PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres-exporter/queries.yml
+    volumes:
+      - ./observability/postgres-exporter/queries.yml:/etc/postgres-exporter/queries.yml:ro
+    depends_on:
+      burrow-01:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/bin/postgres_exporter", "--version"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  burrow-02-exporter:
+    profiles: ["observability"]
+    image: prometheuscommunity/postgres-exporter:v0.17.1
+    environment:
+      DATA_SOURCE_NAME: "postgresql://${POSTGRES_MONITORING_USER:-hamstergres_monitor}:${POSTGRES_MONITORING_PASSWORD:-hamstergres_monitor}@burrow-02:5432/${POSTGRES_DB:-hamstergres}?sslmode=disable"
+      PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres-exporter/queries.yml
+    volumes:
+      - ./observability/postgres-exporter/queries.yml:/etc/postgres-exporter/queries.yml:ro
+    depends_on:
+      burrow-02:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/bin/postgres_exporter", "--version"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  prometheus:
+    profiles: ["observability"]
+    image: prom/prometheus:v3.2.1
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.path=/prometheus"]
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./observability/prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      hamstergres-proxy:
+        condition: service_healthy
+      burrow-01-exporter:
+        condition: service_healthy
+      burrow-02-exporter:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9090/-/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  grafana:
+    profiles: ["observability"]
+    image: grafana/grafana:11.5.2
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:3000/api/health | grep -q ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
 volumes:
   hamstergres-nest-data:
+    name: ${NEST_DATA_VOLUME:-hamstergres_nest-data}
   burrow-01-data:
     # Preserve the development data volume created before the Burrow rename.
-    name: hamstergres_shard-01-data
+    name: ${BURROW_01_DATA_VOLUME:-hamstergres_shard-01-data}
   burrow-02-data:
     # Preserve the development data volume created before the Burrow rename.
-    name: hamstergres_shard-02-data
+    name: ${BURROW_02_DATA_VOLUME:-hamstergres_shard-02-data}
+  prometheus-data:
+  grafana-data:

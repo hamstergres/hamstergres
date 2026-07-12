@@ -269,6 +269,44 @@ scrape_configs:
       - targets: ["127.0.0.1:8080"]
 ```
 
+### Reproducible demo dashboards
+
+The optional Compose profile starts Hamstergres Proxy, Prometheus, Grafana,
+Hamstergres Nest, both Burrows, and one PostgreSQL exporter per Burrow:
+
+```sh
+make up-observability
+```
+
+Open Grafana at <http://127.0.0.1:3000> and sign in with `admin` / `admin`.
+The provisioned **Hamstergres Demo Overview** dashboard is ready without any
+manual data-source or dashboard import. Prometheus is available at
+<http://127.0.0.1:9090>, Proxy status at <http://127.0.0.1:8080>, and the
+PostgreSQL client endpoint at `127.0.0.1:6432`. All published ports bind to
+loopback by default and can be changed with `GRAFANA_PORT`, `PROMETHEUS_PORT`,
+`HAMSTERGRES_STATUS_PORT`, and `HAMSTERGRES_PROXY_PORT`.
+
+Generate traffic and verify all four Prometheus scrape targets plus the
+provisioned dashboard with:
+
+```sh
+make test-observability
+```
+
+The smoke check requires `curl` and `psql`. Dashboard JSON, the Prometheus
+scrape and alert rules, and Grafana provisioning live under `observability/`.
+The PostgreSQL exporters use the `pg_monitor` role created by
+`db/init/002_monitoring.sh`; override `POSTGRES_MONITORING_USER` and
+`POSTGRES_MONITORING_PASSWORD` before the first initialization if desired. If
+the Burrow data volumes predate that initialization script, run
+`docker compose down --volumes` once to recreate this disposable demo data.
+
+This profile is a local demonstration, not a production-hardened monitoring
+deployment. Its defaults intentionally use well-known development passwords,
+no TLS, no Grafana secret management, no metrics authentication, and local
+named volumes. Use managed secrets, authentication, TLS, retention/resource
+limits, backups, and your normal access controls in a real environment.
+
 Structured operational events use stable `event`, `component`, `burrow`,
 `transaction_id`, and `error_category` fields where applicable. Set
 `observability.log_file` to append JSON logs to a local file created with mode

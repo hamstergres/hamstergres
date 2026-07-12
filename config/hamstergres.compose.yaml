@@ -1,0 +1,17 @@
+listen:
+  address: "0.0.0.0:6432"
+
+status:
+  address: "0.0.0.0:8080"
+
+nest:
+  endpoint: "http://hamstergres-nest:2379"
+  registry_key: "/hamstergres/schema-registry/v1"
+  sequence_key: "/hamstergres/sequences/global-id/v1"
+
+sharding:
+  physical_shards:
+    burrow-01:
+      dsn: "postgres://hamster:hamster@burrow-01:5432/hamstergres?sslmode=disable"
+    burrow-02:
+      dsn: "postgres://hamster:hamster@burrow-02:5432/hamstergres?sslmode=disable"
