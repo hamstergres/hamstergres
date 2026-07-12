@@ -51,10 +51,12 @@ type Manager struct {
 	schema        schema.Registry
 	globalIDs     *nest.SequenceStore
 	registryStore *nest.RegistryStore
+	preparedMu    sync.Mutex
+	prepared      map[string]map[string]struct{}
 }
 
 func New(ctx context.Context, cfg config.Config) (*Manager, error) {
-	m := &Manager{metrics: statistics.NewCollector(), writeGate: newWriteGate()}
+	m := &Manager{metrics: statistics.NewCollector(), writeGate: newWriteGate(), prepared: make(map[string]map[string]struct{})}
 	for _, name := range cfg.ShardNames() {
 		poolConfig, err := pgxpool.ParseConfig(cfg.Sharding.PhysicalShards[name].DSN)
 		if err != nil {
@@ -96,7 +98,9 @@ JOIN pg_namespace n ON n.oid = c.relnamespace
 JOIN unnest(i.indkey) WITH ORDINALITY AS key_column(attnum, ordinality) ON true
 JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = key_column.attnum
 LEFT JOIN pg_attrdef ad ON ad.adrelid = c.oid AND ad.adnum = a.attnum
-WHERE i.indisprimary AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+WHERE i.indisprimary
+  AND n.nspname <> 'information_schema'
+  AND n.nspname !~ '^pg_'
 ORDER BY n.nspname, c.relname, key_column.ordinality`
 
 func (m *Manager) loadSchema(ctx context.Context) (schema.Registry, error) {
@@ -172,8 +176,9 @@ type Session struct {
 }
 
 type sessionShard struct {
-	name string
-	conn *pgconn.PgConn
+	name   string
+	conn   *pgconn.PgConn
+	pooled *pgxpool.Conn
 }
 
 // NewSession establishes an affinity connection to each Burrow. The caller
@@ -181,17 +186,84 @@ type sessionShard struct {
 func (m *Manager) NewSession(ctx context.Context) (*Session, error) {
 	session := &Session{shards: make([]*sessionShard, 0, len(m.shards)), writeGate: m.writeGate, ctx: ctx, manager: m}
 	for _, shard := range m.shards {
-		conn, err := pgconn.Connect(ctx, shard.dsn)
+		pooled, err := shard.pool.Acquire(ctx)
 		if err != nil {
 			m.RecordOperation("backend_connection", "failure")
 			slog.Error("Burrow session connection failed", "event", "backend_connection_failed", "component", "hamstergres-proxy", "burrow", shard.name, "error_category", "burrow_unavailable", "error", err)
 			session.Close(context.Background())
 			return nil, fmt.Errorf("connect session to Burrow %s: %w", shard.name, err)
 		}
-		session.shards = append(session.shards, &sessionShard{name: shard.name, conn: conn})
+		if err := m.syncPreparedStatements(ctx, shard.name, pooled.Conn()); err != nil {
+			pooled.Release()
+			session.Close(context.Background())
+			return nil, fmt.Errorf("synchronize prepared statements on Burrow %s: %w", shard.name, err)
+		}
+		session.shards = append(session.shards, &sessionShard{name: shard.name, conn: pooled.Conn().PgConn(), pooled: pooled})
 		m.RecordOperation("backend_connection", "success")
 	}
 	return session, nil
+}
+
+func (m *Manager) syncPreparedStatements(ctx context.Context, burrow string, connection *pgx.Conn) error {
+	rows, err := connection.Query(ctx, "SELECT name FROM pg_prepared_statements", pgx.QueryExecModeSimpleProtocol)
+	if err != nil {
+		return err
+	}
+	names := make(map[string]struct{})
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return err
+		}
+		names[name] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	m.preparedMu.Lock()
+	m.prepared[preparedConnectionKey(burrow, connection.PgConn().PID())] = names
+	m.preparedMu.Unlock()
+	return nil
+}
+
+func preparedConnectionKey(burrow string, pid uint32) string {
+	return burrow + "\x00" + strconv.FormatUint(uint64(pid), 10)
+}
+
+// Prepared reports whether the physical PostgreSQL connection currently has
+// the canonical statement name installed.
+func (s *Session) Prepared(burrow, name string) bool {
+	shard := s.shardByName(burrow)
+	if shard == nil || s.manager == nil {
+		return false
+	}
+	s.manager.preparedMu.Lock()
+	defer s.manager.preparedMu.Unlock()
+	_, ok := s.manager.prepared[preparedConnectionKey(shard.name, shard.conn.PID())][name]
+	return ok
+}
+
+// MarkPrepared records a successful lazy Parse on a physical connection.
+func (s *Session) MarkPrepared(burrows []string, name string) {
+	if s.manager == nil {
+		return
+	}
+	s.manager.preparedMu.Lock()
+	defer s.manager.preparedMu.Unlock()
+	for _, burrow := range burrows {
+		shard := s.shardByName(burrow)
+		if shard == nil {
+			continue
+		}
+		key := preparedConnectionKey(shard.name, shard.conn.PID())
+		if s.manager.prepared[key] == nil {
+			s.manager.prepared[key] = make(map[string]struct{})
+		}
+		s.manager.prepared[key][name] = struct{}{}
+	}
 }
 
 // LockWrites serializes scattered writes so every Burrow observes them in the
@@ -290,6 +362,23 @@ func (s *Session) SendTo(name string, message pgproto3.FrontendMessage) error {
 	shard.conn.Frontend().Send(&pgproto3.Flush{})
 	if err := shard.conn.Frontend().Flush(); err != nil {
 		return fmt.Errorf("send to Burrow %s: %w", shard.name, err)
+	}
+	return nil
+}
+
+// SendBatchTo forwards an extended-protocol request to one Burrow and flushes
+// exactly once. PostgreSQL clients normally pipeline Bind, Execute, and Sync;
+// preserving that request boundary avoids a network round trip per message.
+func (s *Session) SendBatchTo(name string, messages ...pgproto3.FrontendMessage) error {
+	shard := s.shardByName(name)
+	if shard == nil {
+		return fmt.Errorf("unknown Burrow %s", name)
+	}
+	for _, message := range messages {
+		shard.conn.Frontend().Send(message)
+	}
+	if err := shard.conn.Frontend().Flush(); err != nil {
+		return fmt.Errorf("send batch to Burrow %s: %w", shard.name, err)
 	}
 	return nil
 }
@@ -400,13 +489,25 @@ func cloneBackendMessage(message pgproto3.BackendMessage) pgproto3.BackendMessag
 
 // Close releases every affinity connection. It is safe after a partial
 // NewSession failure.
-func (s *Session) Close(ctx context.Context) {
+func (s *Session) Close(ctx context.Context, reusable ...bool) {
 	s.UnlockWrites()
+	release := len(reusable) > 0 && reusable[0]
 	success := true
 	for _, shard := range s.shards {
-		if err := shard.conn.Close(ctx); err != nil {
+		if release {
+			shard.pooled.Release()
+			continue
+		}
+		key := preparedConnectionKey(shard.name, shard.conn.PID())
+		connection := shard.pooled.Hijack()
+		if err := connection.Close(ctx); err != nil {
 			success = false
 			slog.Error("Burrow session cleanup failed", "event", "backend_session_cleanup_failed", "component", "hamstergres-proxy", "burrow", shard.name, "error_category", "client_disconnect_cleanup", "error", err)
+		}
+		if s.manager != nil {
+			s.manager.preparedMu.Lock()
+			delete(s.manager.prepared, key)
+			s.manager.preparedMu.Unlock()
 		}
 	}
 	if s.manager != nil {

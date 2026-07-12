@@ -82,3 +82,11 @@ func TestNormalizePreservesStructureAndReplacesLiterals(t *testing.T) {
 		t.Fatal("equivalent parameterized query shapes have different fingerprints")
 	}
 }
+
+func BenchmarkCollectorRecordSysbenchQuery(b *testing.B) {
+	collector := NewCollector()
+	event := QueryEvent{SQL: "SELECT c FROM sbtest1 WHERE id=$1", Success: true, Shards: []string{"burrow-01"}}
+	for b.Loop() {
+		collector.Record(event)
+	}
+}

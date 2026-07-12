@@ -14,6 +14,11 @@ status:
 observability:
   log_file: ""
 
+# Safe by default. Set to false only when partial commits across Burrows are an
+# accepted risk; the Proxy will use ordinary sequential COMMIT instead of 2PC.
+transactions:
+  two_phase_commit: true
+
 # Hamstergres Nest stores the schema registry in etcd. Use the Docker service
 # hostname when the Proxy runs in Compose, or localhost:2379 from the host.
 nest:

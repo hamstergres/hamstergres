@@ -26,9 +26,19 @@ type Config struct {
 	Observability struct {
 		LogFile string `yaml:"log_file"`
 	} `yaml:"observability"`
+	Transactions struct {
+		TwoPhaseCommit *bool `yaml:"two_phase_commit"`
+	} `yaml:"transactions"`
 	Sharding struct {
 		PhysicalShards map[string]Shard `yaml:"physical_shards"`
 	} `yaml:"sharding"`
+}
+
+// TwoPhaseCommitEnabled defaults to the safe distributed-commit behavior.
+// Operators may explicitly disable it when they accept partial cross-Burrow
+// commits in exchange for avoiding PostgreSQL prepared transactions.
+func (c Config) TwoPhaseCommitEnabled() bool {
+	return c.Transactions.TwoPhaseCommit == nil || *c.Transactions.TwoPhaseCommit
 }
 
 type Shard struct {

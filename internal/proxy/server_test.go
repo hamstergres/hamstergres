@@ -1,11 +1,29 @@
 package proxy
 
 import (
+	"encoding/binary"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/jruszo/hamstergres/internal/schema"
 )
+
+func TestRoutingParametersDecodeBinaryIntegers(t *testing.T) {
+	bigint := make([]byte, 8)
+	binary.BigEndian.PutUint64(bigint, 42)
+	got := routingParameters(&pgproto3.Bind{ParameterFormatCodes: []int16{1}, Parameters: [][]byte{bigint}}, []uint32{20})
+	if len(got) != 1 || string(got[0]) != "42" {
+		t.Fatalf("routing parameters = %q, want 42", got)
+	}
+}
+
+func TestCanonicalStatementNameDeduplicatesEquivalentParses(t *testing.T) {
+	first := canonicalStatementName("SELECT $1::int8", []uint32{20})
+	second := canonicalStatementName("SELECT $1::int8", []uint32{20})
+	if first != second || first == canonicalStatementName("SELECT $1::int8", []uint32{23}) {
+		t.Fatalf("canonical names were not stable and type-sensitive: %q %q", first, second)
+	}
+}
 
 func TestMergedCommandTagCountsSelectRows(t *testing.T) {
 	got := mergedCommandTag([]string{"SELECT 1", "SELECT 1"}, 2)

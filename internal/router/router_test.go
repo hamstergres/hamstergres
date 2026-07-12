@@ -63,3 +63,12 @@ func TestRewriteGeneratedInsertRejectsMultipleRows(t *testing.T) {
 		t.Fatalf("RewriteGeneratedInsert = %#v, true; want unchanged multi-row insert", result)
 	}
 }
+
+func BenchmarkTargetForSchemaBoundPrimaryKey(b *testing.B) {
+	registry := schema.New(map[string][]string{"sbtest1": {"id"}})
+	burrows := []string{"burrow-01", "burrow-02"}
+	parameters := [][]byte{[]byte("42")}
+	for b.Loop() {
+		TargetForSchema("SELECT c FROM sbtest1 WHERE id=$1", parameters, registry, burrows)
+	}
+}

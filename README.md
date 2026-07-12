@@ -124,6 +124,18 @@ The test validates the installed sysbench version, then checks the Proxy's
 process-owned status data for both single-Burrow and scattered routes, with
 both `SELECT` and `UPDATE` statements present.
 
+For an identical direct-versus-Proxy comparison, start the local Proxy and run:
+
+```bash
+make benchmark-sysbench
+```
+
+The benchmark runs 15-second, four-thread `oltp_read_only` and
+`oltp_read_write` workloads through Hamstergres Proxy and directly against
+`burrow-01`, prints the normal sysbench reports, and finishes with a JSON ratio
+record. It mutates and cleans up the two local `sbtest` tables and is therefore
+an explicit benchmark target rather than part of ordinary tests.
+
 The Proxy supports sysbench's Parse, Bind, Describe, Execute, Close, Sync, and
 Flush protocol flow, including text and binary parameter/result formats. The
 test is opt-in because it prepares, runs, and cleans up a short mutating
@@ -156,14 +168,24 @@ At startup, the Proxy reads primary-key definitions from every Burrow and
 refuses to start if the registry differs. `SELECT`, `INSERT`, `UPDATE`, and
 `DELETE` route to one Burrow only when they provide the full discovered primary
 key (including every column of a composite key); other reads are scattered and
-their rows are appended in Burrow-name order. Ambiguous simple-query writes are
-rejected instead of being duplicated across the fleet. DDL is still applied to
-every Burrow. A simple-query transaction may touch multiple Burrows; when it
-does, Hamstergres Proxy commits it with PostgreSQL two-phase commit. The initial
-extended-query contract deliberately fans every execution out to all Burrows
-and also uses two-phase commit. Prepared statements and portals are pinned to
-the frontend session and retain supplied text or binary parameter and result
-formats. `COPY FROM STDIN` is streamed to every Burrow, while `COPY TO STDOUT`
+their rows are appended in Burrow-name order. Ambiguous writes are rejected
+instead of being duplicated across the fleet. DDL is still applied to every
+Burrow. Extended-protocol portals with a complete bound primary key use one
+Tunnel for Bind, Describe, Execute, and Close; unkeyed read portals retain
+deterministic scatter behavior. The Proxy preserves an extended request through
+Flush or Sync, so Bind, optional Describe, Execute, and Sync use one backend
+flush rather than one round trip per message. Equivalent Parse messages share
+a canonical backend name derived from SQL and parameter types; each Tunnel
+prepares that statement once and reuses it for frontend aliases. Clean idle
+Tunnels return to the per-Burrow connection pools after Sync and can be
+multiplexed across frontend sessions; transactions, COPY, and incomplete
+protocol batches remain pinned. Multi-Burrow write transactions use PostgreSQL
+two-phase commit by default, while read-only and single-Burrow transactions use
+ordinary commit. Operators who accept partial cross-Burrow commit risk may set
+`transactions.two_phase_commit: false` to use sequential ordinary commits.
+Prepared statements and portals are pinned to the frontend session and retain
+supplied text or binary parameter and result formats. `COPY FROM STDIN` is
+streamed to every Burrow, while `COPY TO STDOUT`
 merges each Burrow's stream in configured order. Authentication, TLS,
 cancellation, and `COPY BOTH` remain outside this initial gateway milestone.
 
