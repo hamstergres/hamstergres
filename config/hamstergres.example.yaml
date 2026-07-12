@@ -9,6 +9,11 @@ listen:
 status:
   address: "127.0.0.1:8080"
 
+# Structured JSON events stay local. Set log_file to append them to a private
+# file; leave it empty to retain the process supervisor's normal stderr logs.
+observability:
+  log_file: ""
+
 # Hamstergres Nest stores the schema registry in etcd. Use the Docker service
 # hostname when the Proxy runs in Compose, or localhost:2379 from the host.
 nest:

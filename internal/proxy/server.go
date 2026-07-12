@@ -15,6 +15,10 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/jruszo/hamstergres/internal/backend"
 	"github.com/jruszo/hamstergres/internal/ddl"
@@ -380,6 +384,17 @@ func (s *Server) handleClose(frontend *pgproto3.Backend, session *backend.Sessio
 }
 
 func (s *Server) handleCopyQuery(frontend *pgproto3.Backend, session *backend.Session, sql string, state *extendedState) bool {
+	success := false
+	defer func() {
+		outcome := "failure"
+		if success {
+			outcome = "success"
+		}
+		s.backends.RecordOperation("copy", outcome)
+		if !success {
+			s.logger.Error("COPY operation failed", "event", "copy_failed", "component", "hamstergres-proxy", "error_category", "copy")
+		}
+	}()
 	responses, err := exchange(session, &pgproto3.Query{String: sql}, isCopyStarted)
 	if err != nil {
 		s.sendExtendedError(frontend, "08006", err.Error())
@@ -406,11 +421,13 @@ func (s *Server) handleCopyQuery(frontend *pgproto3.Backend, session *backend.Se
 		frontend.Send(response)
 		state.copyIn = true
 		s.markAllParticipants(state)
+		success = true
 		return true
 	case *pgproto3.CopyOutResponse:
 		frontend.Send(response)
 		s.markAllParticipants(state)
-		return s.handleCopyOut(frontend, session, state)
+		success = s.handleCopyOut(frontend, session, state)
+		return success
 	case *pgproto3.CopyBothResponse:
 		s.sendExtendedError(frontend, "0A000", "COPY BOTH is not supported by Hamstergres Proxy")
 		return false
@@ -523,6 +540,20 @@ func (s *Server) handleSync(frontend *pgproto3.Backend, session *backend.Session
 func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Session, message *pgproto3.Execute, portal portalState, state *extendedState) bool {
 	started := time.Now()
 	success := false
+	correlationID := fmt.Sprintf("query-%08x", randomUint32())
+	traceContext, querySpan := otel.Tracer("github.com/jruszo/hamstergres/proxy").Start(context.Background(), "proxy.query",
+		trace.WithAttributes(attribute.String("db.operation.name", firstSQLKeyword(portal.sql)), attribute.String("hamstergres.route", "scatter")))
+	defer func() {
+		if success {
+			querySpan.SetStatus(codes.Ok, "")
+		} else {
+			querySpan.SetStatus(codes.Error, "query failed")
+		}
+		querySpan.End()
+		if !success && portal.sql != "" {
+			s.logger.Error("frontend query failed", "event", "query_failed", "component", "hamstergres-proxy", "correlation_id", correlationID, "error_category", "query_execution")
+		}
+	}()
 	targets := s.backends.ShardNames()
 	defer func() {
 		if portal.sql != "" {
@@ -544,15 +575,19 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 	// The initial extended-query contract is deliberately fan-out. Keeping
 	// every affinity connection in the same Parse/Bind/Execute/Sync lifecycle
 	// also lets a transaction use multiple shard keys, as sysbench does.
+	tunnelSpans := startTunnelSpans(traceContext, targets)
 	responses, err := exchange(session, message, isExecuteDone)
 	if err != nil {
+		endTunnelSpans(tunnelSpans, err)
 		s.sendExtendedError(frontend, "08006", err.Error())
 		return false
 	}
 	if response := firstError(responses); response != nil {
+		endTunnelSpans(tunnelSpans, fmt.Errorf("PostgreSQL error %s", response.Code))
 		frontend.Send(response)
 		return false
 	}
+	endTunnelSpans(tunnelSpans, nil)
 
 	var description *pgproto3.RowDescription
 	var rows []*pgproto3.DataRow
@@ -878,12 +913,27 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 
 	started := time.Now()
 	success := false
+	correlationID := fmt.Sprintf("query-%08x", randomUint32())
+	traceContext, querySpan := otel.Tracer("github.com/jruszo/hamstergres/proxy").Start(context.Background(), "proxy.query",
+		trace.WithAttributes(attribute.String("db.operation.name", firstSQLKeyword(sql))))
+	defer func() {
+		if success {
+			querySpan.SetStatus(codes.Ok, "")
+		} else {
+			querySpan.SetStatus(codes.Error, "query failed")
+		}
+		querySpan.End()
+		if !success {
+			s.logger.Error("frontend query failed", "event", "query_failed", "component", "hamstergres-proxy", "correlation_id", correlationID, "error_category", "query_execution")
+		}
+	}()
 	targets := s.backends.ShardNames()
 	defer func() {
 		s.backends.RecordQueryTargets(sql, success, time.Since(started), targets)
 	}()
 
 	var responses [][]pgproto3.BackendMessage
+	var tunnelSpans []trace.Span
 	target, routed := s.routeSQL(sql, targets)
 	if requiresRoutedWrite(sql) && !routed {
 		s.sendSessionError(frontend, state.txStatus(), "0A000", "write must include a single id or tenant_id shard key")
@@ -891,16 +941,22 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 	}
 	if routed && !isTransactionControl(sql) {
 		targets = []string{target}
+		querySpan.SetAttributes(attribute.String("hamstergres.route", "single_burrow"))
+		tunnelSpans = startTunnelSpans(traceContext, targets)
 		responses, err = exchangeOne(session, target, &pgproto3.Query{String: sql}, isQueryDone)
 	} else {
+		querySpan.SetAttributes(attribute.String("hamstergres.route", "scatter"))
+		tunnelSpans = startTunnelSpans(traceContext, targets)
 		responses, err = exchange(session, &pgproto3.Query{String: sql}, isQueryDone)
 	}
 	if err != nil {
+		endTunnelSpans(tunnelSpans, err)
 		s.sendError(frontend, "08006", err.Error())
 		return false
 	}
 	status := readyTxStatus(responses)
 	if response := firstError(responses); response != nil {
+		endTunnelSpans(tunnelSpans, fmt.Errorf("PostgreSQL error %s", response.Code))
 		frontend.Send(response)
 		frontend.Send(&pgproto3.ReadyForQuery{TxStatus: status})
 		if status == 'I' {
@@ -908,6 +964,7 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 		}
 		return false
 	}
+	endTunnelSpans(tunnelSpans, nil)
 
 	var description *pgproto3.RowDescription
 	var rows []*pgproto3.DataRow
@@ -972,6 +1029,29 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 	return true
 }
 
+func startTunnelSpans(ctx context.Context, burrows []string) []trace.Span {
+	tracer := otel.Tracer("github.com/jruszo/hamstergres/proxy")
+	spans := make([]trace.Span, 0, len(burrows))
+	for _, burrow := range burrows {
+		_, span := tracer.Start(ctx, "tunnel.execute", trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(
+			attribute.String("hamstergres.burrow", burrow), attribute.String("server.address", burrow)))
+		spans = append(spans, span)
+	}
+	return spans
+}
+
+func endTunnelSpans(spans []trace.Span, err error) {
+	for _, span := range spans {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "Burrow execution failed")
+		} else {
+			span.SetStatus(codes.Ok, "")
+		}
+		span.End()
+	}
+}
+
 func (s *Server) handleTwoPhaseCommit(frontend *pgproto3.Backend, session *backend.Session, state *extendedState) bool {
 	if response := s.commitTwoPhase(session); response != nil {
 		frontend.Send(response)
@@ -996,6 +1076,7 @@ func (s *Server) commitTwoPhase(session *backend.Session) *pgproto3.ErrorRespons
 	prepared := make([]string, 0, len(burrows))
 	for _, name := range burrows {
 		if response := runTransactionCommand(session, name, "PREPARE TRANSACTION '"+gid+"'"); response != nil {
+			s.backends.RecordOperation("two_phase_commit", "prepare_failure")
 			for _, preparedName := range prepared {
 				_ = runTransactionCommand(session, preparedName, "ROLLBACK PREPARED '"+gid+"'")
 			}
@@ -1008,6 +1089,8 @@ func (s *Server) commitTwoPhase(session *backend.Session) *pgproto3.ErrorRespons
 	}
 	for _, name := range prepared {
 		if response := runTransactionCommand(session, name, "COMMIT PREPARED '"+gid+"'"); response != nil {
+			s.backends.RecordOperation("two_phase_commit", "uncertain")
+			s.logger.Error("two-phase commit outcome is uncertain", "event", "two_phase_commit_uncertain", "component", "hamstergres-proxy", "burrow", name, "transaction_id", gid, "error_category", "commit_uncertain", "error", response.Message)
 			return &pgproto3.ErrorResponse{
 				Severity: "ERROR",
 				Code:     "40003",
@@ -1015,6 +1098,7 @@ func (s *Server) commitTwoPhase(session *backend.Session) *pgproto3.ErrorRespons
 			}
 		}
 	}
+	s.backends.RecordOperation("two_phase_commit", "success")
 	return nil
 }
 

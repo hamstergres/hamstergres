@@ -17,6 +17,7 @@ import (
 
 	"github.com/jruszo/hamstergres/internal/backend"
 	"github.com/jruszo/hamstergres/internal/config"
+	"github.com/jruszo/hamstergres/internal/observability"
 	"github.com/jruszo/hamstergres/internal/proxy"
 	"github.com/jruszo/hamstergres/internal/status"
 )
@@ -39,8 +40,26 @@ func serveCommand(args []string) {
 		slog.Error("load configuration", "error", err)
 		os.Exit(1)
 	}
+	closeLog, err := configureLogging(cfg.Observability.LogFile)
+	if err != nil {
+		slog.Error("configure local log file", "event", "logging_configuration_failed", "component", "hamstergres-proxy", "error_category", "configuration", "error", err)
+		os.Exit(1)
+	}
+	defer closeLog()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	shutdownTracing, err := observability.ConfigureTracing(ctx)
+	if err != nil {
+		slog.Warn("configure tracing exporter", "event", "tracing_configuration_failed", "error_category", "observability", "error", err)
+	} else {
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := shutdownTracing(shutdownCtx); err != nil {
+				slog.Warn("shutdown tracing exporter", "event", "tracing_shutdown_failed", "error_category", "observability", "error", err)
+			}
+		}()
+	}
 	backends, err := backend.New(ctx, cfg)
 	if err != nil {
 		slog.Error("initialize backend pools", "error", err)
@@ -78,6 +97,19 @@ func serveCommand(args []string) {
 		slog.Error("PostgreSQL gateway stopped", "error", err)
 		os.Exit(1)
 	}
+}
+
+func configureLogging(path string) (func(), error) {
+	if path == "" {
+		return func() {}, nil
+	}
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	logger := slog.New(slog.NewJSONHandler(file, &slog.HandlerOptions{Level: slog.LevelInfo})).With("component", "hamstergres-proxy")
+	slog.SetDefault(logger)
+	return func() { _ = file.Close() }, nil
 }
 
 func statusCommand(args []string) {

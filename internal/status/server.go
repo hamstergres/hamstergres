@@ -88,6 +88,10 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	for _, item := range snapshot.QueryMetrics.ShardExecutions {
 		fmt.Fprintf(&out, "hamstergres_proxy_burrow_executions_total{burrow=%q} %d\n", item.Name, item.Queries)
 	}
+	metric("hamstergres_proxy_operations_total", "counter", "Operational events by stable operation and outcome.")
+	for _, item := range snapshot.QueryMetrics.Operations {
+		fmt.Fprintf(&out, "hamstergres_proxy_operations_total{operation=%q,outcome=%q} %d\n", item.Operation, item.Outcome, item.Count)
+	}
 	metric("hamstergres_proxy_burrow_up", "gauge", "Whether the latest Burrow health check succeeded.")
 	metric("hamstergres_proxy_backend_pool_connections", "gauge", "Backend pool connections by Burrow and state.")
 	metric("hamstergres_proxy_backend_pool_acquire_total", "counter", "Backend pool acquisition attempts by Burrow and outcome.")

@@ -51,6 +51,17 @@ func TestLatencyHistogramAndConcurrentScraping(t *testing.T) {
 	}
 }
 
+func TestOperationalCountersUseStableDimensions(t *testing.T) {
+	collector := NewCollector()
+	collector.RecordOperation("two_phase_commit", "uncertain")
+	collector.RecordOperation("two_phase_commit", "uncertain")
+	collector.RecordOperation("nest_request", "failure")
+	got := collector.Snapshot().Operations
+	if len(got) != 2 || got[0] != (OperationCount{Operation: "nest_request", Outcome: "failure", Count: 1}) || got[1] != (OperationCount{Operation: "two_phase_commit", Outcome: "uncertain", Count: 2}) {
+		t.Fatalf("operations = %#v", got)
+	}
+}
+
 func TestNormalizePreservesStructureAndReplacesLiterals(t *testing.T) {
 	query := "SELECT * FROM accounts WHERE tenant_id = 42 AND label = 'a secret value'"
 	want := "SELECT * FROM accounts WHERE tenant_id = ? AND label = ?"

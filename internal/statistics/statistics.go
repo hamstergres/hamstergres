@@ -95,6 +95,13 @@ type Snapshot struct {
 	Windows         []WindowStatistics `json:"windows"`
 	QuerySummaries  []QuerySummary     `json:"query_summaries"`
 	Latency         Histogram          `json:"latency"`
+	Operations      []OperationCount   `json:"operations"`
+}
+
+type OperationCount struct {
+	Operation string `json:"operation"`
+	Outcome   string `json:"outcome"`
+	Count     int64  `json:"count"`
 }
 
 type Histogram struct {
@@ -117,13 +124,14 @@ type summary struct {
 // Collector keeps ten minutes of individual events plus a bounded set of
 // process-lifetime query shapes. It has no external dependency or persistence.
 type Collector struct {
-	mu        sync.Mutex
-	now       func() time.Time
-	events    []event
-	total     Statistics
-	shards    map[string]int64
-	summaries map[string]*summary
-	latency   Histogram
+	mu         sync.Mutex
+	now        func() time.Time
+	events     []event
+	total      Statistics
+	shards     map[string]int64
+	summaries  map[string]*summary
+	latency    Histogram
+	operations map[string]int64
 }
 
 func NewCollector() *Collector {
@@ -135,7 +143,15 @@ func newCollector(now func() time.Time) *Collector {
 	for i, upper := range LatencyBuckets {
 		buckets[i].UpperBound = upper
 	}
-	return &Collector{now: now, shards: make(map[string]int64), summaries: make(map[string]*summary), latency: Histogram{Buckets: buckets}}
+	return &Collector{now: now, shards: make(map[string]int64), summaries: make(map[string]*summary), latency: Histogram{Buckets: buckets}, operations: make(map[string]int64)}
+}
+
+// RecordOperation records a bounded operational event. Callers must use stable
+// operation and outcome constants; dynamic errors and identifiers belong in logs.
+func (c *Collector) RecordOperation(operation, outcome string) {
+	c.mu.Lock()
+	c.operations[operation+"\x00"+outcome]++
+	c.mu.Unlock()
 }
 
 func (c *Collector) Record(query QueryEvent) {
@@ -194,6 +210,16 @@ func (c *Collector) Snapshot() Snapshot {
 	c.events = discardExpired(c.events, now.Add(-maxEventAge))
 
 	snapshot := Snapshot{Total: finalize(c.total), ShardExecutions: sortedShardCounts(c.shards), Latency: copyHistogram(c.latency)}
+	for key, count := range c.operations {
+		parts := strings.SplitN(key, "\x00", 2)
+		snapshot.Operations = append(snapshot.Operations, OperationCount{Operation: parts[0], Outcome: parts[1], Count: count})
+	}
+	sort.Slice(snapshot.Operations, func(i, j int) bool {
+		if snapshot.Operations[i].Operation == snapshot.Operations[j].Operation {
+			return snapshot.Operations[i].Outcome < snapshot.Operations[j].Outcome
+		}
+		return snapshot.Operations[i].Operation < snapshot.Operations[j].Operation
+	})
 	for _, window := range windows {
 		statistics, shards := summarize(c.events, now.Add(-window.Duration))
 		snapshot.Windows = append(snapshot.Windows, WindowStatistics{

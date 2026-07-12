@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
@@ -465,16 +466,23 @@ func (m *Manager) Schema() schema.Registry {
 func (m *Manager) RefreshSchema(ctx context.Context) error {
 	registry, err := m.loadSchema(ctx)
 	if err != nil {
+		m.RecordOperation("schema_registry_refresh", "failure")
+		slog.Error("schema registry refresh failed", "event", "schema_registry_refresh_failed", "component", "hamstergres-proxy", "error_category", "schema_registry", "error", err)
 		return err
 	}
 	if m.registryStore != nil {
 		if err := m.registryStore.Replace(ctx, registry); err != nil {
+			m.RecordOperation("nest_registry_write", "failure")
+			m.RecordOperation("schema_registry_refresh", "failure")
+			slog.Error("Nest schema registry write failed", "event", "nest_request_failed", "component", "hamstergres-proxy", "error_category", "nest_unavailable", "operation", "schema_registry_write", "error", err)
 			return err
 		}
+		m.RecordOperation("nest_registry_write", "success")
 	}
 	m.schemaMu.Lock()
 	m.schema = registry
 	m.schemaMu.Unlock()
+	m.RecordOperation("schema_registry_refresh", "success")
 	return nil
 }
 
@@ -482,9 +490,21 @@ func (m *Manager) RefreshSchema(ctx context.Context) error {
 // endpoint deliberately cannot generate fleet-wide keys.
 func (m *Manager) NextGlobalID(ctx context.Context) (int64, error) {
 	if m.globalIDs == nil {
+		m.RecordOperation("generated_id_allocation", "failure")
+		m.RecordOperation("nest_request", "failure")
+		slog.Error("generated ID allocation requires Nest", "event", "nest_request_failed", "component", "hamstergres-proxy", "error_category", "nest_unavailable", "operation", "generated_id_allocation")
 		return 0, fmt.Errorf("generated primary keys require Hamstergres Nest")
 	}
-	return m.globalIDs.Next(ctx)
+	id, err := m.globalIDs.Next(ctx)
+	if err != nil {
+		m.RecordOperation("generated_id_allocation", "failure")
+		m.RecordOperation("nest_request", "failure")
+		slog.Error("generated ID allocation failed", "event", "nest_request_failed", "component", "hamstergres-proxy", "error_category", "nest_unavailable", "operation", "generated_id_allocation", "error", err)
+		return 0, err
+	}
+	m.RecordOperation("generated_id_allocation", "success")
+	m.RecordOperation("nest_request", "success")
+	return id, nil
 }
 
 func (m *Manager) shardNames() []string {
@@ -643,6 +663,10 @@ func (m *Manager) RecordQueryTargets(sql string, success bool, duration time.Dur
 	})
 }
 
+func (m *Manager) RecordOperation(operation, outcome string) {
+	m.metrics.RecordOperation(operation, outcome)
+}
+
 // ShardStatus is a safe, presentation-ready snapshot of one backend pool.
 type ShardStatus struct {
 	Name          string    `json:"name"`
@@ -670,6 +694,7 @@ func (m *Manager) ShardStatuses(ctx context.Context) []ShardStatus {
 			err := s.pool.Ping(checkCtx)
 			cancel()
 			m.mu.Lock()
+			wasHealthy := s.last.error == ""
 			s.last.checkedAt = time.Now().UTC()
 			if err != nil {
 				s.last.error = err.Error()
@@ -677,6 +702,9 @@ func (m *Manager) ShardStatuses(ctx context.Context) []ShardStatus {
 				s.last.error = ""
 			}
 			m.mu.Unlock()
+			if err != nil && wasHealthy {
+				slog.Error("Burrow health check failed", "event", "burrow_health_check_failed", "component", "hamstergres-proxy", "burrow", s.name, "error_category", "burrow_unavailable", "error", err)
+			}
 		}(s)
 	}
 	wg.Wait()

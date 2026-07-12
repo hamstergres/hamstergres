@@ -228,6 +228,27 @@ capacity/use/acquisition signals. Metric names use the
 routing decisions, and configured Burrow names. Raw SQL, query shapes,
 fingerprints, credentials, and bound values are deliberately never labels.
 
+| Metric | Unit | Labels |
+| --- | --- | --- |
+| `hamstergres_proxy_uptime_seconds` | seconds | none |
+| `hamstergres_proxy_frontend_connections` | connections | `state`: `active`, `total` |
+| `hamstergres_proxy_queries_total` | queries | `outcome`: `success`, `failure` |
+| `hamstergres_proxy_query_routes_total` | queries | `route`: `single_burrow`, `scatter` |
+| `hamstergres_proxy_query_duration_seconds` | seconds | histogram bucket `le` only |
+| `hamstergres_proxy_burrow_executions_total` | executions | configured `burrow` |
+| `hamstergres_proxy_burrow_up` | boolean | configured `burrow` |
+| `hamstergres_proxy_backend_pool_connections` | connections | configured `burrow`; `state`: `capacity`, `in_use`, `idle` |
+| `hamstergres_proxy_backend_pool_acquire_total` | acquisitions | configured `burrow`; `outcome`: `success`, `canceled` |
+| `hamstergres_proxy_backend_pool_wait_total` | waits | configured `burrow` |
+| `hamstergres_proxy_backend_pool_acquire_duration_seconds_total` | seconds | configured `burrow` |
+| `hamstergres_proxy_operations_total` | operations | bounded `operation` and `outcome` values below |
+
+Operational values are fixed in code: `copy`, `generated_id_allocation`,
+`nest_request`, `nest_registry_write`, `schema_registry_refresh`, and
+`two_phase_commit`. Outcomes are `success`, `failure`, `prepare_failure`, or
+`uncertain` as applicable. Transaction IDs, errors, query shapes, and other
+runtime values never appear in metric labels.
+
 Keep the status listener on a private operator network or place an
 authenticated reverse proxy in front of it. `/metrics`, `/api/v1/status`, and
 the HTML status page expose topology and traffic volumes and do not implement
@@ -242,6 +263,26 @@ scrape_configs:
     static_configs:
       - targets: ["127.0.0.1:8080"]
 ```
+
+Structured operational events use stable `event`, `component`, `burrow`,
+`transaction_id`, and `error_category` fields where applicable. Set
+`observability.log_file` to append JSON logs to a local file created with mode
+`0600`. Leaving it empty keeps the normal stderr logger. Hamstergres Proxy does
+not submit or export logs to an external service.
+
+Tracing hooks cover each frontend query and its selected Tunnel/Burrow
+executions. Export is disabled by default. To opt in, configure the standard
+OpenTelemetry OTLP/HTTP environment variables, for example:
+
+```sh
+OTEL_TRACES_EXPORTER=otlp \
+OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://collector:4318/v1/traces \
+hamstergres-proxy --config config/hamstergres.example.yaml
+```
+
+`OTEL_SDK_DISABLED=true` or `OTEL_TRACES_EXPORTER=none` always disables export.
+Spans include the statement operation, routing decision, Burrow name, and error
+status. They never contain raw SQL or bound parameter values.
 
 ```bash
 make proxy-status
