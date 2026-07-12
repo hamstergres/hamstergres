@@ -50,18 +50,46 @@ scatters only reads without a usable primary key and schema commands that must
 reach every Burrow. A simple-query write without one unambiguous primary key is
 rejected; it is never broadcast as a substitute for distributed transactions.
 Within a simple-query transaction, statements may route to different Burrows.
-If more than one Burrow participates, Hamstergres Proxy prepares the transaction
+If a write touches more than one Burrow, Hamstergres Proxy prepares the transaction
 on the fleet and then issues `COMMIT PREPARED` to each Burrow. A preparation
 failure is rolled back. A commit-phase failure is reported with SQLSTATE
 `40003` and the generated transaction ID because manual reconciliation may be
 required. The current coordinator does not yet persist commit decisions, so an
 operator must inspect `pg_prepared_xacts` after a Proxy crash during commit.
 
-The initial extended-query contract deliberately fans every execution out so
-prepared clients such as sysbench can complete their normal
-Parse/Bind/Describe/Execute/Close/Sync lifecycle across the Burrows. Extended
-transactions use the same two-phase commit path. The future Proxy will use Nest
-metadata to choose a Tunnel and target the appropriate Burrow.
+Extended-query statements are parsed on every affinity connection, but a portal
+whose bound parameters contain a complete primary key uses one Tunnel for its
+Bind, Describe, Execute, and Close lifecycle. Unkeyed reads scatter in stable
+Burrow order, and unroutable writes fail closed. Read-only and single-Burrow
+transactions avoid prepared transactions. Multi-Burrow writes use the same
+two-phase commit path as simple queries.
+
+The Proxy buffers an extended request through the frontend Flush or Sync
+boundary and forwards Bind, optional portal Describe, Execute, and Sync in one
+backend flush. It does not inject a network flush between those messages.
+Normalized SQL plus parameter OIDs produce a stable internal statement name.
+Each Tunnel records the names already prepared on its PostgreSQL connection,
+reuses them for equivalent frontend aliases, and retains the backend statement
+when an alias closes. Cache hits and misses are exposed as the
+`prepared_statement_cache` operational metric. PostgreSQL still performs Parse
+on a Tunnel cache miss; subsequent equivalent frontend Parse messages are
+answered from the cache without repeating backend preparation.
+
+Tunnel connections come from the per-Burrow pools. A frontend keeps its
+connections pinned while a transaction, COPY stream, portal request, or
+unsynchronized protocol batch is active. After a clean idle Sync, the
+connections return to their pools and may serve another frontend. On checkout,
+the Proxy reconciles its per-connection cache with `pg_prepared_statements`;
+frontend statement definitions remain virtual in the Proxy, and any missing
+canonical Parse is injected before Bind on the newly selected connection. A
+disconnect in an unsafe state closes the physical connections instead of
+returning uncertain transaction or protocol state to the pool.
+
+Two-phase commit is enabled by default. Setting
+`transactions.two_phase_commit: false` selects best-effort sequential COMMIT
+for operators who knowingly accept partial cross-Burrow commits. A failure in
+that mode is not atomic: earlier Burrows may already be committed, and the
+operator must reconcile application data.
 
 ## COPY protocol
 

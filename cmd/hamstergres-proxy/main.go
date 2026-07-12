@@ -72,8 +72,11 @@ func serveCommand(args []string) {
 		os.Exit(1)
 	}
 	defer backends.Close()
+	if !cfg.TwoPhaseCommitEnabled() {
+		slog.Warn("two-phase commit is disabled; cross-Burrow commits may be partial", "event", "two_phase_commit_disabled", "error_category", "configuration")
+	}
 
-	frontend := proxy.New(backends, slog.Default())
+	frontend := proxy.New(backends, slog.Default(), cfg.TwoPhaseCommitEnabled())
 	statusServer := status.New(backends, frontend)
 	httpServer := &http.Server{Addr: cfg.Status.Address, Handler: statusServer.Handler(), ReadHeaderTimeout: 5 * time.Second}
 	listener, err := net.Listen("tcp", cfg.Listen.Address)

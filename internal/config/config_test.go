@@ -34,3 +34,15 @@ func TestLoadRejectsIncompleteConfiguration(t *testing.T) {
 		t.Fatal("Load accepted a configuration with no physical Burrows")
 	}
 }
+
+func TestTwoPhaseCommitDefaultsOnAndCanBeDisabled(t *testing.T) {
+	var config Config
+	if !config.TwoPhaseCommitEnabled() {
+		t.Fatal("two-phase commit should default to enabled")
+	}
+	disabled := false
+	config.Transactions.TwoPhaseCommit = &disabled
+	if config.TwoPhaseCommitEnabled() {
+		t.Fatal("two-phase commit remained enabled after explicit disable")
+	}
+}

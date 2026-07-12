@@ -3,13 +3,16 @@ package proxy
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -30,15 +33,20 @@ import (
 
 // Server exposes the PostgreSQL frontend protocol for Hamstergres.
 type Server struct {
-	backends *backend.Manager
-	logger   *slog.Logger
+	backends       *backend.Manager
+	logger         *slog.Logger
+	twoPhaseCommit bool
 
 	connections       atomic.Int64
 	activeConnections atomic.Int64
 }
 
-func New(backends *backend.Manager, logger *slog.Logger) *Server {
-	return &Server{backends: backends, logger: logger}
+func New(backends *backend.Manager, logger *slog.Logger, twoPhaseCommit ...bool) *Server {
+	enabled := true
+	if len(twoPhaseCommit) > 0 {
+		enabled = twoPhaseCommit[0]
+	}
+	return &Server{backends: backends, logger: logger, twoPhaseCommit: enabled}
 }
 
 // Serve accepts PostgreSQL protocol connections until listener is closed.
@@ -167,7 +175,7 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 					state.failed = true
 					break
 				}
-				if s.handleParse(frontend, active, prepared.message) {
+				if s.handleCachedParse(frontend, active, prepared) {
 					state.statements[message.Name] = prepared
 				} else {
 					state.failed = true
@@ -196,32 +204,76 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 					state.failed = true
 					break
 				}
-				if s.handleBind(frontend, active, bound) {
-					state.portals[message.DestinationPortal] = portalState{
-						sql:        statement.sql,
-						parameters: parameters,
-						schema:     statement.schema,
+				target, routed := s.routePortal(statement.sql, parameters, s.backends.ShardNames())
+				if requiresRoutedWrite(statement.sql) && !routed {
+					s.sendExtendedError(frontend, "0A000", "write must include a complete primary-key shard key")
+					state.failed = true
+					break
+				}
+				portal := portalState{
+					sql:        statement.sql,
+					parameters: parameters,
+					schema:     statement.schema,
+					target:     target,
+					routed:     routed,
+				}
+				if state.pending == nil {
+					state.portals[message.DestinationPortal] = portal
+					targets := s.backends.ShardNames()
+					if routed {
+						targets = []string{target}
 					}
+					state.pending = &pendingExtended{targets: targets, bind: bound, portalName: message.DestinationPortal, portal: portal, statement: statement}
+				} else if s.handleBind(frontend, active, bound, target, routed) {
+					state.portals[message.DestinationPortal] = portal
 				} else {
 					state.failed = true
 				}
 			}
 		case *pgproto3.Describe:
 			if active, ok := ensureSession(); ok && !state.failed {
+				if state.pending != nil && message.ObjectType == 'P' && state.pending.portalName == message.Name {
+					state.pending.describe = message
+					break
+				}
+				if state.pending != nil && !s.flushPendingExtended(frontend, active, &state, false) {
+					state.failed = true
+					break
+				}
 				generated := message.ObjectType == 'S' && state.statements[message.Name].generated
-				if !s.handleDescribe(frontend, active, message, generated) {
+				if message.ObjectType == 'S' {
+					if statement, ok := state.statements[message.Name]; ok {
+						rewritten := *message
+						rewritten.Name = statement.backendName
+						message = &rewritten
+					}
+				}
+				portal := state.portals[message.Name]
+				if !s.handleDescribe(frontend, active, message, generated, portal.target, message.ObjectType == 'P' && portal.routed) {
 					state.failed = true
 				}
 			}
 		case *pgproto3.Execute:
 			if active, ok := ensureSession(); ok && !state.failed {
-				if !s.handleExecute(frontend, active, message, state.portals[message.Portal], &state) {
+				if state.pending != nil && state.pending.portalName == message.Portal {
+					state.pending.execute = message
+				} else if !s.handleExecute(frontend, active, message, state.portals[message.Portal], &state) {
 					state.failed = true
 				}
 			}
 		case *pgproto3.Close:
 			if active, ok := ensureSession(); ok && !state.failed {
-				if s.handleClose(frontend, active, message) {
+				if state.pending != nil && !s.flushPendingExtended(frontend, active, &state, false) {
+					state.failed = true
+					break
+				}
+				if message.ObjectType == 'S' {
+					delete(state.statements, message.Name)
+					frontend.Send(&pgproto3.CloseComplete{})
+					break
+				}
+				portal := state.portals[message.Name]
+				if s.handleClose(frontend, active, message, portal.target, message.ObjectType == 'P' && portal.routed) {
 					if message.ObjectType == 'S' {
 						delete(state.statements, message.Name)
 					} else {
@@ -235,13 +287,21 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 			if session == nil {
 				frontend.Send(&pgproto3.ReadyForQuery{TxStatus: state.txStatus()})
 				state.failed = false
+			} else if state.pending != nil {
+				if s.flushPendingExtended(frontend, session, &state, true) {
+					state.failed = false
+				}
+			} else if state.syncConsumed {
+				frontend.Send(&pgproto3.ReadyForQuery{TxStatus: state.txStatus()})
+				state.syncConsumed = false
+				state.failed = false
 			} else if s.handleSync(frontend, session, &state) {
 				state.failed = false
 			}
 		case *pgproto3.Flush:
-			// Each message above is flushed to the Burrows and its response is
-			// returned before the next frontend message is read, so Flush has no
-			// additional observable work to do.
+			if session != nil && state.pending != nil && !s.flushPendingExtended(frontend, session, &state, false) {
+				state.failed = true
+			}
 		case *pgproto3.CopyData:
 			if !state.copyIn || session == nil {
 				s.sendExtendedError(frontend, "08P01", "CopyData received outside COPY FROM STDIN")
@@ -262,6 +322,11 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 		default:
 			s.sendError(frontend, "0A000", fmt.Sprintf("unsupported PostgreSQL frontend message %T", message))
 		}
+		if _, sync := message.(*pgproto3.Sync); sync && session != nil && !state.transaction && !state.copyIn && state.pending == nil && !state.failed {
+			session.Close(context.Background(), true)
+			session = nil
+			s.backends.RecordOperation("backend_connection_multiplex", "release")
+		}
 		if err := frontend.Flush(); err != nil {
 			return err
 		}
@@ -273,19 +338,33 @@ type extendedState struct {
 	portals         map[string]portalState
 	failed          bool
 	transaction     bool
+	mutated         bool
 	target          string
 	schemaDirty     bool
 	copyIn          bool
 	copyTraceSpan   trace.Span
 	copyTunnelSpans []trace.Span
 	participants    map[string]struct{}
+	pending         *pendingExtended
+	syncConsumed    bool
+}
+
+type pendingExtended struct {
+	targets    []string
+	bind       *pgproto3.Bind
+	describe   *pgproto3.Describe
+	execute    *pgproto3.Execute
+	portalName string
+	portal     portalState
+	statement  statementState
 }
 
 type statementState struct {
-	sql       string
-	generated bool
-	schema    bool
-	message   *pgproto3.Parse
+	sql         string
+	generated   bool
+	schema      bool
+	backendName string
+	message     *pgproto3.Parse
 }
 
 func prepareStatement(message *pgproto3.Parse, registry schema.Registry) (statementState, error) {
@@ -297,11 +376,14 @@ func prepareStatement(message *pgproto3.Parse, registry schema.Registry) (statem
 	rewritten, generated := router.RewriteGeneratedInsert(normalized.sql, registry, fmt.Sprintf("$%d", parameter))
 	if !generated {
 		if normalized.sql == message.Query {
-			return statementState{sql: message.Query, schema: normalized.schema, message: message}, nil
+			prepared := *message
+			prepared.Name = canonicalStatementName(message.Query, message.ParameterOIDs)
+			return statementState{sql: message.Query, schema: normalized.schema, backendName: prepared.Name, message: &prepared}, nil
 		}
 		prepared := *message
 		prepared.Query = normalized.sql
-		return statementState{sql: normalized.sql, schema: normalized.schema, message: &prepared}, nil
+		prepared.Name = canonicalStatementName(normalized.sql, prepared.ParameterOIDs)
+		return statementState{sql: normalized.sql, schema: normalized.schema, backendName: prepared.Name, message: &prepared}, nil
 	}
 	oids := append([]uint32(nil), message.ParameterOIDs...)
 	for len(oids) < parameter {
@@ -310,7 +392,19 @@ func prepareStatement(message *pgproto3.Parse, registry schema.Registry) (statem
 	prepared := *message
 	prepared.Query = rewritten.SQL
 	prepared.ParameterOIDs = oids
-	return statementState{sql: rewritten.SQL, generated: true, schema: normalized.schema, message: &prepared}, nil
+	prepared.Name = canonicalStatementName(rewritten.SQL, oids)
+	return statementState{sql: rewritten.SQL, generated: true, schema: normalized.schema, backendName: prepared.Name, message: &prepared}, nil
+}
+
+func canonicalStatementName(sql string, oids []uint32) string {
+	hash := sha256.New()
+	_, _ = hash.Write([]byte(sql))
+	var encoded [4]byte
+	for _, oid := range oids {
+		binary.BigEndian.PutUint32(encoded[:], oid)
+		_, _ = hash.Write(encoded[:])
+	}
+	return "hamstergres_" + hex.EncodeToString(hash.Sum(nil)[:12])
 }
 
 type normalizedSQL struct {
@@ -344,14 +438,21 @@ func maxParameter(sql string) int {
 }
 
 func (s *Server) prepareBind(message *pgproto3.Bind, statement statementState) (*pgproto3.Bind, [][]byte, error) {
+	var parameterOIDs []uint32
+	if statement.message != nil {
+		parameterOIDs = statement.message.ParameterOIDs
+	}
 	if !statement.generated {
-		return message, cloneParameters(message.Parameters), nil
+		bound := *message
+		bound.PreparedStatement = statement.backendName
+		return &bound, routingParameters(&bound, parameterOIDs), nil
 	}
 	id, err := s.backends.NextGlobalID(context.Background())
 	if err != nil {
 		return nil, nil, fmt.Errorf("allocate globally unique primary key: %w", err)
 	}
 	bound := *message
+	bound.PreparedStatement = statement.backendName
 	bound.Parameters = cloneParameters(message.Parameters)
 	if len(message.ParameterFormatCodes) == 1 {
 		bound.ParameterFormatCodes = make([]int16, len(message.Parameters), len(message.Parameters)+1)
@@ -363,7 +464,37 @@ func (s *Server) prepareBind(message *pgproto3.Bind, statement statementState) (
 		bound.ParameterFormatCodes = append(append([]int16(nil), message.ParameterFormatCodes...), 0)
 	}
 	bound.Parameters = append(bound.Parameters, []byte(strconv.FormatInt(id, 10)))
-	return &bound, cloneParameters(bound.Parameters), nil
+	return &bound, routingParameters(&bound, parameterOIDs), nil
+}
+
+func routingParameters(message *pgproto3.Bind, parameterOIDs []uint32) [][]byte {
+	parameters := cloneParameters(message.Parameters)
+	for index, value := range parameters {
+		format := int16(0)
+		if len(message.ParameterFormatCodes) == 1 {
+			format = message.ParameterFormatCodes[0]
+		} else if index < len(message.ParameterFormatCodes) {
+			format = message.ParameterFormatCodes[index]
+		}
+		if format != 1 || index >= len(parameterOIDs) {
+			continue
+		}
+		switch parameterOIDs[index] {
+		case 20:
+			if len(value) == 8 {
+				parameters[index] = []byte(strconv.FormatInt(int64(binary.BigEndian.Uint64(value)), 10))
+			}
+		case 21:
+			if len(value) == 2 {
+				parameters[index] = []byte(strconv.FormatInt(int64(int16(binary.BigEndian.Uint16(value))), 10))
+			}
+		case 23:
+			if len(value) == 4 {
+				parameters[index] = []byte(strconv.FormatInt(int64(int32(binary.BigEndian.Uint32(value))), 10))
+			}
+		}
+	}
+	return parameters
 }
 
 func (s extendedState) txStatus() byte {
@@ -377,6 +508,8 @@ type portalState struct {
 	sql        string
 	parameters [][]byte
 	schema     bool
+	target     string
+	routed     bool
 }
 
 func cloneParameters(parameters [][]byte) [][]byte {
@@ -390,18 +523,54 @@ func cloneParameters(parameters [][]byte) [][]byte {
 	return cloned
 }
 
-func (s *Server) handleParse(frontend *pgproto3.Backend, session *backend.Session, message *pgproto3.Parse) bool {
-	responses, err := exchange(session, message, isParseDone)
-	return s.relayUniform(frontend, responses, err, "Parse")
+func (s *Server) handleCachedParse(frontend *pgproto3.Backend, session *backend.Session, statement statementState) bool {
+	missing := make([]string, 0)
+	for _, target := range s.backends.ShardNames() {
+		if !session.Prepared(target, statement.backendName) {
+			missing = append(missing, target)
+		}
+	}
+	if len(missing) == 0 {
+		s.backends.RecordOperation("prepared_statement_cache", "hit")
+		frontend.Send(&pgproto3.ParseComplete{})
+		return true
+	}
+	for _, target := range missing {
+		responses, err := exchangeOne(session, target, statement.message, isParseDone)
+		if err != nil {
+			s.sendExtendedError(frontend, "08006", err.Error())
+			return false
+		}
+		if response := firstError(responses); response != nil {
+			frontend.Send(response)
+			return false
+		}
+	}
+	session.MarkPrepared(missing, statement.backendName)
+	s.backends.RecordOperation("prepared_statement_cache", "miss")
+	frontend.Send(&pgproto3.ParseComplete{})
+	return true
 }
 
-func (s *Server) handleBind(frontend *pgproto3.Backend, session *backend.Session, message *pgproto3.Bind) bool {
-	responses, err := exchange(session, message, isBindDone)
+func (s *Server) handleBind(frontend *pgproto3.Backend, session *backend.Session, message *pgproto3.Bind, target string, routed bool) bool {
+	var responses [][]pgproto3.BackendMessage
+	var err error
+	if routed {
+		responses, err = exchangeOne(session, target, message, isBindDone)
+	} else {
+		responses, err = exchange(session, message, isBindDone)
+	}
 	return s.relayUniform(frontend, responses, err, "Bind")
 }
 
-func (s *Server) handleDescribe(frontend *pgproto3.Backend, session *backend.Session, message *pgproto3.Describe, generated bool) bool {
-	responses, err := exchange(session, message, isDescribeDone)
+func (s *Server) handleDescribe(frontend *pgproto3.Backend, session *backend.Session, message *pgproto3.Describe, generated bool, target string, routed bool) bool {
+	var responses [][]pgproto3.BackendMessage
+	var err error
+	if routed {
+		responses, err = exchangeOne(session, target, message, isDescribeDone)
+	} else {
+		responses, err = exchange(session, message, isDescribeDone)
+	}
 	if generated {
 		for _, response := range responses {
 			for _, wireMessage := range response {
@@ -414,8 +583,14 @@ func (s *Server) handleDescribe(frontend *pgproto3.Backend, session *backend.Ses
 	return s.relayUniform(frontend, responses, err, "Describe")
 }
 
-func (s *Server) handleClose(frontend *pgproto3.Backend, session *backend.Session, message *pgproto3.Close) bool {
-	responses, err := exchange(session, message, isCloseDone)
+func (s *Server) handleClose(frontend *pgproto3.Backend, session *backend.Session, message *pgproto3.Close, target string, routed bool) bool {
+	var responses [][]pgproto3.BackendMessage
+	var err error
+	if routed {
+		responses, err = exchangeOne(session, target, message, isCloseDone)
+	} else {
+		responses, err = exchange(session, message, isCloseDone)
+	}
 	return s.relayUniform(frontend, responses, err, "Close")
 }
 
@@ -608,6 +783,185 @@ func (s *Server) handleSync(frontend *pgproto3.Backend, session *backend.Session
 	return true
 }
 
+// flushPendingExtended preserves the client's Bind/Execute/Sync request as one
+// backend request. The selected Burrow receives one socket flush and the Proxy
+// drains the resulting ordered response stream once.
+func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backend.Session, state *extendedState, emitReady bool) bool {
+	pending := state.pending
+	if pending == nil {
+		return true
+	}
+	state.pending = nil
+
+	messages := []pgproto3.FrontendMessage{pending.bind}
+	if pending.describe != nil {
+		messages = append(messages, pending.describe)
+	}
+	if pending.execute != nil {
+		if requiresGlobalWriteOrder(pending.portal.sql) && !session.LockWritesContext(session.Context()) {
+			s.sendExtendedError(frontend, "57014", "frontend session ended while waiting to execute a write")
+			return false
+		}
+		messages = append(messages, pending.execute)
+	}
+	messages = append(messages, &pgproto3.Sync{})
+	preparedMisses := make([]string, 0, len(pending.targets))
+	for _, target := range pending.targets {
+		targetMessages := messages
+		if pending.statement.backendName != "" && !session.Prepared(target, pending.statement.backendName) {
+			targetMessages = append([]pgproto3.FrontendMessage{pending.statement.message}, messages...)
+			preparedMisses = append(preparedMisses, target)
+		}
+		if err := session.SendBatchTo(target, targetMessages...); err != nil {
+			s.sendExtendedError(frontend, "08006", err.Error())
+			return false
+		}
+	}
+	var responses [][]pgproto3.BackendMessage
+	var err error
+	if len(pending.targets) == 1 {
+		responses, err = session.ReceiveUntilFrom(context.Background(), pending.targets[0], isSyncDone)
+	} else {
+		responses, err = session.ReceiveUntil(context.Background(), isSyncDone)
+	}
+	if err != nil {
+		s.sendExtendedError(frontend, "08006", err.Error())
+		return false
+	}
+
+	started := time.Now()
+	success := pending.execute != nil
+	errorCategory := "query_execution"
+	backendFailed := false
+	var description *pgproto3.RowDescription
+	var parameterDescription *pgproto3.ParameterDescription
+	var rows []*pgproto3.DataRow
+	var tags []string
+	bindComplete := false
+	empty := false
+	portalSuspended := false
+	for _, response := range responses {
+		for _, wireMessage := range response {
+			switch wireMessage := wireMessage.(type) {
+			case *pgproto3.BindComplete:
+				bindComplete = true
+			case *pgproto3.ParseComplete:
+				// Parse was injected by the Proxy to materialize a canonical
+				// statement on this physical connection.
+			case *pgproto3.RowDescription:
+				if description == nil {
+					description = wireMessage
+				} else if !sameRowDescription(description, wireMessage) {
+					s.sendExtendedError(frontend, "XX000", "incompatible row descriptions from Burrows")
+					return false
+				}
+			case *pgproto3.ParameterDescription:
+				if parameterDescription == nil {
+					parameterDescription = wireMessage
+				} else if !reflect.DeepEqual(parameterDescription.ParameterOIDs, wireMessage.ParameterOIDs) {
+					s.sendExtendedError(frontend, "XX000", "incompatible parameter descriptions from Burrows")
+					return false
+				}
+			case *pgproto3.NoData:
+				// A single NoData below represents uniform Burrow responses.
+				empty = true
+			case *pgproto3.DataRow:
+				rows = append(rows, wireMessage)
+			case *pgproto3.CommandComplete:
+				tags = append(tags, string(wireMessage.CommandTag))
+			case *pgproto3.EmptyQueryResponse:
+				empty = true
+			case *pgproto3.PortalSuspended:
+				portalSuspended = true
+			case *pgproto3.ErrorResponse:
+				if !backendFailed {
+					backendFailed = true
+					success = false
+					errorCategory = postgresErrorCategory(wireMessage.Code)
+					if bindComplete {
+						frontend.Send(&pgproto3.BindComplete{})
+					}
+					frontend.Send(wireMessage)
+				}
+			case *pgproto3.ReadyForQuery:
+				// The internally forwarded Sync is exposed only when the frontend
+				// reaches its own Sync boundary.
+			case *pgproto3.NoticeResponse, *pgproto3.ParameterStatus, *pgproto3.NotificationResponse:
+				// Burrow-local asynchronous messages are not duplicated.
+			default:
+				s.sendExtendedError(frontend, "08P01", fmt.Sprintf("unexpected batched response %T", wireMessage))
+				return false
+			}
+		}
+	}
+	if !backendFailed {
+		if len(preparedMisses) > 0 {
+			session.MarkPrepared(preparedMisses, pending.statement.backendName)
+			s.backends.RecordOperation("prepared_statement_cache", "miss")
+		} else if pending.statement.backendName != "" {
+			s.backends.RecordOperation("prepared_statement_cache", "hit")
+		}
+		if bindComplete {
+			frontend.Send(&pgproto3.BindComplete{})
+		}
+		if description != nil {
+			if parameterDescription != nil {
+				frontend.Send(parameterDescription)
+			}
+			frontend.Send(description)
+		} else if parameterDescription != nil {
+			frontend.Send(parameterDescription)
+			frontend.Send(&pgproto3.NoData{})
+		} else if pending.describe != nil && empty {
+			frontend.Send(&pgproto3.NoData{})
+		}
+		for _, row := range rows {
+			frontend.Send(row)
+		}
+		if portalSuspended {
+			frontend.Send(&pgproto3.PortalSuspended{})
+		} else if len(tags) > 0 {
+			frontend.Send(&pgproto3.CommandComplete{CommandTag: []byte(mergedCommandTag(tags, len(rows)))})
+		} else if pending.execute != nil && empty {
+			frontend.Send(&pgproto3.EmptyQueryResponse{})
+		}
+	}
+
+	if pending.execute != nil && pending.portal.sql != "" {
+		s.backends.RecordQueryTargetsCategory(pending.portal.sql, success, time.Since(started), pending.targets, errorCategory)
+		if success {
+			if state.transaction && !isTransactionControl(pending.portal.sql) {
+				for _, target := range pending.targets {
+					state.participants[target] = struct{}{}
+				}
+				state.mutated = state.mutated || requiresRoutedWrite(pending.portal.sql)
+			}
+			if pending.portal.schema {
+				state.schemaDirty = true
+			}
+			updateTransactionState(state, pending.portal.sql)
+		}
+	}
+	if state.schemaDirty && !backendFailed {
+		if err := s.backends.RefreshSchema(context.Background()); err != nil {
+			frontend.Send(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "55000", Message: fmt.Sprintf("refresh schema registry after DDL: %v", err)})
+			backendFailed = true
+		} else {
+			state.schemaDirty = false
+		}
+	}
+	if emitReady {
+		frontend.Send(&pgproto3.ReadyForQuery{TxStatus: state.txStatus()})
+	} else {
+		state.syncConsumed = true
+	}
+	state.failed = backendFailed && !emitReady
+	if !state.transaction {
+		session.UnlockWrites()
+	}
+	return true
+}
+
 // handleExecute merges rows from the fan-out execution. Data values are
 // already encoded by PostgreSQL, so text and binary result formats pass through
 // unchanged.
@@ -635,13 +989,14 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 			s.backends.RecordQueryTargetsCategory(portal.sql, success, time.Since(started), targets, errorCategory)
 		}
 	}()
-	if state.transaction && (firstSQLKeyword(portal.sql) == "COMMIT" || firstSQLKeyword(portal.sql) == "END") {
-		if response := s.commitTwoPhase(traceContext, session); response != nil {
+	if state.transaction && state.mutated && len(state.participants) > 1 && s.twoPhaseCommit && (firstSQLKeyword(portal.sql) == "COMMIT" || firstSQLKeyword(portal.sql) == "END") {
+		if response := s.commitTwoPhase(traceContext, session, participantNames(state.participants)); response != nil {
 			frontend.Send(response)
 			return false
 		}
 		frontend.Send(&pgproto3.CommandComplete{CommandTag: []byte("COMMIT")})
 		state.transaction = false
+		state.mutated = false
 		clear(state.participants)
 		success = true
 		return true
@@ -652,11 +1007,26 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 		return false
 	}
 
-	// The initial extended-query contract is deliberately fan-out. Keeping
-	// every affinity connection in the same Parse/Bind/Execute/Sync lifecycle
-	// also lets a transaction use multiple shard keys, as sysbench does.
+	target, routed := portal.target, portal.routed
+	if requiresRoutedWrite(portal.sql) && !routed {
+		errorCategory = "unsafe_routing"
+		s.sendExtendedError(frontend, "0A000", "write must include a complete primary-key shard key")
+		return false
+	}
+	var responses [][]pgproto3.BackendMessage
+	var err error
+	if routed && !isTransactionControl(portal.sql) {
+		targets = []string{target}
+		querySpan.SetAttributes(attribute.String("hamstergres.route", "single_burrow"))
+	} else {
+		querySpan.SetAttributes(attribute.String("hamstergres.route", "scatter"))
+	}
 	tunnelSpans := startTunnelSpans(traceContext, targets)
-	responses, err := exchange(session, message, isExecuteDone)
+	if len(targets) == 1 {
+		responses, err = exchangeOne(session, targets[0], message, isExecuteDone)
+	} else {
+		responses, err = exchange(session, message, isExecuteDone)
+	}
 	if err != nil {
 		errorCategory = "burrow_transport"
 		endTunnelSpans(tunnelSpans, err)
@@ -719,6 +1089,12 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 	success = true
 	if portal.schema {
 		state.schemaDirty = true
+	}
+	if state.transaction && !isTransactionControl(portal.sql) {
+		for _, name := range targets {
+			state.participants[name] = struct{}{}
+		}
+		state.mutated = state.mutated || requiresRoutedWrite(portal.sql)
 	}
 	updateTransactionState(state, portal.sql)
 	return true
@@ -969,7 +1345,7 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 		frontend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 		return true
 	}
-	if state.transaction && (firstSQLKeyword(sql) == "COMMIT" || firstSQLKeyword(sql) == "END") && len(state.participants) > 1 {
+	if state.transaction && state.mutated && s.twoPhaseCommit && (firstSQLKeyword(sql) == "COMMIT" || firstSQLKeyword(sql) == "END") && len(state.participants) > 1 {
 		return s.handleTwoPhaseCommit(frontend, session, state)
 	}
 	normalized, err := normalizeDDL(sql)
@@ -1110,6 +1486,7 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 				state.participants[name] = struct{}{}
 			}
 		}
+		state.mutated = state.mutated || requiresRoutedWrite(sql)
 	}
 	updateTransactionState(state, sql)
 	frontend.Send(&pgproto3.ReadyForQuery{TxStatus: state.txStatus()})
@@ -1167,7 +1544,7 @@ func (s *Server) handleTwoPhaseCommit(frontend *pgproto3.Backend, session *backe
 	ctx, span := otel.Tracer("github.com/jruszo/hamstergres/proxy").Start(context.Background(), "proxy.query", trace.WithAttributes(
 		attribute.String("db.operation.name", "COMMIT"), attribute.String("hamstergres.route", "scatter")))
 	defer span.End()
-	if response := s.commitTwoPhase(ctx, session); response != nil {
+	if response := s.commitTwoPhase(ctx, session, participantNames(state.participants)); response != nil {
 		span.SetStatus(codes.Error, "two-phase commit failed")
 		frontend.Send(response)
 		frontend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
@@ -1178,6 +1555,7 @@ func (s *Server) handleTwoPhaseCommit(frontend *pgproto3.Backend, session *backe
 	}
 	span.SetStatus(codes.Ok, "")
 	state.transaction = false
+	state.mutated = false
 	state.target = ""
 	clear(state.participants)
 	session.UnlockWrites()
@@ -1186,9 +1564,19 @@ func (s *Server) handleTwoPhaseCommit(frontend *pgproto3.Backend, session *backe
 	return true
 }
 
-func (s *Server) commitTwoPhase(ctx context.Context, session *backend.Session) *pgproto3.ErrorResponse {
+func (s *Server) commitTwoPhase(ctx context.Context, session *backend.Session, burrows []string) *pgproto3.ErrorResponse {
 	gid := fmt.Sprintf("hamstergres-%08x-%08x", randomUint32(), randomUint32())
-	burrows := s.backends.ShardNames()
+	participating := make(map[string]struct{}, len(burrows))
+	for _, name := range burrows {
+		participating[name] = struct{}{}
+	}
+	for _, name := range s.backends.ShardNames() {
+		if _, ok := participating[name]; !ok {
+			if response := runTransactionCommandTraced(ctx, session, name, "ROLLBACK"); response != nil {
+				return response
+			}
+		}
+	}
 	prepared := make([]string, 0, len(burrows))
 	for _, name := range burrows {
 		if response := runTransactionCommandTraced(ctx, session, name, "PREPARE TRANSACTION '"+gid+"'"); response != nil {
@@ -1259,12 +1647,23 @@ func updateTransactionState(state *extendedState, sql string) {
 	case "BEGIN", "START":
 		state.transaction = true
 		state.target = ""
+		state.mutated = false
 		clear(state.participants)
 	case "COMMIT", "END", "ROLLBACK", "ABORT":
 		state.transaction = false
 		state.target = ""
+		state.mutated = false
 		clear(state.participants)
 	}
+}
+
+func participantNames(participants map[string]struct{}) []string {
+	names := make([]string, 0, len(participants))
+	for name := range participants {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func readyTxStatus(responses [][]pgproto3.BackendMessage) byte {

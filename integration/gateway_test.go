@@ -375,6 +375,13 @@ func TestExtendedPreparedStatementLifecycleEndToEnd(t *testing.T) {
 	if err := connection.Deallocate(context.Background(), statement.Name); err != nil {
 		t.Fatalf("Close/Sync: %v\ngateway logs:\n%s", err, logs.String())
 	}
+	alias, err := connection.Prepare(context.Background(), "extended_lifecycle_alias", "SELECT $1::int4 AS value", []uint32{23})
+	if err != nil {
+		t.Fatalf("cached Parse/Describe/Sync: %v\ngateway logs:\n%s", err, logs.String())
+	}
+	if err := connection.Deallocate(context.Background(), alias.Name); err != nil {
+		t.Fatalf("cached Close/Sync: %v\ngateway logs:\n%s", err, logs.String())
+	}
 	missing := connection.ExecPrepared(context.Background(), statement.Name, nil, nil, nil).Read()
 	var postgresError *pgconn.PgError
 	if !errors.As(missing.Err, &postgresError) || postgresError.Code != "26000" {
@@ -384,6 +391,15 @@ func TestExtendedPreparedStatementLifecycleEndToEnd(t *testing.T) {
 	snapshot := gatewaySnapshot(t, statusURL+"/api/v1/status")
 	if snapshot.QueryMetrics.Total.Queries != 1 || snapshot.QueryMetrics.Total.FailedQueries != 0 {
 		t.Fatalf("extended lifecycle counters = %#v, want one successful tracked query", snapshot.QueryMetrics.Total)
+	}
+	cache := map[string]int64{}
+	for _, operation := range snapshot.QueryMetrics.Operations {
+		if operation.Operation == "prepared_statement_cache" {
+			cache[operation.Outcome] = operation.Count
+		}
+	}
+	if cache["hit"] < 1 || cache["miss"] < 1 {
+		t.Fatalf("prepared statement cache operations = %#v, want at least one hit and miss", cache)
 	}
 	assertShardExecutions(t, snapshot.QueryMetrics.Total, snapshot.QueryMetrics.ShardExecutions, 1)
 }
@@ -479,6 +495,61 @@ func TestCrossBurrowTransactionUsesTwoPhaseCommit(t *testing.T) {
 	}
 }
 
+func TestCrossBurrowTransactionCanDisableTwoPhaseCommit(t *testing.T) {
+	repoRoot := repositoryRoot(t)
+	ensureDockerBurrows(t, repoRoot)
+	frontendAddress, statusAddress := availableAddress(t), availableAddress(t)
+	binary := buildGateway(t, repoRoot)
+	configPath := writeGatewayConfig(t, frontendAddress, statusAddress)
+	contents, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents = append(contents, []byte("transactions:\n  two_phase_commit: false\n")...)
+	if err := os.WriteFile(configPath, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logs := startGateway(t, binary, configPath)
+	statusURL := "http://" + statusAddress
+	waitForHealthyGateway(t, statusURL, logs)
+	assertStructuredLogEvent(t, logs.String(), "two_phase_commit_disabled", "configuration")
+
+	config, err := pgx.ParseConfig("postgres://any-user@" + frontendAddress + "/any-database?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	connection, err := pgx.ConnectConfig(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close(context.Background())
+	if _, err := connection.Exec(context.Background(), "DROP TABLE IF EXISTS no_two_pc_e2e"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := connection.Exec(context.Background(), "CREATE TABLE no_two_pc_e2e (id bigint PRIMARY KEY, value text)"); err != nil {
+		t.Fatal(err)
+	}
+	transaction, err := connection.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, key := range keysForDifferentBurrows() {
+		if _, err := transaction.Exec(context.Background(), "INSERT INTO no_two_pc_e2e (id, value) VALUES ($1, $2)", key, fmt.Sprintf("value-%d", index)); err != nil {
+			_ = transaction.Rollback(context.Background())
+			t.Fatal(err)
+		}
+	}
+	if err := transaction.Commit(context.Background()); err != nil {
+		t.Fatalf("best-effort cross-Burrow commit: %v\ngateway logs:\n%s", err, logs.String())
+	}
+	for _, operation := range gatewaySnapshot(t, statusURL+"/api/v1/status").QueryMetrics.Operations {
+		if operation.Operation == "two_phase_commit" {
+			t.Fatalf("disabled two-phase commit recorded operation %#v", operation)
+		}
+	}
+}
+
 func TestFrontendDisconnectCancelsBlockedBurrowTransaction(t *testing.T) {
 	repoRoot := repositoryRoot(t)
 	ensureDockerBurrows(t, repoRoot)
@@ -491,7 +562,9 @@ func TestFrontendDisconnectCancelsBlockedBurrowTransaction(t *testing.T) {
 	statusURL := "http://" + statusAddress
 	waitForHealthyGateway(t, statusURL, logs)
 
-	queryGateway(t, frontendAddress, "DROP TABLE IF EXISTS disconnect_e2e; CREATE TABLE disconnect_e2e (id bigint PRIMARY KEY, value bigint); INSERT INTO disconnect_e2e (id, value) VALUES (1, 0)", func(rows pgx.Rows) {})
+	queryGateway(t, frontendAddress, "DROP TABLE IF EXISTS disconnect_e2e", func(rows pgx.Rows) {})
+	queryGateway(t, frontendAddress, "CREATE TABLE disconnect_e2e (id bigint PRIMARY KEY, value bigint)", func(rows pgx.Rows) {})
+	queryGateway(t, frontendAddress, "INSERT INTO disconnect_e2e (id, value) VALUES (1, 0)", func(rows pgx.Rows) {})
 	target := router.BurrowForKey("1", []string{"burrow-01", "burrow-02"})
 	port := "5541"
 	if target == "burrow-02" {
