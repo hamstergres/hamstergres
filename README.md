@@ -113,7 +113,7 @@ make test-sysbench
 
 The command starts or reuses the Docker Burrows, launches an isolated
 Hamstergres Proxy on random local ports, and runs locally installed sysbench
-1.0.20 through it for schema `prepare`, a two-thread three-second read/write
+1.0.20 through it for schema `prepare`, a four-thread three-second read/write
 workload, and `cleanup`. Install the required version on macOS with:
 
 ```bash

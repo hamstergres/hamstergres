@@ -99,6 +99,33 @@ func (s *Server) sendStartup(frontend *pgproto3.Backend) error {
 }
 
 func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
+	sessionContext, cancelSession := context.WithCancel(context.Background())
+	defer cancelSession()
+	type frontendReceive struct {
+		message pgproto3.FrontendMessage
+		err     error
+	}
+	received := make(chan frontendReceive, 1)
+	go func() {
+		defer close(received)
+		for {
+			message, err := frontend.Receive()
+			if err != nil {
+				cancelSession()
+				select {
+				case received <- frontendReceive{err: err}:
+				default:
+				}
+				return
+			}
+			select {
+			case received <- frontendReceive{message: message}:
+			case <-sessionContext.Done():
+				return
+			}
+		}
+	}()
+
 	state := extendedState{statements: make(map[string]statementState), portals: make(map[string]portalState), participants: make(map[string]struct{})}
 	defer finishCopyTrace(&state, fmt.Errorf("frontend session ended during COPY"))
 	var session *backend.Session
@@ -112,7 +139,7 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 		if session != nil {
 			return session, true
 		}
-		created, err := s.backends.NewSession(context.Background())
+		created, err := s.backends.NewSession(sessionContext)
 		if err != nil {
 			s.sendExtendedError(frontend, "08006", err.Error())
 			state.failed = true
@@ -123,10 +150,14 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 	}
 
 	for {
-		message, err := frontend.Receive()
-		if err != nil {
-			return err
+		next, ok := <-received
+		if !ok {
+			return context.Canceled
 		}
+		if next.err != nil {
+			return next.err
+		}
+		message := next.message
 		switch message := message.(type) {
 		case *pgproto3.Parse:
 			if active, ok := ensureSession(); ok && !state.failed {
@@ -615,6 +646,11 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 		success = true
 		return true
 	}
+	if requiresGlobalWriteOrder(portal.sql) && !session.LockWritesContext(session.Context()) {
+		errorCategory = "client_disconnect"
+		s.sendExtendedError(frontend, "57014", "frontend session ended while waiting to execute a write")
+		return false
+	}
 
 	// The initial extended-query contract is deliberately fan-out. Keeping
 	// every affinity connection in the same Parse/Bind/Execute/Sync lifecycle
@@ -985,6 +1021,11 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 	if requiresRoutedWrite(sql) && !routed {
 		errorCategory = "unsafe_routing"
 		s.sendSessionError(frontend, state.txStatus(), "0A000", "write must include a single id or tenant_id shard key")
+		return false
+	}
+	if requiresGlobalWriteOrder(sql) && !session.LockWritesContext(session.Context()) {
+		errorCategory = "client_disconnect"
+		s.sendSessionError(frontend, state.txStatus(), "57014", "frontend session ended while waiting to execute a write")
 		return false
 	}
 	if routed && !isTransactionControl(sql) {

@@ -45,7 +45,7 @@ type shardHealth struct {
 type Manager struct {
 	shards        []*shard
 	mu            sync.RWMutex
-	writeMu       sync.Mutex
+	writeGate     chan struct{}
 	metrics       *statistics.Collector
 	schemaMu      sync.RWMutex
 	schema        schema.Registry
@@ -54,7 +54,7 @@ type Manager struct {
 }
 
 func New(ctx context.Context, cfg config.Config) (*Manager, error) {
-	m := &Manager{metrics: statistics.NewCollector()}
+	m := &Manager{metrics: statistics.NewCollector(), writeGate: newWriteGate()}
 	for _, name := range cfg.ShardNames() {
 		poolConfig, err := pgxpool.ParseConfig(cfg.Sharding.PhysicalShards[name].DSN)
 		if err != nil {
@@ -165,8 +165,10 @@ func (m *Manager) loadSchema(ctx context.Context) (schema.Registry, error) {
 // regular query pools independently.
 type Session struct {
 	shards      []*sessionShard
-	writeMu     *sync.Mutex
+	writeGate   chan struct{}
 	writeLocked bool
+	ctx         context.Context
+	manager     *Manager
 }
 
 type sessionShard struct {
@@ -177,7 +179,7 @@ type sessionShard struct {
 // NewSession establishes an affinity connection to each Burrow. The caller
 // must close the returned session.
 func (m *Manager) NewSession(ctx context.Context) (*Session, error) {
-	session := &Session{shards: make([]*sessionShard, 0, len(m.shards)), writeMu: &m.writeMu}
+	session := &Session{shards: make([]*sessionShard, 0, len(m.shards)), writeGate: m.writeGate, ctx: ctx, manager: m}
 	for _, shard := range m.shards {
 		conn, err := pgconn.Connect(ctx, shard.dsn)
 		if err != nil {
@@ -196,27 +198,51 @@ func (m *Manager) NewSession(ctx context.Context) (*Session, error) {
 // same process-wide order. The returned function must be called when the write
 // is complete.
 func (m *Manager) LockWrites() func() {
-	m.writeMu.Lock()
-	return m.writeMu.Unlock
+	<-m.writeGate
+	return func() { m.writeGate <- struct{}{} }
 }
 
 // LockWrites holds the process-wide write lock for this affinity session until
 // UnlockWrites or Close. Repeated calls while already locked are no-ops.
 func (s *Session) LockWrites() {
-	if s.writeLocked || s.writeMu == nil {
-		return
-	}
-	s.writeMu.Lock()
-	s.writeLocked = true
+	_ = s.LockWritesContext(context.Background())
 }
 
-// UnlockWrites releases the process-wide write lock if this session holds it.
+// LockWritesContext acquires the process-wide write gate for this affinity
+// session. A frontend disconnect cancels a session waiting behind another
+// transaction instead of leaking its goroutine.
+func (s *Session) LockWritesContext(ctx context.Context) bool {
+	if s.writeLocked || s.writeGate == nil {
+		return true
+	}
+	select {
+	case <-s.writeGate:
+		s.writeLocked = true
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func newWriteGate() chan struct{} {
+	gate := make(chan struct{}, 1)
+	gate <- struct{}{}
+	return gate
+}
+
+func (s *Session) Context() context.Context {
+	if s.ctx != nil {
+		return s.ctx
+	}
+	return context.Background()
+}
+
 func (s *Session) UnlockWrites() {
-	if !s.writeLocked || s.writeMu == nil {
+	if !s.writeLocked || s.writeGate == nil {
 		return
 	}
 	s.writeLocked = false
-	s.writeMu.Unlock()
+	s.writeGate <- struct{}{}
 }
 
 // Send broadcasts one frontend protocol message to every Burrow before
@@ -271,6 +297,7 @@ func (s *Session) SendTo(name string, message pgproto3.FrontendMessage) error {
 // ReceiveUntil reads each Burrow's response through its terminating message.
 // The outer slice is ordered by configured Burrow name, just like QueryAll.
 func (s *Session) ReceiveUntil(ctx context.Context, done func(pgproto3.BackendMessage) bool) ([][]pgproto3.BackendMessage, error) {
+	ctx = s.receiveContext(ctx)
 	responses := make([][]pgproto3.BackendMessage, len(s.shards))
 	for index, shard := range s.shards {
 		response, err := receiveUntil(ctx, shard, done)
@@ -284,6 +311,7 @@ func (s *Session) ReceiveUntil(ctx context.Context, done func(pgproto3.BackendMe
 
 // ReceiveUntilFrom reads one Burrow's response through its terminating message.
 func (s *Session) ReceiveUntilFrom(ctx context.Context, name string, done func(pgproto3.BackendMessage) bool) ([][]pgproto3.BackendMessage, error) {
+	ctx = s.receiveContext(ctx)
 	shard := s.shardByName(name)
 	if shard == nil {
 		return nil, fmt.Errorf("unknown Burrow %s", name)
@@ -293,6 +321,13 @@ func (s *Session) ReceiveUntilFrom(ctx context.Context, name string, done func(p
 		return nil, err
 	}
 	return [][]pgproto3.BackendMessage{response}, nil
+}
+
+func (s *Session) receiveContext(fallback context.Context) context.Context {
+	if s.ctx != nil {
+		return s.ctx
+	}
+	return fallback
 }
 
 func (s *Session) shardByName(name string) *sessionShard {
@@ -367,8 +402,19 @@ func cloneBackendMessage(message pgproto3.BackendMessage) pgproto3.BackendMessag
 // NewSession failure.
 func (s *Session) Close(ctx context.Context) {
 	s.UnlockWrites()
+	success := true
 	for _, shard := range s.shards {
-		_ = shard.conn.Close(ctx)
+		if err := shard.conn.Close(ctx); err != nil {
+			success = false
+			slog.Error("Burrow session cleanup failed", "event", "backend_session_cleanup_failed", "component", "hamstergres-proxy", "burrow", shard.name, "error_category", "client_disconnect_cleanup", "error", err)
+		}
+	}
+	if s.manager != nil {
+		outcome := "success"
+		if !success {
+			outcome = "failure"
+		}
+		s.manager.RecordOperation("frontend_session_cleanup", outcome)
 	}
 }
 

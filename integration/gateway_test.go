@@ -479,6 +479,99 @@ func TestCrossBurrowTransactionUsesTwoPhaseCommit(t *testing.T) {
 	}
 }
 
+func TestFrontendDisconnectCancelsBlockedBurrowTransaction(t *testing.T) {
+	repoRoot := repositoryRoot(t)
+	ensureDockerBurrows(t, repoRoot)
+
+	frontendAddress := availableAddress(t)
+	statusAddress := availableAddress(t)
+	binary := buildGateway(t, repoRoot)
+	configPath := writeGatewayConfig(t, frontendAddress, statusAddress)
+	logs := startGateway(t, binary, configPath)
+	statusURL := "http://" + statusAddress
+	waitForHealthyGateway(t, statusURL, logs)
+
+	queryGateway(t, frontendAddress, "DROP TABLE IF EXISTS disconnect_e2e; CREATE TABLE disconnect_e2e (id bigint PRIMARY KEY, value bigint); INSERT INTO disconnect_e2e (id, value) VALUES (1, 0)", func(rows pgx.Rows) {})
+	target := router.BurrowForKey("1", []string{"burrow-01", "burrow-02"})
+	port := "5541"
+	if target == "burrow-02" {
+		port = "5542"
+	}
+	blocker, err := pgx.Connect(context.Background(), "postgres://hamster:hamster@localhost:"+port+"/hamstergres?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Close(context.Background())
+	blockerTx, err := blocker.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blockerTx.Rollback(context.Background())
+	if _, err := blockerTx.Exec(context.Background(), "UPDATE disconnect_e2e SET value = value + 1 WHERE id = 1"); err != nil {
+		t.Fatal(err)
+	}
+
+	client, err := pgx.Connect(context.Background(), "postgres://any-user@"+frontendAddress+"/any-database?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Exec(context.Background(), "BEGIN"); err != nil {
+		t.Fatal(err)
+	}
+	blocked := make(chan error, 1)
+	go func() {
+		_, err := client.Exec(context.Background(), "UPDATE disconnect_e2e SET value = value + 1 WHERE id = $1", int64(1))
+		blocked <- err
+	}()
+	time.Sleep(200 * time.Millisecond)
+	select {
+	case err := <-blocked:
+		t.Fatalf("transactional update was not blocked before disconnect: %v", err)
+	default:
+	}
+	if err := client.PgConn().Conn().Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("blocked frontend query did not stop after disconnect\ngateway logs:\n%s", logs.String())
+	}
+	if err := blockerTx.Rollback(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		snapshot := gatewaySnapshot(t, statusURL+"/api/v1/status")
+		if snapshot.Frontend.ActiveConnections == 0 && activeApplicationTransactions(t) == 0 {
+			queryGateway(t, frontendAddress, "SELECT 1", func(rows pgx.Rows) {})
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("frontend or Burrow transaction remained active after disconnect\ngateway logs:\n%s", logs.String())
+}
+
+func activeApplicationTransactions(t *testing.T) int {
+	t.Helper()
+	total := 0
+	for _, port := range []string{"5541", "5542"} {
+		connection, err := pgx.Connect(context.Background(), "postgres://hamster:hamster@localhost:"+port+"/hamstergres?sslmode=disable")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var count int
+		err = connection.QueryRow(context.Background(), "SELECT count(*) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND usename = 'hamster' AND xact_start IS NOT NULL").Scan(&count)
+		connection.Close(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		total += count
+	}
+	return total
+}
+
 func keysForDifferentBurrows() [2]int64 {
 	burrows := []string{"burrow-01", "burrow-02"}
 	var keys [2]int64
@@ -1004,8 +1097,8 @@ func runSysbench(sysbench, frontendAddress, action string) (string, error) {
 		"--pgsql-password=hamster",
 		"--pgsql-db=hamstergres",
 		"--tables=2",
-		"--table-size=10",
-		"--threads=1",
+		"--table-size=1000",
+		"--threads=4",
 		"--time=3",
 		"--events=0",
 		"--report-interval=0",
