@@ -1,8 +1,8 @@
 package backend
 
 import (
+	"context"
 	"fmt"
-	"sync"
 	"testing"
 	"time"
 
@@ -73,15 +73,15 @@ func TestMergeRejectsDifferentResultShapes(t *testing.T) {
 }
 
 func TestSessionWriteLockIsHeldUntilUnlock(t *testing.T) {
-	var writeMu sync.Mutex
-	session := &Session{writeMu: &writeMu}
+	writeGate := newWriteGate()
+	session := &Session{writeGate: writeGate}
 	session.LockWrites()
 	session.LockWrites()
 
 	acquired := make(chan struct{})
 	go func() {
-		writeMu.Lock()
-		defer writeMu.Unlock()
+		<-writeGate
+		defer func() { writeGate <- struct{}{} }()
 		close(acquired)
 	}()
 
@@ -97,4 +97,26 @@ func TestSessionWriteLockIsHeldUntilUnlock(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("write lock was not released")
 	}
+}
+
+func TestSessionWriteLockWaitIsCanceled(t *testing.T) {
+	writeGate := newWriteGate()
+	first := &Session{writeGate: writeGate}
+	first.LockWrites()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	second := &Session{writeGate: writeGate}
+	result := make(chan bool, 1)
+	go func() { result <- second.LockWritesContext(ctx) }()
+	cancel()
+
+	select {
+	case acquired := <-result:
+		if acquired {
+			t.Fatal("canceled session acquired the write gate")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("write gate wait did not observe cancellation")
+	}
+	first.UnlockWrites()
 }
