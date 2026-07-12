@@ -150,6 +150,14 @@ func statusCommand(args []string) {
 	fmt.Printf("Frontend: %d active / %d total connections\n", snapshot.Frontend.ActiveConnections, snapshot.Frontend.Connections)
 	fmt.Printf("Queries: %d total / %d failed (average %dms)\n", snapshot.Queries.Queries, snapshot.Queries.FailedQueries, snapshot.Queries.AverageDurationMillis)
 	fmt.Printf("Routing: %d scattered / %d single-shard\n", snapshot.QueryMetrics.Total.ScatteredQueries, snapshot.QueryMetrics.Total.SingleShardQueries)
+	fmt.Printf("Sharding inventory: %s (%d vshards, unsharded mode %s)\n", snapshot.Sharding.Source, snapshot.Sharding.VirtualShards, snapshot.Sharding.UnshardedMode)
+	for _, table := range snapshot.Sharding.Tables {
+		if table.Sharded {
+			fmt.Printf("  %s: sharded by (%s)\n", table.Table, strings.Join(table.ShardKeys, ", "))
+		} else {
+			fmt.Printf("  %s: unsharded\n", table.Table)
+		}
+	}
 	fmt.Println("Rolling query traffic:")
 	for _, window := range snapshot.QueryMetrics.Windows {
 		fmt.Printf("  %s: %d queries, %d failed, %d scattered, %d single-shard, %dms average\n", window.Name, window.Statistics.Queries, window.Statistics.FailedQueries, window.Statistics.ScatteredQueries, window.Statistics.SingleShardQueries, window.Statistics.AverageDurationMillis)

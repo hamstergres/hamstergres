@@ -3,12 +3,25 @@ package backend
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/jruszo/hamstergres/internal/statistics"
 )
+
+func TestAppendShardKeyPreservesCompoundColumnOrder(t *testing.T) {
+	keys := make(map[string][]string)
+	appendShardKey(keys, "public", "events", "tenant")
+	appendShardKey(keys, "public", "events", "region")
+	want := []string{"tenant", "region"}
+	for _, name := range []string{"events", "public.events"} {
+		if !reflect.DeepEqual(keys[name], want) {
+			t.Fatalf("%s shard key = %#v", name, keys[name])
+		}
+	}
+}
 
 func TestSchemaMismatchHasDedicatedOperationalSignal(t *testing.T) {
 	m := &Manager{metrics: statistics.NewCollector()}

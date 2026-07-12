@@ -43,10 +43,14 @@ Nest contains the map that says which data belongs to which Burrow.
 
 Use the familiar technical term `vshard` for virtual shards, named like
 `vshard-00001`. A vshard maps to a Burrow. At startup, each Proxy reads the
-primary-key registry from every Burrow's PostgreSQL catalogs and refuses to
-start if they disagree. It routes reads and writes using the discovered primary
-key (all columns for a composite key), with the static 64k-vshard map. It
-scatters only reads without a usable primary key and schema commands that must
+shard-key registry from every Burrow's PostgreSQL catalogs and refuses to start
+if they disagree. A table is sharded only when one or more columns have the
+exact comment `hamstergres.shard_key`. Multiple marked columns form a compound
+key in PostgreSQL attribute order, so numeric, text, and mixed-type tuples are
+supported. For example, mark both `accounts.tenant_id` and
+`accounts.region`. It routes reads and writes using the complete tuple and the
+64k-vshard ownership catalog persisted in Nest. It scatters only reads without
+a usable shard key and schema commands that must
 reach every Burrow. A simple-query write without one unambiguous primary key is
 rejected; it is never broadcast as a substitute for distributed transactions.
 Within a simple-query transaction, statements may route to different Burrows.
@@ -102,13 +106,24 @@ the same two-phase commit.
 
 ## Schema registry contract
 
-Hamstergres Nest persists the validated primary-key registry at
-`/hamstergres/schema-registry/v1` by default. On first startup, a Proxy seeds
+Hamstergres Nest persists the validated table inventory, shard-key, and vshard
+registry at `/hamstergres/schema-registry/v2` by default. On first startup, a Proxy seeds
 an empty registry from the live Burrow catalogs. Later startup compares the
 live registry with both every other Burrow and the Nest snapshot. Any mismatch
 is a startup error: the Proxy never guesses which schema is authoritative or
 applies DDL itself. Hamstergres Migrations is responsible for an intentional
 schema change and for updating the Nest snapshot as part of that workflow.
+
+The snapshot is also Hamstergres' sharding catalog: it records each sharded
+table and ordered column list plus the owning Burrow for every vshard. Tables absent from the
+catalog are unsharded. The configuration-wide
+`sharding.unsharded_tables.mode` chooses `primary` (all traffic uses one
+configured Burrow) or `replicated` (writes reach all Burrows and reads choose
+one Burrow). This policy is deliberately not selectable per table.
+
+The Proxy keeps the validated Nest inventory in process and exposes it through
+the status HTML, JSON API, CLI, and Prometheus metrics. Status requests never
+query Burrows, invoke `psql`, or fetch Nest synchronously.
 
 ## Globally generated primary keys
 

@@ -10,6 +10,11 @@ import (
 
 const DefaultStatusAddress = "127.0.0.1:8080"
 
+const (
+	UnshardedPrimary    = "primary"
+	UnshardedReplicated = "replicated"
+)
+
 // Config is the static development configuration for a gateway instance.
 type Config struct {
 	Listen struct {
@@ -31,6 +36,10 @@ type Config struct {
 	} `yaml:"transactions"`
 	Sharding struct {
 		PhysicalShards map[string]Shard `yaml:"physical_shards"`
+		Unsharded      struct {
+			Mode          string `yaml:"mode"`
+			PrimaryBurrow string `yaml:"primary_burrow"`
+		} `yaml:"unsharded_tables"`
 	} `yaml:"sharding"`
 }
 
@@ -62,7 +71,7 @@ func Load(path string) (Config, error) {
 		cfg.Status.Address = DefaultStatusAddress
 	}
 	if cfg.Nest.RegistryKey == "" {
-		cfg.Nest.RegistryKey = "/hamstergres/schema-registry/v1"
+		cfg.Nest.RegistryKey = "/hamstergres/schema-registry/v2"
 	}
 	if cfg.Nest.SequenceKey == "" {
 		cfg.Nest.SequenceKey = "/hamstergres/sequences/global-id/v1"
@@ -73,6 +82,20 @@ func Load(path string) (Config, error) {
 	for name, shard := range cfg.Sharding.PhysicalShards {
 		if shard.DSN == "" {
 			return Config{}, fmt.Errorf("config %q: physical Burrow %q has no dsn", path, name)
+		}
+	}
+	if cfg.Sharding.Unsharded.Mode == "" {
+		cfg.Sharding.Unsharded.Mode = UnshardedPrimary
+	}
+	if cfg.Sharding.Unsharded.Mode != UnshardedPrimary && cfg.Sharding.Unsharded.Mode != UnshardedReplicated {
+		return Config{}, fmt.Errorf("config %q: sharding.unsharded_tables.mode must be %q or %q", path, UnshardedPrimary, UnshardedReplicated)
+	}
+	if cfg.Sharding.Unsharded.Mode == UnshardedPrimary {
+		if cfg.Sharding.Unsharded.PrimaryBurrow == "" {
+			cfg.Sharding.Unsharded.PrimaryBurrow = cfg.ShardNames()[0]
+		}
+		if _, ok := cfg.Sharding.PhysicalShards[cfg.Sharding.Unsharded.PrimaryBurrow]; !ok {
+			return Config{}, fmt.Errorf("config %q: unsharded primary Burrow %q is not configured", path, cfg.Sharding.Unsharded.PrimaryBurrow)
 		}
 	}
 	return cfg, nil

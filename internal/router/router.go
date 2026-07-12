@@ -15,6 +15,15 @@ var (
 	tableReference = regexp.MustCompile(`(?is)^\s*(?:SELECT\b.*?\bFROM|UPDATE|DELETE\s+FROM|INSERT\s+INTO)\s+([a-zA-Z_][\w]*(?:\.[a-zA-Z_][\w]*)?)`)
 )
 
+// TableForSQL returns the normalized table reference used by supported DML.
+func TableForSQL(sql string) (string, bool) {
+	match := tableReference.FindStringSubmatch(sql)
+	if len(match) != 2 {
+		return "", false
+	}
+	return strings.ToLower(strings.Trim(match[1], `"`)), true
+}
+
 // GeneratedInsert is a rewritten single-row INSERT whose generated primary
 // key is now explicit, allowing the Proxy to route before contacting a Burrow.
 type GeneratedInsert struct {
@@ -69,8 +78,8 @@ func quoteIdentifier(value string) string {
 	return `"` + strings.ReplaceAll(value, `"`, `""`) + `"`
 }
 
-// TargetForSchema routes a read or write using the table's discovered primary
-// key. It returns false for tables without a primary key and for ambiguous
+// TargetForSchema routes a read or write using the table's annotated shard-key
+// tuple. It returns false for tables without a shard key and for incomplete or ambiguous
 // predicates, leaving the Proxy to apply its safe scatter/rejection policy.
 func TargetForSchema(sql string, parameters [][]byte, registry schema.Registry, burrows []string) (string, bool) {
 	if len(burrows) == 0 {
@@ -80,13 +89,18 @@ func TargetForSchema(sql string, parameters [][]byte, registry schema.Registry, 
 	if len(tableMatch) != 2 {
 		return "", false
 	}
-	columns, ok := registry.PrimaryKey(tableMatch[1])
+	columns, ok := registry.ShardKey(tableMatch[1])
 	if !ok || len(columns) == 0 {
 		return "", false
 	}
 	values, ok := primaryKeyValues(sql, parameters, columns)
 	if !ok {
 		return "", false
+	}
+	vshard := int(HashKey(strings.Join(values, "\x00")) % VirtualShards)
+	owners := registry.VShardOwners()
+	if len(owners) == VirtualShards {
+		return owners[vshard], true
 	}
 	return BurrowForKey(strings.Join(values, "\x00"), burrows), true
 }
