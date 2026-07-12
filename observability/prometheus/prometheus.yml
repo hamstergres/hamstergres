@@ -8,7 +8,8 @@ rule_files:
 scrape_configs:
   - job_name: hamstergres-proxy
     static_configs:
-      - targets: [hamstergres-proxy:8080]
+      # The Proxy runs as a normal host process via `make run-proxy`.
+      - targets: [host.docker.internal:8080]
   - job_name: hamstergres-nest
     metrics_path: /metrics
     static_configs:

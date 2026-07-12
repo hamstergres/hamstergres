@@ -1,10 +1,7 @@
-.PHONY: up up-observability down logs ps test test-unit test-e2e test-sysbench test-observability run-proxy proxy-status
+.PHONY: up down logs ps test test-unit test-e2e test-sysbench test-observability run-proxy proxy-status
 
 up:
 	docker compose up -d --wait
-
-up-observability:
-	docker compose --profile observability up -d --build --wait
 
 down:
 	docker compose down
@@ -31,7 +28,7 @@ test-observability:
 	./scripts/observability-smoke.sh
 
 run-proxy:
-	go run ./cmd/hamstergres-proxy
+	go run ./cmd/hamstergres-proxy --config config/hamstergres.local.example.yaml
 
 proxy-status:
 	go run ./cmd/hamstergres-proxy status

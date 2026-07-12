@@ -269,14 +269,21 @@ scrape_configs:
       - targets: ["127.0.0.1:8080"]
 ```
 
-### Reproducible demo dashboards
+### Reproducible local dashboards
 
-The optional Compose profile starts Hamstergres Proxy, Prometheus, Grafana,
-Hamstergres Nest, both Burrows, and one PostgreSQL exporter per Burrow:
+The standard Compose environment starts Prometheus, Grafana, Hamstergres Nest,
+both Burrows, and one PostgreSQL exporter per Burrow:
 
 ```sh
-make up-observability
+make up
+make run-proxy
 ```
+
+`make run-proxy` runs Hamstergres Proxy directly on the host with
+`config/hamstergres.local.example.yaml`. Prometheus reaches its metrics endpoint
+through `host.docker.internal:8080`, so rebuilding or containerizing the Proxy
+is not required. On Linux, Compose supplies the equivalent `host-gateway`
+mapping automatically.
 
 Open Grafana at <http://127.0.0.1:3000> and sign in with `admin` / `admin`.
 The provisioned **Hamstergres Demo Overview** dashboard is ready without any
@@ -284,7 +291,9 @@ manual data-source or dashboard import. Prometheus is available at
 <http://127.0.0.1:9090>, Proxy status at <http://127.0.0.1:8080>, and the
 PostgreSQL client endpoint at `127.0.0.1:6432`. All published ports bind to
 loopback by default and can be changed with `GRAFANA_PORT`, `PROMETHEUS_PORT`,
-`HAMSTERGRES_STATUS_PORT`, and `HAMSTERGRES_PROXY_PORT`.
+`NEST_PORT`, `BURROW_01_PORT`, and `BURROW_02_PORT`. The host-run Proxy listens
+on ports `6432` and `8080` as configured in
+`config/hamstergres.local.example.yaml`.
 
 Generate traffic and verify all four Prometheus scrape targets plus the
 provisioned dashboard with:
@@ -301,7 +310,7 @@ The PostgreSQL exporters use the `pg_monitor` role created by
 the Burrow data volumes predate that initialization script, run
 `docker compose down --volumes` once to recreate this disposable demo data.
 
-This profile is a local demonstration, not a production-hardened monitoring
+This Compose environment is a local demonstration, not a production-hardened monitoring
 deployment. Its defaults intentionally use well-known development passwords,
 no TLS, no Grafana secret management, no metrics authentication, and local
 named volumes. Use managed secrets, authentication, TLS, retention/resource

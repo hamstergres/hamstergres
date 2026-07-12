@@ -62,31 +62,7 @@ services:
       retries: 15
       start_period: 5s
 
-  hamstergres-proxy:
-    profiles: ["observability"]
-    build:
-      context: .
-    command: ["-config", "/etc/hamstergres/config.yaml"]
-    ports:
-      - "127.0.0.1:${HAMSTERGRES_PROXY_PORT:-6432}:6432"
-      - "127.0.0.1:${HAMSTERGRES_STATUS_PORT:-8080}:8080"
-    volumes:
-      - ./config/hamstergres.compose.yaml:/etc/hamstergres/config.yaml:ro
-    depends_on:
-      hamstergres-nest:
-        condition: service_healthy
-      burrow-01:
-        condition: service_healthy
-      burrow-02:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/healthz"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
-
   burrow-01-exporter:
-    profiles: ["observability"]
     image: prometheuscommunity/postgres-exporter:v0.17.1
     environment:
       DATA_SOURCE_NAME: "postgresql://${POSTGRES_MONITORING_USER:-hamstergres_monitor}:${POSTGRES_MONITORING_PASSWORD:-hamstergres_monitor}@burrow-01:5432/${POSTGRES_DB:-hamstergres}?sslmode=disable"
@@ -103,7 +79,6 @@ services:
       retries: 5
 
   burrow-02-exporter:
-    profiles: ["observability"]
     image: prometheuscommunity/postgres-exporter:v0.17.1
     environment:
       DATA_SOURCE_NAME: "postgresql://${POSTGRES_MONITORING_USER:-hamstergres_monitor}:${POSTGRES_MONITORING_PASSWORD:-hamstergres_monitor}@burrow-02:5432/${POSTGRES_DB:-hamstergres}?sslmode=disable"
@@ -120,7 +95,6 @@ services:
       retries: 5
 
   prometheus:
-    profiles: ["observability"]
     image: prom/prometheus:v3.2.1
     command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.path=/prometheus"]
     ports:
@@ -128,9 +102,9 @@ services:
     volumes:
       - ./observability/prometheus:/etc/prometheus:ro
       - prometheus-data:/prometheus
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
-      hamstergres-proxy:
-        condition: service_healthy
       burrow-01-exporter:
         condition: service_healthy
       burrow-02-exporter:
@@ -142,7 +116,6 @@ services:
       retries: 20
 
   grafana:
-    profiles: ["observability"]
     image: grafana/grafana:11.5.2
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
