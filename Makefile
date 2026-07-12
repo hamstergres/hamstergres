@@ -1,4 +1,4 @@
-.PHONY: up down logs ps test test-unit test-e2e test-sysbench run-proxy proxy-status
+.PHONY: up down logs ps test test-unit test-e2e test-sysbench test-observability run-proxy proxy-status
 
 up:
 	docker compose up -d --wait
@@ -24,8 +24,11 @@ test-e2e:
 test-sysbench:
 	HAMSTERGRES_SYSBENCH_E2E=1 go test ./integration -run '^TestSysbenchReadWriteEndToEnd$$' -count=1 -v
 
+test-observability:
+	./scripts/observability-smoke.sh
+
 run-proxy:
-	go run ./cmd/hamstergres-proxy
+	go run ./cmd/hamstergres-proxy --config config/hamstergres.local.example.yaml
 
 proxy-status:
 	go run ./cmd/hamstergres-proxy status

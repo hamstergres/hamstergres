@@ -1,0 +1,28 @@
+pg_stat_checkpointer:
+  query: |
+    SELECT num_timed, num_requested, buffers_written,
+           write_time, sync_time
+    FROM pg_stat_checkpointer
+  metrics:
+    - num_timed:
+        usage: COUNTER
+        description: Scheduled checkpoints performed.
+    - num_requested:
+        usage: COUNTER
+        description: Requested checkpoints performed.
+    - buffers_written:
+        usage: COUNTER
+        description: Buffers written during checkpoints.
+    - write_time:
+        usage: COUNTER
+        description: Time spent writing checkpoint files in milliseconds.
+    - sync_time:
+        usage: COUNTER
+        description: Time spent synchronizing checkpoint files in milliseconds.
+
+pg_prepared_transactions:
+  query: SELECT count(*) AS count FROM pg_prepared_xacts
+  metrics:
+    - count:
+        usage: GAUGE
+        description: Transactions currently prepared for two-phase commit.

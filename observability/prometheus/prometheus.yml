@@ -1,0 +1,24 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+rule_files:
+  - /etc/prometheus/rules.yml
+
+scrape_configs:
+  - job_name: hamstergres-proxy
+    static_configs:
+      # The Proxy runs as a normal host process via `make run-proxy`.
+      - targets: [host.docker.internal:8080]
+  - job_name: hamstergres-nest
+    metrics_path: /metrics
+    static_configs:
+      - targets: [hamstergres-nest:2381]
+  - job_name: burrows
+    static_configs:
+      - targets: [burrow-01-exporter:9187]
+        labels:
+          burrow: burrow-01
+      - targets: [burrow-02-exporter:9187]
+        labels:
+          burrow: burrow-02
