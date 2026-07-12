@@ -787,6 +787,7 @@ func (s *Server) handleSync(frontend *pgproto3.Backend, session *backend.Session
 // backend request. The selected Burrow receives one socket flush and the Proxy
 // drains the resulting ordered response stream once.
 func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backend.Session, state *extendedState, emitReady bool) bool {
+	started := time.Now()
 	pending := state.pending
 	if pending == nil {
 		return true
@@ -829,7 +830,6 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 		return false
 	}
 
-	started := time.Now()
 	success := pending.execute != nil
 	errorCategory := "query_execution"
 	backendFailed := false
