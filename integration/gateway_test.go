@@ -75,6 +75,19 @@ func TestGatewayEndToEnd(t *testing.T) {
 	assertTotalShardExecutions(t, snapshot.QueryMetrics.ShardExecutions, 3)
 	assertSummary(t, snapshot.QueryMetrics.QuerySummaries, "SELECT ? AS value")
 	assertSummary(t, snapshot.QueryMetrics.QuerySummaries, "SELECT * FROM accounts WHERE tenant_id = ? AND account_id = ?")
+	metrics := getBody(t, statusURL+"/metrics")
+	for _, want := range []string{
+		`hamstergres_proxy_queries_total{outcome="success"} 2`,
+		`hamstergres_proxy_query_routes_total{route="single_burrow"} 1`,
+		`hamstergres_proxy_query_routes_total{route="scatter"} 1`,
+		`hamstergres_proxy_burrow_executions_total{burrow="burrow-01"}`,
+		`hamstergres_proxy_query_duration_seconds_count 2`,
+		"# EOF",
+	} {
+		if !strings.Contains(metrics, want) {
+			t.Fatalf("metrics endpoint did not contain %q:\n%s", want, metrics)
+		}
+	}
 
 	page := getBody(t, statusURL+"/")
 	if !strings.Contains(page, "SELECT * FROM accounts WHERE tenant_id = ? AND account_id = ?") {

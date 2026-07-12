@@ -212,6 +212,37 @@ uses `psql` or asks a client process to calculate statistics. The HTML page,
 JSON API, and the CLI are presentation layers over that one process-owned
 snapshot, leaving a single place to add later internal metrics.
 
+### Prometheus / OpenMetrics
+
+Hamstergres Proxy exposes process-owned metrics at `GET /metrics` on the same
+operator listener as the status page (by default
+`http://127.0.0.1:8080/metrics`). The response is OpenMetrics 1.0 text and can
+be scraped directly by Prometheus. No Grafana dependency or external command is
+required.
+
+The endpoint currently exports query success/failure counters, a query latency
+histogram in seconds, single-Burrow and scatter routing decisions, per-Burrow
+Tunnel executions, frontend connection counts, Burrow health, and backend pool
+capacity/use/acquisition signals. Metric names use the
+`hamstergres_proxy_` prefix. Labels are limited to fixed states, outcomes,
+routing decisions, and configured Burrow names. Raw SQL, query shapes,
+fingerprints, credentials, and bound values are deliberately never labels.
+
+Keep the status listener on a private operator network or place an
+authenticated reverse proxy in front of it. `/metrics`, `/api/v1/status`, and
+the HTML status page expose topology and traffic volumes and do not implement
+authentication themselves. Observability is local and pull-based by default;
+a slow or unavailable scraper cannot block PostgreSQL query processing.
+
+Example Prometheus scrape configuration:
+
+```yaml
+scrape_configs:
+  - job_name: hamstergres-proxy
+    static_configs:
+      - targets: ["127.0.0.1:8080"]
+```
+
 ```bash
 make proxy-status
 # or: go run ./cmd/hamstergres-proxy status --status-url http://host:8080/api/v1/status

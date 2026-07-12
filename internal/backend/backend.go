@@ -652,6 +652,11 @@ type ShardStatus struct {
 	TotalConns    int32     `json:"total_connections"`
 	AcquiredConns int32     `json:"acquired_connections"`
 	IdleConns     int32     `json:"idle_connections"`
+	MaxConns      int32     `json:"max_connections"`
+	AcquireCount  int64     `json:"acquire_count"`
+	AcquireWaits  int64     `json:"acquire_wait_count"`
+	AcquireErrors int64     `json:"acquire_error_count"`
+	AcquireTime   float64   `json:"acquire_duration_seconds"`
 }
 
 // ShardStatuses pings every shard before returning connection and health data.
@@ -684,6 +689,8 @@ func (m *Manager) ShardStatuses(ctx context.Context) []ShardStatus {
 		statuses = append(statuses, ShardStatus{
 			Name: shard.name, Healthy: shard.last.error == "", LastCheckedAt: shard.last.checkedAt,
 			LastError: shard.last.error, TotalConns: stat.TotalConns(), AcquiredConns: stat.AcquiredConns(), IdleConns: stat.IdleConns(),
+			MaxConns: stat.MaxConns(), AcquireCount: stat.AcquireCount(), AcquireWaits: stat.EmptyAcquireCount(),
+			AcquireErrors: stat.CanceledAcquireCount(), AcquireTime: stat.AcquireDuration().Seconds(),
 		})
 	}
 	return statuses

@@ -23,6 +23,10 @@ var windows = []Window{
 	{Name: "10 minutes", Duration: 10 * time.Minute},
 }
 
+// LatencyBuckets are deliberately fixed and shared by every exporter. Values
+// are seconds, following Prometheus base-unit conventions.
+var LatencyBuckets = []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
+
 var (
 	blockComment = regexp.MustCompile(`(?s)/\*.*?\*/`)
 	lineComment  = regexp.MustCompile(`--[^\n]*`)
@@ -90,6 +94,18 @@ type Snapshot struct {
 	ShardExecutions []ShardCount       `json:"burrow_executions"`
 	Windows         []WindowStatistics `json:"windows"`
 	QuerySummaries  []QuerySummary     `json:"query_summaries"`
+	Latency         Histogram          `json:"latency"`
+}
+
+type Histogram struct {
+	Buckets []Bucket `json:"buckets"`
+	Count   int64    `json:"count"`
+	Sum     float64  `json:"sum_seconds"`
+}
+
+type Bucket struct {
+	UpperBound float64 `json:"upper_bound_seconds"`
+	Count      int64   `json:"count"`
 }
 
 type summary struct {
@@ -107,6 +123,7 @@ type Collector struct {
 	total     Statistics
 	shards    map[string]int64
 	summaries map[string]*summary
+	latency   Histogram
 }
 
 func NewCollector() *Collector {
@@ -114,7 +131,11 @@ func NewCollector() *Collector {
 }
 
 func newCollector(now func() time.Time) *Collector {
-	return &Collector{now: now, shards: make(map[string]int64), summaries: make(map[string]*summary)}
+	buckets := make([]Bucket, len(LatencyBuckets))
+	for i, upper := range LatencyBuckets {
+		buckets[i].UpperBound = upper
+	}
+	return &Collector{now: now, shards: make(map[string]int64), summaries: make(map[string]*summary), latency: Histogram{Buckets: buckets}}
 }
 
 func (c *Collector) Record(query QueryEvent) {
@@ -126,6 +147,13 @@ func (c *Collector) Record(query QueryEvent) {
 	c.events = append(c.events, event{at: now, QueryEvent: copyEvent(query), summary: summaryLabel})
 	c.events = discardExpired(c.events, now.Add(-maxEventAge))
 	add(&c.total, query)
+	c.latency.Count++
+	c.latency.Sum += query.Duration.Seconds()
+	for i := range c.latency.Buckets {
+		if query.Duration.Seconds() <= c.latency.Buckets[i].UpperBound {
+			c.latency.Buckets[i].Count++
+		}
+	}
 	for _, shard := range query.Shards {
 		c.shards[shard]++
 	}
@@ -165,7 +193,7 @@ func (c *Collector) Snapshot() Snapshot {
 	defer c.mu.Unlock()
 	c.events = discardExpired(c.events, now.Add(-maxEventAge))
 
-	snapshot := Snapshot{Total: finalize(c.total), ShardExecutions: sortedShardCounts(c.shards)}
+	snapshot := Snapshot{Total: finalize(c.total), ShardExecutions: sortedShardCounts(c.shards), Latency: copyHistogram(c.latency)}
 	for _, window := range windows {
 		statistics, shards := summarize(c.events, now.Add(-window.Duration))
 		snapshot.Windows = append(snapshot.Windows, WindowStatistics{
@@ -184,6 +212,12 @@ func (c *Collector) Snapshot() Snapshot {
 		return snapshot.QuerySummaries[i].Statistics.Queries > snapshot.QuerySummaries[j].Statistics.Queries
 	})
 	return snapshot
+}
+
+func copyHistogram(source Histogram) Histogram {
+	result := source
+	result.Buckets = append([]Bucket(nil), source.Buckets...)
+	return result
 }
 
 // Fingerprint returns a stable 64-bit label for a normalized query shape. The

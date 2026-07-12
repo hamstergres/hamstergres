@@ -3,8 +3,9 @@
 listen:
   address: "0.0.0.0:6432"
 
-# The operator status page and JSON status API. Keep this on a private network
-# or behind your usual access control in any non-development deployment.
+# The operator status page, JSON API, and unauthenticated Prometheus endpoint
+# at /metrics. Keep this on a private network or behind your usual access
+# control in any non-development deployment.
 status:
   address: "127.0.0.1:8080"
 
