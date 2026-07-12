@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -20,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/jruszo/hamstergres/internal/router"
 	"github.com/jruszo/hamstergres/internal/statistics"
 	"github.com/jruszo/hamstergres/internal/status"
 )
@@ -175,12 +178,127 @@ func TestExtendedPreparedStatementLifecycleEndToEnd(t *testing.T) {
 	if err := connection.Deallocate(context.Background(), statement.Name); err != nil {
 		t.Fatalf("Close/Sync: %v\ngateway logs:\n%s", err, logs.String())
 	}
+	missing := connection.ExecPrepared(context.Background(), statement.Name, nil, nil, nil).Read()
+	var postgresError *pgconn.PgError
+	if !errors.As(missing.Err, &postgresError) || postgresError.Code != "26000" {
+		t.Fatalf("execute closed statement error = %v, want SQLSTATE 26000", missing.Err)
+	}
 
 	snapshot := gatewaySnapshot(t, statusURL+"/api/v1/status")
 	if snapshot.QueryMetrics.Total.Queries != 1 || snapshot.QueryMetrics.Total.FailedQueries != 0 {
-		t.Fatalf("extended lifecycle counters = %#v, want one successful query", snapshot.QueryMetrics.Total)
+		t.Fatalf("extended lifecycle counters = %#v, want one successful tracked query", snapshot.QueryMetrics.Total)
 	}
 	assertShardExecutions(t, snapshot.QueryMetrics.Total, snapshot.QueryMetrics.ShardExecutions, 1)
+}
+
+func TestCopyProtocolEndToEnd(t *testing.T) {
+	repoRoot := repositoryRoot(t)
+	ensureDockerBurrows(t, repoRoot)
+
+	frontendAddress := availableAddress(t)
+	statusAddress := availableAddress(t)
+	binary := buildGateway(t, repoRoot)
+	configPath := writeGatewayConfig(t, frontendAddress, statusAddress)
+	logs := startGateway(t, binary, configPath)
+	waitForHealthyGateway(t, "http://"+statusAddress, logs)
+
+	connection, err := pgconn.Connect(context.Background(), "postgres://any-user@"+frontendAddress+"/any-database?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close(context.Background())
+
+	if _, err := connection.Exec(context.Background(), "DROP TABLE IF EXISTS copy_e2e; CREATE TABLE copy_e2e (id bigint PRIMARY KEY, value text)").ReadAll(); err != nil {
+		t.Fatalf("prepare COPY table: %v", err)
+	}
+	if _, err := connection.CopyFrom(context.Background(), strings.NewReader("1\tone\n2\ttwo\n"), "COPY copy_e2e (id, value) FROM STDIN"); err != nil {
+		t.Fatalf("COPY FROM STDIN: %v\ngateway logs:\n%s", err, logs.String())
+	}
+	var copied bytes.Buffer
+	if _, err := connection.CopyTo(context.Background(), &copied, "COPY copy_e2e (id, value) TO STDOUT"); err != nil {
+		t.Fatalf("COPY TO STDOUT: %v\ngateway logs:\n%s", err, logs.String())
+	}
+	if got := strings.Count(copied.String(), "\n"); got != 4 {
+		t.Fatalf("COPY TO rows = %d, want two rows from each Burrow: %q", got, copied.String())
+	}
+}
+
+func TestCrossBurrowTransactionUsesTwoPhaseCommit(t *testing.T) {
+	repoRoot := repositoryRoot(t)
+	ensureDockerBurrows(t, repoRoot)
+
+	frontendAddress := availableAddress(t)
+	statusAddress := availableAddress(t)
+	binary := buildGateway(t, repoRoot)
+	configPath := writeGatewayConfig(t, frontendAddress, statusAddress)
+	logs := startGateway(t, binary, configPath)
+	waitForHealthyGateway(t, "http://"+statusAddress, logs)
+
+	config, err := pgx.ParseConfig("postgres://any-user@" + frontendAddress + "/any-database?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	connection, err := pgx.ConnectConfig(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close(context.Background())
+
+	if _, err := connection.Exec(context.Background(), "DROP TABLE IF EXISTS two_pc_e2e"); err != nil {
+		t.Fatalf("drop 2PC table: %v", err)
+	}
+	if _, err := connection.Exec(context.Background(), "CREATE TABLE two_pc_e2e (id bigint PRIMARY KEY, value text)"); err != nil {
+		t.Fatalf("prepare 2PC table: %v", err)
+	}
+	keys := keysForDifferentBurrows()
+	transaction, err := connection.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, key := range keys {
+		if _, err := transaction.Exec(context.Background(), "INSERT INTO two_pc_e2e (id, value) VALUES ($1, $2)", key, fmt.Sprintf("value-%d", index)); err != nil {
+			_ = transaction.Rollback(context.Background())
+			t.Fatalf("cross-Burrow insert: %v\ngateway logs:\n%s", err, logs.String())
+		}
+	}
+	if err := transaction.Commit(context.Background()); err != nil {
+		t.Fatalf("two-phase commit: %v\ngateway logs:\n%s", err, logs.String())
+	}
+	rows, err := connection.Query(context.Background(), "SELECT id FROM two_pc_e2e")
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for rows.Next() {
+		count++
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("committed row count = %d, want 2", count)
+	}
+}
+
+func keysForDifferentBurrows() [2]int64 {
+	burrows := []string{"burrow-01", "burrow-02"}
+	var keys [2]int64
+	found := make(map[string]bool)
+	for key := int64(1); len(found) < len(burrows); key++ {
+		name := router.BurrowForKey(strconv.FormatInt(key, 10), burrows)
+		if found[name] {
+			continue
+		}
+		found[name] = true
+		if name == burrows[0] {
+			keys[0] = key
+		} else {
+			keys[1] = key
+		}
+	}
+	return keys
 }
 
 func TestGeneratedIDsAcrossConcurrentProxies(t *testing.T) {
@@ -588,6 +706,10 @@ func runSysbench(sysbench, frontendAddress, action string) (string, error) {
 	defer cancel()
 	command := exec.CommandContext(context, sysbench,
 		"--db-driver=pgsql",
+		// Hamstergres requires explicit keys for multi-row INSERTs. This keeps
+		// sysbench's bulk prepare phase routable while its run phase exercises
+		// the PostgreSQL extended-query protocol.
+		"--auto_inc=off",
 		"--pgsql-host=127.0.0.1",
 		"--pgsql-port="+port,
 		"--pgsql-user=hamster",

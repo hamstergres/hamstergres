@@ -39,6 +39,12 @@ func RewriteGeneratedInsert(sql string, registry schema.Registry, valueExpressio
 		return GeneratedInsert{}, false
 	}
 	columnsText, valuesText := sql[match[2]:match[3]], sql[match[4]:match[5]]
+	// Generated-key synthesis is intentionally limited to one VALUES row. The
+	// expression above identifies the first row, so reject any following row
+	// instead of appending a column only to that row and producing invalid SQL.
+	if strings.HasPrefix(strings.TrimSpace(sql[match[1]:]), ",") {
+		return GeneratedInsert{}, false
+	}
 	columns, values := strings.Split(columnsText, ","), strings.Split(valuesText, ",")
 	if len(columns) != len(values) {
 		return GeneratedInsert{}, false

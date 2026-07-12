@@ -233,6 +233,21 @@ func (s *Session) Send(message pgproto3.FrontendMessage) error {
 	return nil
 }
 
+// SendCopy broadcasts a COPY data-phase message without injecting a protocol
+// Flush. PostgreSQL only accepts CopyData, CopyDone, and CopyFail while it is
+// in COPY FROM STDIN mode; the transport buffer is still flushed normally.
+func (s *Session) SendCopy(message pgproto3.FrontendMessage) error {
+	for _, shard := range s.shards {
+		shard.conn.Frontend().Send(message)
+	}
+	for _, shard := range s.shards {
+		if err := shard.conn.Frontend().Flush(); err != nil {
+			return fmt.Errorf("send COPY data to Burrow %s: %w", shard.name, err)
+		}
+	}
+	return nil
+}
+
 // SendTo forwards one frontend protocol message to a single Burrow while
 // preserving that Burrow's prepared-statement and portal state.
 func (s *Session) SendTo(name string, message pgproto3.FrontendMessage) error {
