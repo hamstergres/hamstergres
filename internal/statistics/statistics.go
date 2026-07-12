@@ -38,10 +38,11 @@ var (
 // QueryEvent describes one completed gateway query. Shards lists all targets
 // selected by the router, even if the query eventually failed on a target.
 type QueryEvent struct {
-	Duration time.Duration
-	Success  bool
-	Shards   []string
-	SQL      string
+	Duration      time.Duration
+	Success       bool
+	Shards        []string
+	SQL           string
+	ErrorCategory string
 }
 
 type event struct {
@@ -96,6 +97,12 @@ type Snapshot struct {
 	QuerySummaries  []QuerySummary     `json:"query_summaries"`
 	Latency         Histogram          `json:"latency"`
 	Operations      []OperationCount   `json:"operations"`
+	Failures        []FailureCount     `json:"failures"`
+}
+
+type FailureCount struct {
+	Category string `json:"category"`
+	Count    int64  `json:"count"`
 }
 
 type OperationCount struct {
@@ -132,6 +139,7 @@ type Collector struct {
 	summaries  map[string]*summary
 	latency    Histogram
 	operations map[string]int64
+	failures   map[string]int64
 }
 
 func NewCollector() *Collector {
@@ -143,7 +151,7 @@ func newCollector(now func() time.Time) *Collector {
 	for i, upper := range LatencyBuckets {
 		buckets[i].UpperBound = upper
 	}
-	return &Collector{now: now, shards: make(map[string]int64), summaries: make(map[string]*summary), latency: Histogram{Buckets: buckets}, operations: make(map[string]int64)}
+	return &Collector{now: now, shards: make(map[string]int64), summaries: make(map[string]*summary), latency: Histogram{Buckets: buckets}, operations: make(map[string]int64), failures: make(map[string]int64)}
 }
 
 // RecordOperation records a bounded operational event. Callers must use stable
@@ -163,6 +171,13 @@ func (c *Collector) Record(query QueryEvent) {
 	c.events = append(c.events, event{at: now, QueryEvent: copyEvent(query), summary: summaryLabel})
 	c.events = discardExpired(c.events, now.Add(-maxEventAge))
 	add(&c.total, query)
+	if !query.Success {
+		category := query.ErrorCategory
+		if category == "" {
+			category = "unknown"
+		}
+		c.failures[category]++
+	}
 	c.latency.Count++
 	c.latency.Sum += query.Duration.Seconds()
 	for i := range c.latency.Buckets {
@@ -214,6 +229,10 @@ func (c *Collector) Snapshot() Snapshot {
 		parts := strings.SplitN(key, "\x00", 2)
 		snapshot.Operations = append(snapshot.Operations, OperationCount{Operation: parts[0], Outcome: parts[1], Count: count})
 	}
+	for category, count := range c.failures {
+		snapshot.Failures = append(snapshot.Failures, FailureCount{Category: category, Count: count})
+	}
+	sort.Slice(snapshot.Failures, func(i, j int) bool { return snapshot.Failures[i].Category < snapshot.Failures[j].Category })
 	sort.Slice(snapshot.Operations, func(i, j int) bool {
 		if snapshot.Operations[i].Operation == snapshot.Operations[j].Operation {
 			return snapshot.Operations[i].Outcome < snapshot.Operations[j].Outcome

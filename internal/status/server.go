@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -79,6 +80,10 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(&out, "hamstergres_proxy_queries_total{outcome=\"success\"} %d\nhamstergres_proxy_queries_total{outcome=\"failure\"} %d\n", success, snapshot.Queries.FailedQueries)
 	metric("hamstergres_proxy_query_routes_total", "counter", "Client query routing decisions.")
 	fmt.Fprintf(&out, "hamstergres_proxy_query_routes_total{route=\"single_burrow\"} %d\nhamstergres_proxy_query_routes_total{route=\"scatter\"} %d\n", snapshot.Queries.SingleShardQueries, snapshot.Queries.ScatteredQueries)
+	metric("hamstergres_proxy_query_failures_total", "counter", "Failed client queries by stable error category.")
+	for _, failure := range snapshot.QueryMetrics.Failures {
+		fmt.Fprintf(&out, "hamstergres_proxy_query_failures_total{category=%q} %d\n", failure.Category, failure.Count)
+	}
 	metric("hamstergres_proxy_query_duration_seconds", "histogram", "Client query latency in seconds.")
 	for _, bucket := range snapshot.QueryMetrics.Latency.Buckets {
 		fmt.Fprintf(&out, "hamstergres_proxy_query_duration_seconds_bucket{le=%q} %d\n", strconv.FormatFloat(bucket.UpperBound, 'g', -1, 64), bucket.Count)
@@ -134,6 +139,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleHTML(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := pageTemplate.Execute(w, s.collector.Snapshot(r.Context())); err != nil {
+		slog.Error("render status page", "event", "status_render_failed", "component", "hamstergres-proxy", "error_category", "observability", "error", err)
 		http.Error(w, fmt.Sprintf("render status page: %v", err), http.StatusInternalServerError)
 	}
 }

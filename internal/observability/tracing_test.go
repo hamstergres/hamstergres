@@ -18,3 +18,10 @@ func TestTracingEnabledOnlyByExplicitStandardEnvironment(t *testing.T) {
 		t.Fatal("OTEL_SDK_DISABLED did not disable tracing")
 	}
 }
+
+func TestConfiguredServiceNameHonorsStandardEnvironment(t *testing.T) {
+	t.Setenv("OTEL_SERVICE_NAME", "proxy-west")
+	if got := configuredServiceName(); got != "proxy-west" {
+		t.Fatalf("service name = %q", got)
+	}
+}

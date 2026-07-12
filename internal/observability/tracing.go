@@ -24,13 +24,21 @@ func ConfigureTracing(ctx context.Context) (func(context.Context) error, error) 
 	if err != nil {
 		return nil, err
 	}
-	res, err := resource.Merge(resource.Default(), resource.NewWithAttributes(semconv.SchemaURL, semconv.ServiceName("hamstergres-proxy")))
+	serviceName := configuredServiceName()
+	res, err := resource.Merge(resource.Default(), resource.NewWithAttributes(semconv.SchemaURL, semconv.ServiceName(serviceName)))
 	if err != nil {
 		return nil, err
 	}
 	provider := tracesdk.NewTracerProvider(tracesdk.WithBatcher(exporter), tracesdk.WithResource(res))
 	otel.SetTracerProvider(provider)
 	return provider.Shutdown, nil
+}
+
+func configuredServiceName() string {
+	if name := os.Getenv("OTEL_SERVICE_NAME"); name != "" {
+		return name
+	}
+	return "hamstergres-proxy"
 }
 
 func tracingEnabled() bool {

@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -180,10 +181,13 @@ func (m *Manager) NewSession(ctx context.Context) (*Session, error) {
 	for _, shard := range m.shards {
 		conn, err := pgconn.Connect(ctx, shard.dsn)
 		if err != nil {
+			m.RecordOperation("backend_connection", "failure")
+			slog.Error("Burrow session connection failed", "event", "backend_connection_failed", "component", "hamstergres-proxy", "burrow", shard.name, "error_category", "burrow_unavailable", "error", err)
 			session.Close(context.Background())
 			return nil, fmt.Errorf("connect session to Burrow %s: %w", shard.name, err)
 		}
 		session.shards = append(session.shards, &sessionShard{name: shard.name, conn: conn})
+		m.RecordOperation("backend_connection", "success")
 	}
 	return session, nil
 }
@@ -381,8 +385,9 @@ func (m *Manager) QueryAll(ctx context.Context, sql string) (Result, error) {
 	started := time.Now()
 	targets := m.shardNames()
 	success := false
+	errorCategory := "query_execution"
 	defer func() {
-		m.metrics.Record(statistics.QueryEvent{SQL: sql, Success: success, Duration: time.Since(started), Shards: targets})
+		m.metrics.Record(statistics.QueryEvent{SQL: sql, Success: success, Duration: time.Since(started), Shards: targets, ErrorCategory: errorCategory})
 	}()
 
 	type outcome struct {
@@ -411,6 +416,8 @@ func (m *Manager) QueryAll(ctx context.Context, sql string) (Result, error) {
 		byName[outcome.name] = outcome.result
 	}
 	if firstErr != nil {
+		errorCategory = classifyQueryError(firstErr)
+		m.RecordOperation("backend_query", "failure")
 		return Result{}, firstErr
 	}
 
@@ -425,6 +432,12 @@ func (m *Manager) QueryAll(ctx context.Context, sql string) (Result, error) {
 	}
 	merged, err := merge(ordered)
 	success = err == nil
+	if err != nil {
+		errorCategory = "result_mismatch"
+		m.RecordOperation("backend_query", "failure")
+	} else {
+		m.RecordOperation("backend_query", "success")
+	}
 	return merged, err
 }
 
@@ -433,8 +446,9 @@ func (m *Manager) QueryOne(ctx context.Context, sql, name string) (Result, error
 	started := time.Now()
 	targets := []string{name}
 	success := false
+	errorCategory := "query_execution"
 	defer func() {
-		m.metrics.Record(statistics.QueryEvent{SQL: sql, Success: success, Duration: time.Since(started), Shards: targets})
+		m.metrics.Record(statistics.QueryEvent{SQL: sql, Success: success, Duration: time.Since(started), Shards: targets, ErrorCategory: errorCategory})
 	}()
 
 	for _, shard := range m.shards {
@@ -443,9 +457,36 @@ func (m *Manager) QueryOne(ctx context.Context, sql, name string) (Result, error
 		}
 		result, err := queryShard(ctx, shard.pool, sql)
 		success = err == nil
+		if err != nil {
+			errorCategory = classifyQueryError(err)
+			m.RecordOperation("backend_query", "failure")
+		} else {
+			m.RecordOperation("backend_query", "success")
+		}
 		return result, err
 	}
+	errorCategory = "configuration"
 	return Result{}, fmt.Errorf("unknown Burrow %s", name)
+}
+
+func classifyQueryError(err error) string {
+	var postgresError *pgconn.PgError
+	if errors.As(err, &postgresError) {
+		if len(postgresError.Code) >= 2 {
+			switch postgresError.Code[:2] {
+			case "22", "23":
+				return "data_error"
+			case "25", "40":
+				return "transaction_error"
+			case "42":
+				return "sql_error"
+			case "53":
+				return "resource_exhausted"
+			}
+		}
+		return "postgres_error"
+	}
+	return "backend_connection"
 }
 
 // ShardNames returns the configured Burrow names in routing order.
@@ -466,8 +507,7 @@ func (m *Manager) Schema() schema.Registry {
 func (m *Manager) RefreshSchema(ctx context.Context) error {
 	registry, err := m.loadSchema(ctx)
 	if err != nil {
-		m.RecordOperation("schema_registry_refresh", "failure")
-		slog.Error("schema registry refresh failed", "event", "schema_registry_refresh_failed", "component", "hamstergres-proxy", "error_category", "schema_registry", "error", err)
+		m.recordSchemaRefreshFailure(err)
 		return err
 	}
 	if m.registryStore != nil {
@@ -484,6 +524,16 @@ func (m *Manager) RefreshSchema(ctx context.Context) error {
 	m.schemaMu.Unlock()
 	m.RecordOperation("schema_registry_refresh", "success")
 	return nil
+}
+
+func (m *Manager) recordSchemaRefreshFailure(err error) {
+	m.RecordOperation("schema_registry_refresh", "failure")
+	if strings.Contains(err.Error(), "schema registry mismatch") {
+		m.RecordOperation("schema_registry_mismatch", "detected")
+		slog.Error("schema registry mismatch detected", "event", "schema_registry_mismatch", "component", "hamstergres-proxy", "error_category", "schema_registry_mismatch", "error", err)
+		return
+	}
+	slog.Error("schema registry refresh failed", "event", "schema_registry_refresh_failed", "component", "hamstergres-proxy", "error_category", "schema_registry", "error", err)
 }
 
 // NextGlobalID allocates through Hamstergres Nest. A Proxy without a Nest
@@ -658,8 +708,12 @@ func (m *Manager) RecordQuery(sql string, success bool, duration time.Duration) 
 
 // RecordQueryTargets records an affinity-session query with the selected Burrows.
 func (m *Manager) RecordQueryTargets(sql string, success bool, duration time.Duration, shards []string) {
+	m.RecordQueryTargetsCategory(sql, success, duration, shards, "")
+}
+
+func (m *Manager) RecordQueryTargetsCategory(sql string, success bool, duration time.Duration, shards []string, errorCategory string) {
 	m.metrics.Record(statistics.QueryEvent{
-		SQL: sql, Success: success, Duration: duration, Shards: shards,
+		SQL: sql, Success: success, Duration: duration, Shards: shards, ErrorCategory: errorCategory,
 	})
 }
 

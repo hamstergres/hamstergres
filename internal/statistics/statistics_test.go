@@ -62,6 +62,16 @@ func TestOperationalCountersUseStableDimensions(t *testing.T) {
 	}
 }
 
+func TestFailedQueriesAreCountedByStableCategory(t *testing.T) {
+	collector := NewCollector()
+	collector.Record(QueryEvent{SQL: "SELECT broken", Success: false, ErrorCategory: "sql_error", Shards: []string{"burrow-01"}})
+	collector.Record(QueryEvent{SQL: "SELECT disconnected", Success: false, ErrorCategory: "burrow_transport", Shards: []string{"burrow-01"}})
+	got := collector.Snapshot().Failures
+	if len(got) != 2 || got[0] != (FailureCount{Category: "burrow_transport", Count: 1}) || got[1] != (FailureCount{Category: "sql_error", Count: 1}) {
+		t.Fatalf("failures = %#v", got)
+	}
+}
+
 func TestNormalizePreservesStructureAndReplacesLiterals(t *testing.T) {
 	query := "SELECT * FROM accounts WHERE tenant_id = 42 AND label = 'a secret value'"
 	want := "SELECT * FROM accounts WHERE tenant_id = ? AND label = ?"

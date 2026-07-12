@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,6 +22,10 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/prometheus/common/expfmt"
+	collecttracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
+	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/jruszo/hamstergres/internal/router"
 	"github.com/jruszo/hamstergres/internal/statistics"
@@ -64,24 +69,31 @@ func TestGatewayEndToEnd(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+	queryGatewayError(t, frontendAddress, "SELECT * FROM hamstergres_missing_table", "XX000")
 
 	snapshot := gatewaySnapshot(t, statusURL+"/api/v1/status")
-	if snapshot.Queries.Queries != 2 || snapshot.Queries.FailedQueries != 0 {
-		t.Fatalf("query counters = %#v, want two successful queries", snapshot.Queries)
+	if snapshot.Queries.Queries != 3 || snapshot.Queries.FailedQueries != 1 {
+		t.Fatalf("query counters = %#v, want two successful and one failed query", snapshot.Queries)
 	}
-	if snapshot.QueryMetrics.Total.ScatteredQueries != 1 || snapshot.QueryMetrics.Total.SingleShardQueries != 1 {
-		t.Fatalf("routing counters = %#v, want one scattered and one single-shard query", snapshot.QueryMetrics.Total)
+	if snapshot.QueryMetrics.Total.ScatteredQueries != 2 || snapshot.QueryMetrics.Total.SingleShardQueries != 1 {
+		t.Fatalf("routing counters = %#v, want two scattered and one single-shard query", snapshot.QueryMetrics.Total)
 	}
-	assertTotalShardExecutions(t, snapshot.QueryMetrics.ShardExecutions, 3)
+	assertTotalShardExecutions(t, snapshot.QueryMetrics.ShardExecutions, 5)
 	assertSummary(t, snapshot.QueryMetrics.QuerySummaries, "SELECT ? AS value")
 	assertSummary(t, snapshot.QueryMetrics.QuerySummaries, "SELECT * FROM accounts WHERE tenant_id = ? AND account_id = ?")
 	metrics := getBody(t, statusURL+"/metrics")
+	var parser expfmt.TextParser
+	if _, err := parser.TextToMetricFamilies(strings.NewReader(metrics)); err != nil {
+		t.Fatalf("metrics endpoint is not valid Prometheus/OpenMetrics text: %v\n%s", err, metrics)
+	}
 	for _, want := range []string{
 		`hamstergres_proxy_queries_total{outcome="success"} 2`,
+		`hamstergres_proxy_queries_total{outcome="failure"} 1`,
+		`hamstergres_proxy_query_failures_total{category="sql_error"} 1`,
 		`hamstergres_proxy_query_routes_total{route="single_burrow"} 1`,
-		`hamstergres_proxy_query_routes_total{route="scatter"} 1`,
+		`hamstergres_proxy_query_routes_total{route="scatter"} 2`,
 		`hamstergres_proxy_burrow_executions_total{burrow="burrow-01"}`,
-		`hamstergres_proxy_query_duration_seconds_count 2`,
+		`hamstergres_proxy_query_duration_seconds_count 3`,
 		"# EOF",
 	} {
 		if !strings.Contains(metrics, want) {
@@ -102,8 +114,180 @@ func TestGatewayEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("status CLI failed: %v\n%s", err, output)
 	}
-	if !strings.Contains(string(output), "Routing: 1 scattered / 1 single-shard") || !strings.Contains(string(output), statistics.Fingerprint("SELECT * FROM accounts WHERE tenant_id = ? AND account_id = ?")) {
+	if !strings.Contains(string(output), "Routing: 2 scattered / 1 single-shard") || !strings.Contains(string(output), statistics.Fingerprint("SELECT * FROM accounts WHERE tenant_id = ? AND account_id = ?")) {
 		t.Fatalf("status CLI output did not contain routing and fingerprint data:\n%s", output)
+	}
+	assertConcurrentQueriesAndMetricScrapes(t, frontendAddress, statusURL+"/metrics")
+}
+
+func TestTracingAndObservabilityFailureEndToEnd(t *testing.T) {
+	repoRoot := repositoryRoot(t)
+	ensureDockerBurrows(t, repoRoot)
+	var mu sync.Mutex
+	var spans []*tracepb.Span
+	collector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var request collecttracepb.ExportTraceServiceRequest
+		if err := proto.Unmarshal(body, &request); err != nil {
+			t.Error(err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		for _, resourceSpans := range request.ResourceSpans {
+			for _, scopeSpans := range resourceSpans.ScopeSpans {
+				spans = append(spans, scopeSpans.Spans...)
+			}
+		}
+		mu.Unlock()
+		response, _ := proto.Marshal(&collecttracepb.ExportTraceServiceResponse{})
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		_, _ = w.Write(response)
+	}))
+	defer collector.Close()
+
+	frontendAddress, statusAddress := availableAddress(t), availableAddress(t)
+	binary := buildGateway(t, repoRoot)
+	configPath := writeGatewayConfig(t, frontendAddress, statusAddress)
+	contents, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents = append(contents, []byte("\nobservability:\n  log_file: \"/missing/hamstergres/proxy.log\"\n")...)
+	if err := os.WriteFile(configPath, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logs := startGatewayWithEnv(t, binary, configPath, []string{
+		"OTEL_TRACES_EXPORTER=otlp",
+		"OTEL_SERVICE_NAME=hamstergres-proxy-integration",
+		"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=" + collector.URL + "/v1/traces",
+	})
+	statusURL := "http://" + statusAddress
+	waitForHealthyGateway(t, statusURL, logs)
+	assertStructuredLogEvent(t, logs.String(), "logging_configuration_failed", "observability")
+	queryGateway(t, frontendAddress, "SELECT 1", func(rows pgx.Rows) {
+		for rows.Next() {
+		}
+	})
+	queryGatewayError(t, frontendAddress, "SELECT * FROM hamstergres_missing_trace_table", "XX000")
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		count := len(spans)
+		mu.Unlock()
+		if count >= 6 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	assertExportedTraceShape(t, spans)
+}
+
+func TestStatusListenerFailureDoesNotBlockQueries(t *testing.T) {
+	repoRoot := repositoryRoot(t)
+	ensureDockerBurrows(t, repoRoot)
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	frontendAddress := availableAddress(t)
+	binary := buildGateway(t, repoRoot)
+	configPath := writeGatewayConfig(t, frontendAddress, occupied.Addr().String())
+	logs := startGateway(t, binary, configPath)
+	waitForGatewayQuery(t, frontendAddress, logs)
+	assertStructuredLogEvent(t, logs.String(), "status_server_failed", "network")
+}
+
+func waitForGatewayQuery(t *testing.T, address string, logs *synchronizedBuffer) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		config, err := pgx.ParseConfig("postgres://any-user@" + address + "/any-database?sslmode=disable")
+		if err == nil {
+			config.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+			connection, connectErr := pgx.ConnectConfig(context.Background(), config)
+			if connectErr == nil {
+				_, queryErr := connection.Exec(context.Background(), "SELECT 1")
+				connection.Close(context.Background())
+				if queryErr == nil {
+					return
+				}
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("Proxy did not serve queries after status listener failure:\n%s", logs.String())
+}
+
+func assertStructuredLogEvent(t *testing.T, logs, event, category string) {
+	t.Helper()
+	for _, line := range strings.Split(logs, "\n") {
+		var fields map[string]any
+		if json.Unmarshal([]byte(line), &fields) != nil || fields["event"] != event {
+			continue
+		}
+		if fields["component"] != "hamstergres-proxy" || fields["error_category"] != category || fields["level"] == nil {
+			t.Fatalf("structured event %s lacks required fields: %#v", event, fields)
+		}
+		return
+	}
+	t.Fatalf("structured event %s not found:\n%s", event, logs)
+}
+
+func assertExportedTraceShape(t *testing.T, spans []*tracepb.Span) {
+	t.Helper()
+	parents := make(map[string]*tracepb.Span)
+	for _, span := range spans {
+		if span.Name == "proxy.query" {
+			parents[string(span.SpanId)] = span
+		}
+		for _, item := range span.Attributes {
+			if item.Key == "db.statement" || item.Key == "db.query.text" {
+				t.Fatalf("sensitive SQL attribute exported: %s", item.Key)
+			}
+		}
+	}
+	if len(parents) < 2 {
+		t.Fatalf("query spans = %d, all spans = %#v", len(parents), spans)
+	}
+	tunnelsByParent := make(map[string]map[string]bool)
+	failedQuery := false
+	for _, span := range spans {
+		if span.Name == "proxy.query" && span.Status.GetCode() == tracepb.Status_STATUS_CODE_ERROR {
+			failedQuery = true
+		}
+		if span.Name != "tunnel.execute" {
+			continue
+		}
+		parent := string(span.ParentSpanId)
+		if parents[parent] == nil {
+			t.Fatal("Tunnel span is not parented by a frontend query")
+		}
+		if tunnelsByParent[parent] == nil {
+			tunnelsByParent[parent] = make(map[string]bool)
+		}
+		for _, item := range span.Attributes {
+			if item.Key == "hamstergres.burrow" {
+				tunnelsByParent[parent][item.Value.GetStringValue()] = true
+			}
+		}
+	}
+	if !failedQuery {
+		t.Fatal("failed frontend query did not export error status")
+	}
+	for parent := range parents {
+		if len(tunnelsByParent[parent]) != 2 {
+			t.Fatalf("query %x selected Tunnel spans = %#v, want both Burrows", parent, tunnelsByParent[parent])
+		}
 	}
 }
 
@@ -556,10 +740,31 @@ sharding:
 	return path
 }
 
-func startGateway(t *testing.T, binary, configPath string) *bytes.Buffer {
+type synchronizedBuffer struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (b *synchronizedBuffer) Write(contents []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.Write(contents)
+}
+func (b *synchronizedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.String()
+}
+
+func startGateway(t *testing.T, binary, configPath string) *synchronizedBuffer {
+	return startGatewayWithEnv(t, binary, configPath, nil)
+}
+
+func startGatewayWithEnv(t *testing.T, binary, configPath string, environment []string) *synchronizedBuffer {
 	t.Helper()
-	logs := &bytes.Buffer{}
+	logs := &synchronizedBuffer{}
 	command := exec.Command(binary, "-config", configPath)
+	command.Env = append(os.Environ(), environment...)
 	command.Stdout = logs
 	command.Stderr = logs
 	if err := command.Start(); err != nil {
@@ -574,7 +779,7 @@ func startGateway(t *testing.T, binary, configPath string) *bytes.Buffer {
 	return logs
 }
 
-func waitForHealthyGateway(t *testing.T, statusURL string, logs *bytes.Buffer) {
+func waitForHealthyGateway(t *testing.T, statusURL string, logs *synchronizedBuffer) {
 	t.Helper()
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
@@ -609,6 +814,76 @@ func queryGateway(t *testing.T, address, sql string, assert func(pgx.Rows)) {
 	}
 	defer rows.Close()
 	assert(rows)
+}
+
+func queryGatewayError(t *testing.T, address, sql, code string) {
+	t.Helper()
+	config, err := pgx.ParseConfig("postgres://any-user@" + address + "/any-database?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	connection, err := pgx.ConnectConfig(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close(context.Background())
+	_, err = connection.Exec(context.Background(), sql)
+	var postgresError *pgconn.PgError
+	if !errors.As(err, &postgresError) || postgresError.Code != code {
+		t.Fatalf("query error = %v, want PostgreSQL code %s", err, code)
+	}
+}
+
+func assertConcurrentQueriesAndMetricScrapes(t *testing.T, address, metricsURL string) {
+	t.Helper()
+	var wg sync.WaitGroup
+	errorsFound := make(chan error, 40)
+	for worker := 0; worker < 4; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 10; i++ {
+				response, err := http.Get(metricsURL)
+				if err != nil {
+					errorsFound <- err
+					continue
+				}
+				_, readErr := io.Copy(io.Discard, response.Body)
+				response.Body.Close()
+				if readErr != nil || response.StatusCode != http.StatusOK {
+					errorsFound <- fmt.Errorf("metrics scrape: status=%s read=%v", response.Status, readErr)
+				}
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 10; i++ {
+			config, err := pgx.ParseConfig("postgres://any-user@" + address + "/any-database?sslmode=disable")
+			if err != nil {
+				errorsFound <- err
+				return
+			}
+			config.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+			connection, err := pgx.ConnectConfig(context.Background(), config)
+			if err != nil {
+				errorsFound <- err
+				continue
+			}
+			_, err = connection.Exec(context.Background(), "SELECT 1")
+			connection.Close(context.Background())
+			if err != nil {
+				errorsFound <- err
+			}
+		}
+	}()
+	wg.Wait()
+	close(errorsFound)
+	for err := range errorsFound {
+		t.Error(err)
+	}
 }
 
 func gatewaySnapshot(t *testing.T, endpoint string) status.Snapshot {

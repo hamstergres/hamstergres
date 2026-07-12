@@ -233,6 +233,7 @@ fingerprints, credentials, and bound values are deliberately never labels.
 | `hamstergres_proxy_uptime_seconds` | seconds | none |
 | `hamstergres_proxy_frontend_connections` | connections | `state`: `active`, `total` |
 | `hamstergres_proxy_queries_total` | queries | `outcome`: `success`, `failure` |
+| `hamstergres_proxy_query_failures_total` | failures | bounded `category` values |
 | `hamstergres_proxy_query_routes_total` | queries | `route`: `single_burrow`, `scatter` |
 | `hamstergres_proxy_query_duration_seconds` | seconds | histogram bucket `le` only |
 | `hamstergres_proxy_burrow_executions_total` | executions | configured `burrow` |
@@ -243,11 +244,15 @@ fingerprints, credentials, and bound values are deliberately never labels.
 | `hamstergres_proxy_backend_pool_acquire_duration_seconds_total` | seconds | configured `burrow` |
 | `hamstergres_proxy_operations_total` | operations | bounded `operation` and `outcome` values below |
 
-Operational values are fixed in code: `copy`, `generated_id_allocation`,
-`nest_request`, `nest_registry_write`, `schema_registry_refresh`, and
-`two_phase_commit`. Outcomes are `success`, `failure`, `prepare_failure`, or
-`uncertain` as applicable. Transaction IDs, errors, query shapes, and other
-runtime values never appear in metric labels.
+Operational values are fixed in code: `backend_connection`, `backend_query`,
+`copy`, `generated_id_allocation`, `nest_request`, `nest_registry_write`,
+`schema_registry_mismatch`, `schema_registry_refresh`, and `two_phase_commit`.
+Outcomes are bounded values such as `success`, `failure`, `detected`,
+`prepare_failure`, or `uncertain`. Query failure categories are likewise fixed,
+including `sql_error`, `data_error`, `transaction_error`, `unsafe_routing`,
+`burrow_transport`, `resource_exhausted`, and `schema_registry`. Transaction
+IDs, errors, query shapes, and other runtime values never appear in metric
+labels.
 
 Keep the status listener on a private operator network or place an
 authenticated reverse proxy in front of it. `/metrics`, `/api/v1/status`, and
@@ -268,7 +273,9 @@ Structured operational events use stable `event`, `component`, `burrow`,
 `transaction_id`, and `error_category` fields where applicable. Set
 `observability.log_file` to append JSON logs to a local file created with mode
 `0600`. Leaving it empty keeps the normal stderr logger. Hamstergres Proxy does
-not submit or export logs to an external service.
+not submit or export logs to an external service. If the configured file cannot
+be opened, the Proxy emits `logging_configuration_failed`, falls back to JSON
+on stderr, and continues serving queries.
 
 Tracing hooks cover each frontend query and its selected Tunnel/Burrow
 executions. Export is disabled by default. To opt in, configure the standard
