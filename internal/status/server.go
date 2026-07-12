@@ -6,7 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"log/slog"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jruszo/hamstergres/internal/backend"
@@ -57,7 +60,64 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/", s.handleHTML)
 	mux.HandleFunc("/api/v1/status", s.handleJSON)
 	mux.HandleFunc("/healthz", s.handleHealth)
+	mux.HandleFunc("/metrics", s.handleMetrics)
 	return mux
+}
+
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/openmetrics-text; version=1.0.0; charset=utf-8")
+	snapshot := s.collector.Snapshot(r.Context())
+	var out strings.Builder
+	metric := func(name, kind, help string) {
+		fmt.Fprintf(&out, "# HELP %s %s\n# TYPE %s %s\n", name, help, name, kind)
+	}
+	metric("hamstergres_proxy_uptime_seconds", "gauge", "Seconds since the Proxy started.")
+	fmt.Fprintf(&out, "hamstergres_proxy_uptime_seconds %d\n", snapshot.UptimeSeconds)
+	metric("hamstergres_proxy_frontend_connections", "gauge", "Frontend connections by state.")
+	fmt.Fprintf(&out, "hamstergres_proxy_frontend_connections{state=\"active\"} %d\nhamstergres_proxy_frontend_connections{state=\"total\"} %d\n", snapshot.Frontend.ActiveConnections, snapshot.Frontend.Connections)
+	metric("hamstergres_proxy_queries_total", "counter", "Client queries by outcome and routing decision.")
+	success := snapshot.Queries.Queries - snapshot.Queries.FailedQueries
+	fmt.Fprintf(&out, "hamstergres_proxy_queries_total{outcome=\"success\"} %d\nhamstergres_proxy_queries_total{outcome=\"failure\"} %d\n", success, snapshot.Queries.FailedQueries)
+	metric("hamstergres_proxy_query_routes_total", "counter", "Client query routing decisions.")
+	fmt.Fprintf(&out, "hamstergres_proxy_query_routes_total{route=\"single_burrow\"} %d\nhamstergres_proxy_query_routes_total{route=\"scatter\"} %d\n", snapshot.Queries.SingleShardQueries, snapshot.Queries.ScatteredQueries)
+	metric("hamstergres_proxy_query_failures_total", "counter", "Failed client queries by stable error category.")
+	for _, failure := range snapshot.QueryMetrics.Failures {
+		fmt.Fprintf(&out, "hamstergres_proxy_query_failures_total{category=%q} %d\n", failure.Category, failure.Count)
+	}
+	metric("hamstergres_proxy_query_duration_seconds", "histogram", "Client query latency in seconds.")
+	for _, bucket := range snapshot.QueryMetrics.Latency.Buckets {
+		fmt.Fprintf(&out, "hamstergres_proxy_query_duration_seconds_bucket{le=%q} %d\n", strconv.FormatFloat(bucket.UpperBound, 'g', -1, 64), bucket.Count)
+	}
+	fmt.Fprintf(&out, "hamstergres_proxy_query_duration_seconds_bucket{le=\"+Inf\"} %d\nhamstergres_proxy_query_duration_seconds_sum %g\nhamstergres_proxy_query_duration_seconds_count %d\n", snapshot.QueryMetrics.Latency.Count, snapshot.QueryMetrics.Latency.Sum, snapshot.QueryMetrics.Latency.Count)
+	metric("hamstergres_proxy_burrow_executions_total", "counter", "Query executions sent through Tunnels to each Burrow.")
+	for _, item := range snapshot.QueryMetrics.ShardExecutions {
+		fmt.Fprintf(&out, "hamstergres_proxy_burrow_executions_total{burrow=%q} %d\n", item.Name, item.Queries)
+	}
+	metric("hamstergres_proxy_operations_total", "counter", "Operational events by stable operation and outcome.")
+	for _, item := range snapshot.QueryMetrics.Operations {
+		fmt.Fprintf(&out, "hamstergres_proxy_operations_total{operation=%q,outcome=%q} %d\n", item.Operation, item.Outcome, item.Count)
+	}
+	metric("hamstergres_proxy_burrow_up", "gauge", "Whether the latest Burrow health check succeeded.")
+	metric("hamstergres_proxy_backend_pool_connections", "gauge", "Backend pool connections by Burrow and state.")
+	metric("hamstergres_proxy_backend_pool_acquire_total", "counter", "Backend pool acquisition attempts by Burrow and outcome.")
+	metric("hamstergres_proxy_backend_pool_wait_total", "counter", "Backend pool acquisitions that had to wait for capacity.")
+	metric("hamstergres_proxy_backend_pool_acquire_duration_seconds_total", "counter", "Total time spent acquiring backend connections.")
+	for _, b := range snapshot.Burrows {
+		up := 0
+		if b.Healthy {
+			up = 1
+		}
+		fmt.Fprintf(&out, "hamstergres_proxy_burrow_up{burrow=%q} %d\n", b.Name, up)
+		fmt.Fprintf(&out, "hamstergres_proxy_backend_pool_connections{burrow=%q,state=\"capacity\"} %d\n", b.Name, b.MaxConns)
+		fmt.Fprintf(&out, "hamstergres_proxy_backend_pool_connections{burrow=%q,state=\"in_use\"} %d\n", b.Name, b.AcquiredConns)
+		fmt.Fprintf(&out, "hamstergres_proxy_backend_pool_connections{burrow=%q,state=\"idle\"} %d\n", b.Name, b.IdleConns)
+		fmt.Fprintf(&out, "hamstergres_proxy_backend_pool_acquire_total{burrow=%q,outcome=\"success\"} %d\n", b.Name, b.AcquireCount)
+		fmt.Fprintf(&out, "hamstergres_proxy_backend_pool_acquire_total{burrow=%q,outcome=\"canceled\"} %d\n", b.Name, b.AcquireErrors)
+		fmt.Fprintf(&out, "hamstergres_proxy_backend_pool_wait_total{burrow=%q} %d\n", b.Name, b.AcquireWaits)
+		fmt.Fprintf(&out, "hamstergres_proxy_backend_pool_acquire_duration_seconds_total{burrow=%q} %g\n", b.Name, b.AcquireTime)
+	}
+	out.WriteString("# EOF\n")
+	_, _ = w.Write([]byte(out.String()))
 }
 
 func (s *Server) handleJSON(w http.ResponseWriter, r *http.Request) {
@@ -79,6 +139,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleHTML(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := pageTemplate.Execute(w, s.collector.Snapshot(r.Context())); err != nil {
+		slog.Error("render status page", "event", "status_render_failed", "component", "hamstergres-proxy", "error_category", "observability", "error", err)
 		http.Error(w, fmt.Sprintf("render status page: %v", err), http.StatusInternalServerError)
 	}
 }

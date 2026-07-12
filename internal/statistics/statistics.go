@@ -23,6 +23,10 @@ var windows = []Window{
 	{Name: "10 minutes", Duration: 10 * time.Minute},
 }
 
+// LatencyBuckets are deliberately fixed and shared by every exporter. Values
+// are seconds, following Prometheus base-unit conventions.
+var LatencyBuckets = []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
+
 var (
 	blockComment = regexp.MustCompile(`(?s)/\*.*?\*/`)
 	lineComment  = regexp.MustCompile(`--[^\n]*`)
@@ -34,10 +38,11 @@ var (
 // QueryEvent describes one completed gateway query. Shards lists all targets
 // selected by the router, even if the query eventually failed on a target.
 type QueryEvent struct {
-	Duration time.Duration
-	Success  bool
-	Shards   []string
-	SQL      string
+	Duration      time.Duration
+	Success       bool
+	Shards        []string
+	SQL           string
+	ErrorCategory string
 }
 
 type event struct {
@@ -90,6 +95,31 @@ type Snapshot struct {
 	ShardExecutions []ShardCount       `json:"burrow_executions"`
 	Windows         []WindowStatistics `json:"windows"`
 	QuerySummaries  []QuerySummary     `json:"query_summaries"`
+	Latency         Histogram          `json:"latency"`
+	Operations      []OperationCount   `json:"operations"`
+	Failures        []FailureCount     `json:"failures"`
+}
+
+type FailureCount struct {
+	Category string `json:"category"`
+	Count    int64  `json:"count"`
+}
+
+type OperationCount struct {
+	Operation string `json:"operation"`
+	Outcome   string `json:"outcome"`
+	Count     int64  `json:"count"`
+}
+
+type Histogram struct {
+	Buckets []Bucket `json:"buckets"`
+	Count   int64    `json:"count"`
+	Sum     float64  `json:"sum_seconds"`
+}
+
+type Bucket struct {
+	UpperBound float64 `json:"upper_bound_seconds"`
+	Count      int64   `json:"count"`
 }
 
 type summary struct {
@@ -101,12 +131,15 @@ type summary struct {
 // Collector keeps ten minutes of individual events plus a bounded set of
 // process-lifetime query shapes. It has no external dependency or persistence.
 type Collector struct {
-	mu        sync.Mutex
-	now       func() time.Time
-	events    []event
-	total     Statistics
-	shards    map[string]int64
-	summaries map[string]*summary
+	mu         sync.Mutex
+	now        func() time.Time
+	events     []event
+	total      Statistics
+	shards     map[string]int64
+	summaries  map[string]*summary
+	latency    Histogram
+	operations map[string]int64
+	failures   map[string]int64
 }
 
 func NewCollector() *Collector {
@@ -114,7 +147,19 @@ func NewCollector() *Collector {
 }
 
 func newCollector(now func() time.Time) *Collector {
-	return &Collector{now: now, shards: make(map[string]int64), summaries: make(map[string]*summary)}
+	buckets := make([]Bucket, len(LatencyBuckets))
+	for i, upper := range LatencyBuckets {
+		buckets[i].UpperBound = upper
+	}
+	return &Collector{now: now, shards: make(map[string]int64), summaries: make(map[string]*summary), latency: Histogram{Buckets: buckets}, operations: make(map[string]int64), failures: make(map[string]int64)}
+}
+
+// RecordOperation records a bounded operational event. Callers must use stable
+// operation and outcome constants; dynamic errors and identifiers belong in logs.
+func (c *Collector) RecordOperation(operation, outcome string) {
+	c.mu.Lock()
+	c.operations[operation+"\x00"+outcome]++
+	c.mu.Unlock()
 }
 
 func (c *Collector) Record(query QueryEvent) {
@@ -126,6 +171,20 @@ func (c *Collector) Record(query QueryEvent) {
 	c.events = append(c.events, event{at: now, QueryEvent: copyEvent(query), summary: summaryLabel})
 	c.events = discardExpired(c.events, now.Add(-maxEventAge))
 	add(&c.total, query)
+	if !query.Success {
+		category := query.ErrorCategory
+		if category == "" {
+			category = "unknown"
+		}
+		c.failures[category]++
+	}
+	c.latency.Count++
+	c.latency.Sum += query.Duration.Seconds()
+	for i := range c.latency.Buckets {
+		if query.Duration.Seconds() <= c.latency.Buckets[i].UpperBound {
+			c.latency.Buckets[i].Count++
+		}
+	}
 	for _, shard := range query.Shards {
 		c.shards[shard]++
 	}
@@ -165,7 +224,21 @@ func (c *Collector) Snapshot() Snapshot {
 	defer c.mu.Unlock()
 	c.events = discardExpired(c.events, now.Add(-maxEventAge))
 
-	snapshot := Snapshot{Total: finalize(c.total), ShardExecutions: sortedShardCounts(c.shards)}
+	snapshot := Snapshot{Total: finalize(c.total), ShardExecutions: sortedShardCounts(c.shards), Latency: copyHistogram(c.latency)}
+	for key, count := range c.operations {
+		parts := strings.SplitN(key, "\x00", 2)
+		snapshot.Operations = append(snapshot.Operations, OperationCount{Operation: parts[0], Outcome: parts[1], Count: count})
+	}
+	for category, count := range c.failures {
+		snapshot.Failures = append(snapshot.Failures, FailureCount{Category: category, Count: count})
+	}
+	sort.Slice(snapshot.Failures, func(i, j int) bool { return snapshot.Failures[i].Category < snapshot.Failures[j].Category })
+	sort.Slice(snapshot.Operations, func(i, j int) bool {
+		if snapshot.Operations[i].Operation == snapshot.Operations[j].Operation {
+			return snapshot.Operations[i].Outcome < snapshot.Operations[j].Outcome
+		}
+		return snapshot.Operations[i].Operation < snapshot.Operations[j].Operation
+	})
 	for _, window := range windows {
 		statistics, shards := summarize(c.events, now.Add(-window.Duration))
 		snapshot.Windows = append(snapshot.Windows, WindowStatistics{
@@ -184,6 +257,12 @@ func (c *Collector) Snapshot() Snapshot {
 		return snapshot.QuerySummaries[i].Statistics.Queries > snapshot.QuerySummaries[j].Statistics.Queries
 	})
 	return snapshot
+}
+
+func copyHistogram(source Histogram) Histogram {
+	result := source
+	result.Buckets = append([]Bucket(nil), source.Buckets...)
+	return result
 }
 
 // Fingerprint returns a stable 64-bit label for a normalized query shape. The

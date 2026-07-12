@@ -1,12 +1,23 @@
 package backend
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
+	"github.com/jruszo/hamstergres/internal/statistics"
 )
+
+func TestSchemaMismatchHasDedicatedOperationalSignal(t *testing.T) {
+	m := &Manager{metrics: statistics.NewCollector()}
+	m.recordSchemaRefreshFailure(fmt.Errorf("schema registry mismatch at Burrow burrow-02"))
+	operations := m.QueryMetrics().Operations
+	if len(operations) != 2 || operations[0].Operation != "schema_registry_mismatch" || operations[0].Outcome != "detected" {
+		t.Fatalf("operations = %#v", operations)
+	}
+}
 
 func TestMergeAppendsRowsAndCountsSelect(t *testing.T) {
 	field := pgproto3.FieldDescription{Name: []byte("tenant_id"), DataTypeOID: 20}

@@ -23,6 +23,9 @@ type Config struct {
 		RegistryKey string `yaml:"registry_key"`
 		SequenceKey string `yaml:"sequence_key"`
 	} `yaml:"nest"`
+	Observability struct {
+		LogFile string `yaml:"log_file"`
+	} `yaml:"observability"`
 	Sharding struct {
 		PhysicalShards map[string]Shard `yaml:"physical_shards"`
 	} `yaml:"sharding"`

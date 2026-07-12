@@ -212,6 +212,85 @@ uses `psql` or asks a client process to calculate statistics. The HTML page,
 JSON API, and the CLI are presentation layers over that one process-owned
 snapshot, leaving a single place to add later internal metrics.
 
+### Prometheus / OpenMetrics
+
+Hamstergres Proxy exposes process-owned metrics at `GET /metrics` on the same
+operator listener as the status page (by default
+`http://127.0.0.1:8080/metrics`). The response is OpenMetrics 1.0 text and can
+be scraped directly by Prometheus. No Grafana dependency or external command is
+required.
+
+The endpoint currently exports query success/failure counters, a query latency
+histogram in seconds, single-Burrow and scatter routing decisions, per-Burrow
+Tunnel executions, frontend connection counts, Burrow health, and backend pool
+capacity/use/acquisition signals. Metric names use the
+`hamstergres_proxy_` prefix. Labels are limited to fixed states, outcomes,
+routing decisions, and configured Burrow names. Raw SQL, query shapes,
+fingerprints, credentials, and bound values are deliberately never labels.
+
+| Metric | Unit | Labels |
+| --- | --- | --- |
+| `hamstergres_proxy_uptime_seconds` | seconds | none |
+| `hamstergres_proxy_frontend_connections` | connections | `state`: `active`, `total` |
+| `hamstergres_proxy_queries_total` | queries | `outcome`: `success`, `failure` |
+| `hamstergres_proxy_query_failures_total` | failures | bounded `category` values |
+| `hamstergres_proxy_query_routes_total` | queries | `route`: `single_burrow`, `scatter` |
+| `hamstergres_proxy_query_duration_seconds` | seconds | histogram bucket `le` only |
+| `hamstergres_proxy_burrow_executions_total` | executions | configured `burrow` |
+| `hamstergres_proxy_burrow_up` | boolean | configured `burrow` |
+| `hamstergres_proxy_backend_pool_connections` | connections | configured `burrow`; `state`: `capacity`, `in_use`, `idle` |
+| `hamstergres_proxy_backend_pool_acquire_total` | acquisitions | configured `burrow`; `outcome`: `success`, `canceled` |
+| `hamstergres_proxy_backend_pool_wait_total` | waits | configured `burrow` |
+| `hamstergres_proxy_backend_pool_acquire_duration_seconds_total` | seconds | configured `burrow` |
+| `hamstergres_proxy_operations_total` | operations | bounded `operation` and `outcome` values below |
+
+Operational values are fixed in code: `backend_connection`, `backend_query`,
+`copy`, `generated_id_allocation`, `nest_request`, `nest_registry_write`,
+`schema_registry_mismatch`, `schema_registry_refresh`, and `two_phase_commit`.
+Outcomes are bounded values such as `success`, `failure`, `detected`,
+`prepare_failure`, or `uncertain`. Query failure categories are likewise fixed,
+including `sql_error`, `data_error`, `transaction_error`, `unsafe_routing`,
+`burrow_transport`, `resource_exhausted`, and `schema_registry`. Transaction
+IDs, errors, query shapes, and other runtime values never appear in metric
+labels.
+
+Keep the status listener on a private operator network or place an
+authenticated reverse proxy in front of it. `/metrics`, `/api/v1/status`, and
+the HTML status page expose topology and traffic volumes and do not implement
+authentication themselves. Observability is local and pull-based by default;
+a slow or unavailable scraper cannot block PostgreSQL query processing.
+
+Example Prometheus scrape configuration:
+
+```yaml
+scrape_configs:
+  - job_name: hamstergres-proxy
+    static_configs:
+      - targets: ["127.0.0.1:8080"]
+```
+
+Structured operational events use stable `event`, `component`, `burrow`,
+`transaction_id`, and `error_category` fields where applicable. Set
+`observability.log_file` to append JSON logs to a local file created with mode
+`0600`. Leaving it empty keeps the normal stderr logger. Hamstergres Proxy does
+not submit or export logs to an external service. If the configured file cannot
+be opened, the Proxy emits `logging_configuration_failed`, falls back to JSON
+on stderr, and continues serving queries.
+
+Tracing hooks cover each frontend query and its selected Tunnel/Burrow
+executions. Export is disabled by default. To opt in, configure the standard
+OpenTelemetry OTLP/HTTP environment variables, for example:
+
+```sh
+OTEL_TRACES_EXPORTER=otlp \
+OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://collector:4318/v1/traces \
+hamstergres-proxy --config config/hamstergres.example.yaml
+```
+
+`OTEL_SDK_DISABLED=true` or `OTEL_TRACES_EXPORTER=none` always disables export.
+Spans include the statement operation, routing decision, Burrow name, and error
+status. They never contain raw SQL or bound parameter values.
+
 ```bash
 make proxy-status
 # or: go run ./cmd/hamstergres-proxy status --status-url http://host:8080/api/v1/status

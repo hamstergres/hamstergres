@@ -7,16 +7,19 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/jruszo/hamstergres/internal/backend"
 	"github.com/jruszo/hamstergres/internal/config"
+	"github.com/jruszo/hamstergres/internal/observability"
 	"github.com/jruszo/hamstergres/internal/proxy"
 	"github.com/jruszo/hamstergres/internal/status"
 )
@@ -36,14 +39,36 @@ func serveCommand(args []string) {
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
-		slog.Error("load configuration", "error", err)
+		slog.Error("load configuration", "event", "configuration_load_failed", "component", "hamstergres-proxy", "error_category", "configuration", "error", err)
 		os.Exit(1)
 	}
+	closeLog, err := configureLogging(cfg.Observability.LogFile)
+	if err != nil {
+		slog.Warn("configure local log file", "event", "logging_configuration_failed", "component", "hamstergres-proxy", "error_category", "observability", "error", err)
+		closeLog = func() {}
+	}
+	defer closeLog()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	shutdownTracing, err := observability.ConfigureTracing(ctx)
+	if err != nil {
+		slog.Warn("configure tracing exporter", "event", "tracing_configuration_failed", "error_category", "observability", "error", err)
+	} else {
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := shutdownTracing(shutdownCtx); err != nil {
+				slog.Warn("shutdown tracing exporter", "event", "tracing_shutdown_failed", "error_category", "observability", "error", err)
+			}
+		}()
+	}
 	backends, err := backend.New(ctx, cfg)
 	if err != nil {
-		slog.Error("initialize backend pools", "error", err)
+		event, category := "backend_initialization_failed", "backend_initialization"
+		if strings.Contains(err.Error(), "schema registry mismatch") || strings.Contains(err.Error(), "live Burrow schema differs from Nest registry") {
+			event, category = "schema_registry_mismatch", "schema_registry_mismatch"
+		}
+		slog.Error("initialize backend pools", "event", event, "error_category", category, "error", err)
 		os.Exit(1)
 	}
 	defer backends.Close()
@@ -53,16 +78,15 @@ func serveCommand(args []string) {
 	httpServer := &http.Server{Addr: cfg.Status.Address, Handler: statusServer.Handler(), ReadHeaderTimeout: 5 * time.Second}
 	listener, err := net.Listen("tcp", cfg.Listen.Address)
 	if err != nil {
-		slog.Error("listen for PostgreSQL clients", "address", cfg.Listen.Address, "error", err)
+		slog.Error("listen for PostgreSQL clients", "event", "frontend_listen_failed", "error_category", "network", "address", cfg.Listen.Address, "error", err)
 		os.Exit(1)
 	}
 	defer listener.Close()
 
 	go func() {
-		slog.Info("status server listening", "address", cfg.Status.Address)
+		slog.Info("status server listening", "event", "status_server_started", "address", cfg.Status.Address)
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("status server stopped", "error", err)
-			stop()
+			slog.Error("status server stopped", "event", "status_server_failed", "error_category", "network", "error", err)
 		}
 	}()
 	go func() {
@@ -73,11 +97,29 @@ func serveCommand(args []string) {
 		_ = listener.Close()
 	}()
 
-	slog.Info("PostgreSQL gateway listening", "address", cfg.Listen.Address, "burrows", cfg.ShardNames())
+	slog.Info("PostgreSQL gateway listening", "event", "frontend_started", "address", cfg.Listen.Address, "burrows", cfg.ShardNames())
 	if err := frontend.Serve(listener); err != nil && !errors.Is(err, net.ErrClosed) {
-		slog.Error("PostgreSQL gateway stopped", "error", err)
+		slog.Error("PostgreSQL gateway stopped", "event", "frontend_failed", "error_category", "network", "error", err)
 		os.Exit(1)
 	}
+}
+
+func configureLogging(path string) (func(), error) {
+	if path == "" {
+		installLogger(os.Stderr)
+		return func() {}, nil
+	}
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		installLogger(os.Stderr)
+		return nil, err
+	}
+	installLogger(file)
+	return func() { _ = file.Close() }, nil
+}
+
+func installLogger(output io.Writer) {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(output, &slog.HandlerOptions{Level: slog.LevelInfo})).With("component", "hamstergres-proxy"))
 }
 
 func statusCommand(args []string) {
@@ -87,17 +129,17 @@ func statusCommand(args []string) {
 
 	response, err := http.Get(*statusURL) // #nosec G107 -- the operator explicitly supplies the local control endpoint.
 	if err != nil {
-		slog.Error("request gateway status", "error", err)
+		slog.Error("request gateway status", "event", "status_request_failed", "component", "hamstergres-proxy", "error_category", "network", "error", err)
 		os.Exit(1)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		slog.Error("gateway status request failed", "status", response.Status)
+		slog.Error("gateway status request failed", "event", "status_request_failed", "component", "hamstergres-proxy", "error_category", "http_status", "status", response.Status)
 		os.Exit(1)
 	}
 	var snapshot status.Snapshot
 	if err := json.NewDecoder(response.Body).Decode(&snapshot); err != nil {
-		slog.Error("decode gateway status", "error", err)
+		slog.Error("decode gateway status", "event", "status_decode_failed", "component", "hamstergres-proxy", "error_category", "protocol", "error", err)
 		os.Exit(1)
 	}
 	fmt.Printf("Hamstergres status (%s)\n", snapshot.Now.Format(time.RFC3339))
