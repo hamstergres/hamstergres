@@ -10,6 +10,9 @@ services:
       - --advertise-client-urls=http://0.0.0.0:2379
       - --listen-client-urls=http://0.0.0.0:2379
       - --listen-metrics-urls=http://0.0.0.0:2381
+      - --auto-compaction-mode=periodic
+      - --auto-compaction-retention=${NEST_AUTO_COMPACTION_RETENTION:-1h}
+      - --quota-backend-bytes=${NEST_QUOTA_BACKEND_BYTES:-1073741824}
     ports:
       - "127.0.0.1:${NEST_PORT:-2379}:2379"
     volumes:
