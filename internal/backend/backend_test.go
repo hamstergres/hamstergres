@@ -41,6 +41,20 @@ func TestNewSessionDoesNotAcquireHundredsOfBurrows(t *testing.T) {
 	}
 }
 
+func TestInvalidatePreparedStatementsOnlyForSelectedBurrows(t *testing.T) {
+	manager := &Manager{prepared: map[string]map[string]struct{}{
+		preparedConnectionKey("burrow-01", 1): {"statement": {}},
+		preparedConnectionKey("burrow-02", 2): {"statement": {}},
+	}}
+	manager.InvalidatePreparedStatements([]string{"burrow-01"})
+	if _, ok := manager.prepared[preparedConnectionKey("burrow-01", 1)]; ok {
+		t.Fatal("selected Burrow prepared cache was not invalidated")
+	}
+	if _, ok := manager.prepared[preparedConnectionKey("burrow-02", 2)]; !ok {
+		t.Fatal("unselected Burrow prepared cache was invalidated")
+	}
+}
+
 func TestSchemaMismatchHasDedicatedOperationalSignal(t *testing.T) {
 	m := &Manager{metrics: statistics.NewCollector()}
 	m.recordSchemaRefreshFailure(fmt.Errorf("schema registry mismatch at Burrow burrow-02"))

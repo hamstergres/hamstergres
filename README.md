@@ -136,6 +136,45 @@ The benchmark runs 15-second, four-thread `oltp_read_only` and
 record. It mutates and cleans up the two local `sbtest` tables and is therefore
 an explicit benchmark target rather than part of ordinary tests.
 
+### One-CPU sharding experiment
+
+The development Compose environment limits each PostgreSQL Burrow to one CPU.
+To measure whether two one-CPU Burrows provide more keyed-read throughput than
+one one-CPU Burrow, run:
+
+```bash
+make experiment-sharding-cpu
+```
+
+This experiment starts the required Compose services and manages its own
+isolated Hamstergres Proxy on ports 16432 and 18080. It compares direct
+PostgreSQL on `burrow-01`, a one-Burrow Proxy topology, and a two-Burrow Proxy
+topology. Before timing the two-Burrow case, it verifies both Burrows contain
+part of the shard-keyed dataset and verifies Docker applied a one-CPU quota to
+each PostgreSQL container. It also checks the process-owned routing counters to
+prove that every timed read used exactly one owning Burrow and that neither
+topology scattered reads. The isolated experiment configs allow 64 pooled
+connections per Burrow so the 32- and 64-client points measure Burrow CPU
+capacity rather than the normal eight-connection pool default. Production
+configs can tune this with `sharding.backend_pool.max_connections`.
+
+Three 15-second rounds at 1, 4, 8, 16, 32, and 64 clients are averaged by
+default. Each timed run has a three-second warmup. Proxy topology order and
+concurrency order are reversed on alternating rounds to reduce order bias.
+Override the concurrency curve with `HAMSTERGRES_EXPERIMENT_CONCURRENCY`, or
+select a single point with `HAMSTERGRES_EXPERIMENT_THREADS`. The duration can
+be changed with `HAMSTERGRES_EXPERIMENT_WARMUP_SECONDS`,
+`HAMSTERGRES_EXPERIMENT_SECONDS`, `HAMSTERGRES_EXPERIMENT_ROUNDS`, or
+`HAMSTERGRES_EXPERIMENT_TABLE_SIZE`.
+
+The final JSON Lines records report average transactions per second and the
+two-versus-one-Burrow Proxy ratio for every concurrency point. They also record
+the CPUs available to Docker, because an undersized container VM can impose a
+shared CPU ceiling across the Proxy and both Burrows. This is an end-to-end
+scaling experiment, so the result includes Hamstergres Proxy routing and
+protocol overhead; a ratio greater than `1` is the evidence that adding the
+second one-CPU Burrow improved throughput for this workload.
+
 The Proxy supports sysbench's Parse, Bind, Describe, Execute, Close, Sync, and
 Flush protocol flow, including text and binary parameter/result formats. The
 test is opt-in because it prepares, runs, and cleans up a short mutating
@@ -285,6 +324,11 @@ authenticated reverse proxy in front of it. `/metrics`, `/api/v1/status`, and
 the HTML status page expose topology and traffic volumes and do not implement
 authentication themselves. Observability is local and pull-based by default;
 a slow or unavailable scraper cannot block PostgreSQL query processing.
+
+Go runtime profiles are disabled by default. Set `status.profiling: true` only
+on a private diagnostic listener to expose `/debug/pprof/` CPU, allocation,
+heap, goroutine, mutex, block, and trace profiles. The checked-in CPU-scaling
+experiment enables profiling on its isolated localhost-only status port.
 
 Example Prometheus scrape configuration:
 

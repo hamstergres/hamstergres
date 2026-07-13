@@ -25,79 +25,114 @@ type Plan struct {
 	Routed  bool
 }
 
-// Analyze parses exactly one PostgreSQL statement and derives its routing plan.
-// Unsupported or ambiguous syntax produces an unrouted plan, never a
-// permissive single-Burrow guess.
-func Analyze(sql string, parameters [][]byte, registry schema.Registry, burrows []string) (Plan, error) {
+// Prepared is the immutable, parser-derived portion of a routing plan. Extended
+// protocol clients parse a statement once and bind it many times, so retaining
+// this structure avoids repeating PostgreSQL parsing and protobuf allocation on
+// every Bind while still resolving each execution against the current schema
+// and vshard registry.
+type Prepared struct {
+	plan              Plan
+	relation          *pg_query.RangeVar
+	predicate         *pg_query.Node
+	insert            *pg_query.InsertStmt
+	update            *pg_query.UpdateStmt
+	physicalRelations int
+	maximumParameter  int
+}
+
+// Prepare parses exactly one PostgreSQL statement and caches its immutable
+// routing structure. Unsupported or ambiguous syntax remains a valid prepared
+// statement with an unrouted plan; parser errors are returned to the caller.
+func Prepare(sql string) (*Prepared, error) {
 	tree, err := pg_query.Parse(sql)
 	if err != nil {
-		return Plan{}, err
+		return nil, err
 	}
+	prepared := &Prepared{plan: Plan{Write: containsWrite(tree)}, maximumParameter: maxParameterInTree(tree)}
 	if len(tree.Stmts) != 1 || tree.Stmts[0].Stmt == nil {
-		return Plan{Write: containsWrite(tree)}, nil
+		return prepared, nil
 	}
 
 	statement := tree.Stmts[0].Stmt
-	plan := Plan{Write: containsWrite(tree)}
-	var relation *pg_query.RangeVar
-	var predicate *pg_query.Node
-	var insert *pg_query.InsertStmt
-	var update *pg_query.UpdateStmt
-
 	switch value := statement.GetNode().(type) {
 	case *pg_query.Node_InsertStmt:
-		plan.Write = true
-		insert = value.InsertStmt
-		relation = insert.Relation
+		prepared.plan.Write = true
+		prepared.insert = value.InsertStmt
+		prepared.relation = prepared.insert.Relation
 	case *pg_query.Node_UpdateStmt:
-		plan.Write = true
-		update = value.UpdateStmt
-		relation = update.Relation
-		predicate = update.WhereClause
-		if update.WithClause != nil || len(update.FromClause) != 0 {
-			predicate = nil
+		prepared.plan.Write = true
+		prepared.update = value.UpdateStmt
+		prepared.relation = prepared.update.Relation
+		prepared.predicate = prepared.update.WhereClause
+		if prepared.update.WithClause != nil || len(prepared.update.FromClause) != 0 {
+			prepared.predicate = nil
 		}
 	case *pg_query.Node_DeleteStmt:
-		plan.Write = true
-		relation = value.DeleteStmt.Relation
-		predicate = value.DeleteStmt.WhereClause
+		prepared.plan.Write = true
+		prepared.relation = value.DeleteStmt.Relation
+		prepared.predicate = value.DeleteStmt.WhereClause
 		if value.DeleteStmt.WithClause != nil || len(value.DeleteStmt.UsingClause) != 0 {
-			predicate = nil
+			prepared.predicate = nil
 		}
 	case *pg_query.Node_MergeStmt:
 		// MERGE can contain multiple conditional write actions. Resolve its
 		// target relation for policy purposes, but keep sharded MERGE unrouted
 		// until every action can be proven to share one shard-key tuple.
-		plan.Write = true
-		relation = value.MergeStmt.Relation
+		prepared.plan.Write = true
+		prepared.relation = value.MergeStmt.Relation
 	case *pg_query.Node_SelectStmt:
 		selectStatement := value.SelectStmt
 		if selectStatement.WithClause == nil && selectStatement.Op == pg_query.SetOperation_SETOP_NONE && len(selectStatement.FromClause) == 1 {
-			relation = selectStatement.FromClause[0].GetRangeVar()
-			predicate = selectStatement.WhereClause
+			prepared.relation = selectStatement.FromClause[0].GetRangeVar()
+			prepared.predicate = selectStatement.WhereClause
 		}
 	default:
-		return plan, nil
+		return prepared, nil
 	}
 
-	if relation == nil {
-		return plan, nil
+	if prepared.relation == nil {
+		return prepared, nil
 	}
-	plan.Table = relationName(relation)
+	prepared.plan.Table = relationName(prepared.relation)
+	prepared.physicalRelations = countPhysicalRelations(statement)
+	return prepared, nil
+}
+
+// MaxParameter returns the highest real ParamRef found while preparing the
+// statement. Dollar sequences inside comments and string literals are ignored.
+func (p *Prepared) MaxParameter() int {
+	if p == nil {
+		return 0
+	}
+	return p.maximumParameter
+}
+
+// Analyze resolves one execution of a prepared statement against bound values
+// and the current registry. The cached AST is read-only; schema and vshard
+// ownership changes therefore remain visible without reparsing SQL.
+func (p *Prepared) Analyze(parameters [][]byte, registry schema.Registry, burrows []string) Plan {
+	if p == nil {
+		return Plan{}
+	}
+	plan := p.plan
+	relation, insert, update := p.relation, p.insert, p.update
+	if relation == nil {
+		return plan
+	}
 	columns, sharded := registry.ShardKey(plan.Table)
 	types, _ := registry.ShardKeyTypes(plan.Table)
 	plan.Sharded = sharded
 	if !sharded || len(columns) == 0 || len(burrows) == 0 {
-		return plan, nil
+		return plan
 	}
-	if countPhysicalRelations(statement) != 1 {
-		return plan, nil
+	if p.physicalRelations != 1 {
+		return plan
 	}
 	if insert != nil && insert.OnConflictClause != nil {
-		return plan, nil
+		return plan
 	}
 	if update != nil && updatesShardKey(update, columns) {
-		return plan, nil
+		return plan
 	}
 
 	var values []string
@@ -105,22 +140,32 @@ func Analyze(sql string, parameters [][]byte, registry schema.Registry, burrows 
 	if insert != nil {
 		values, ok = insertKeyValues(insert, parameters, columns, types)
 	} else {
-		values, ok = predicateKeyValues(predicate, parameters, columns, types, relation)
+		values, ok = predicateKeyValues(p.predicate, parameters, columns, types, relation)
 	}
 	if !ok {
-		return plan, nil
+		return plan
 	}
 
 	key := strings.Join(values, "\x00")
 	vshard := int(HashKey(key) % VirtualShards)
-	owners := registry.VShardOwners()
-	if len(owners) == VirtualShards {
-		plan.Target = owners[vshard]
+	if registry.VShardCount() == VirtualShards {
+		plan.Target, _ = registry.VShardOwner(vshard)
 	} else {
 		plan.Target = BurrowForKey(key, burrows)
 	}
 	plan.Routed = true
-	return plan, nil
+	return plan
+}
+
+// Analyze parses exactly one PostgreSQL statement and derives its routing plan.
+// Unsupported or ambiguous syntax produces an unrouted plan, never a
+// permissive single-Burrow guess.
+func Analyze(sql string, parameters [][]byte, registry schema.Registry, burrows []string) (Plan, error) {
+	prepared, err := Prepare(sql)
+	if err != nil {
+		return Plan{}, err
+	}
+	return prepared.Analyze(parameters, registry, burrows), nil
 }
 
 // TableForSQL returns the AST-resolved primary physical relation for supported
@@ -197,17 +242,21 @@ func RewriteGeneratedInsert(sql string, registry schema.Registry, valueExpressio
 // MaxParameter returns the highest real ParamRef in the PostgreSQL AST. Dollar
 // sequences inside comments and string literals are therefore ignored.
 func MaxParameter(sql string) (int, error) {
-	tree, err := pg_query.Parse(sql)
+	prepared, err := Prepare(sql)
 	if err != nil {
 		return 0, err
 	}
+	return prepared.MaxParameter(), nil
+}
+
+func maxParameterInTree(tree *pg_query.ParseResult) int {
 	maximum := 0
 	walkMessage(tree.ProtoReflect(), func(message protoreflect.Message) {
 		if parameter, ok := message.Interface().(*pg_query.ParamRef); ok && int(parameter.Number) > maximum {
 			maximum = int(parameter.Number)
 		}
 	})
-	return maximum, nil
+	return maximum
 }
 
 // TargetForSchema is retained as the small routing API used by existing tests

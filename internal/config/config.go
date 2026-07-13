@@ -8,7 +8,10 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const DefaultStatusAddress = "127.0.0.1:8080"
+const (
+	DefaultStatusAddress             = "127.0.0.1:8080"
+	DefaultBackendPoolMaxConnections = 8
+)
 
 const (
 	UnshardedPrimary    = "primary"
@@ -21,7 +24,8 @@ type Config struct {
 		Address string `yaml:"address"`
 	} `yaml:"listen"`
 	Status struct {
-		Address string `yaml:"address"`
+		Address   string `yaml:"address"`
+		Profiling bool   `yaml:"profiling"`
 	} `yaml:"status"`
 	Nest struct {
 		Endpoint    string `yaml:"endpoint"`
@@ -36,7 +40,10 @@ type Config struct {
 	} `yaml:"transactions"`
 	Sharding struct {
 		PhysicalShards map[string]Shard `yaml:"physical_shards"`
-		Unsharded      struct {
+		BackendPool    struct {
+			MaxConnections int32 `yaml:"max_connections"`
+		} `yaml:"backend_pool"`
+		Unsharded struct {
 			Mode          string `yaml:"mode"`
 			PrimaryBurrow string `yaml:"primary_burrow"`
 		} `yaml:"unsharded_tables"`
@@ -79,6 +86,12 @@ func Load(path string) (Config, error) {
 	if len(cfg.Sharding.PhysicalShards) == 0 {
 		return Config{}, fmt.Errorf("config %q: at least one physical Burrow is required", path)
 	}
+	if cfg.Sharding.BackendPool.MaxConnections < 0 {
+		return Config{}, fmt.Errorf("config %q: sharding.backend_pool.max_connections must be greater than zero", path)
+	}
+	if cfg.Sharding.BackendPool.MaxConnections == 0 {
+		cfg.Sharding.BackendPool.MaxConnections = DefaultBackendPoolMaxConnections
+	}
 	for name, shard := range cfg.Sharding.PhysicalShards {
 		if shard.DSN == "" {
 			return Config{}, fmt.Errorf("config %q: physical Burrow %q has no dsn", path, name)
@@ -99,6 +112,16 @@ func Load(path string) (Config, error) {
 		}
 	}
 	return cfg, nil
+}
+
+// BackendPoolMaxConnections returns the per-Burrow connection limit. Config
+// values built directly by tests and embedders receive the same default as a
+// file loaded through Load.
+func (c Config) BackendPoolMaxConnections() int32 {
+	if c.Sharding.BackendPool.MaxConnections > 0 {
+		return c.Sharding.BackendPool.MaxConnections
+	}
+	return DefaultBackendPoolMaxConnections
 }
 
 // ShardNames returns a stable ordering for fan-out operations and reporting.

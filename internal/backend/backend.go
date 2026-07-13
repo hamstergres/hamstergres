@@ -44,6 +44,7 @@ type shardHealth struct {
 // Manager owns one connection pool per physical shard.
 type Manager struct {
 	shards        []*shard
+	names         []string
 	mu            sync.RWMutex
 	writeGate     chan struct{}
 	metrics       *statistics.Collector
@@ -73,13 +74,14 @@ func New(ctx context.Context, cfg config.Config) (*Manager, error) {
 			m.Close()
 			return nil, fmt.Errorf("parse dsn for shard %q: %w", name, err)
 		}
-		poolConfig.MaxConns = 8
+		poolConfig.MaxConns = cfg.BackendPoolMaxConnections()
 		pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 		if err != nil {
 			m.Close()
 			return nil, fmt.Errorf("create pool for shard %q: %w", name, err)
 		}
 		m.shards = append(m.shards, &shard{name: name, dsn: cfg.Sharding.PhysicalShards[name].DSN, pool: pool})
+		m.names = append(m.names, name)
 	}
 	registry, err := m.loadSchema(ctx)
 	if err != nil {
@@ -335,6 +337,14 @@ func (s *Session) ConnectedNames() []string {
 }
 
 func (m *Manager) syncPreparedStatements(ctx context.Context, burrow string, connection *pgx.Conn) error {
+	key := preparedConnectionKey(burrow, connection.PgConn().PID())
+	m.preparedMu.Lock()
+	_, synchronized := m.prepared[key]
+	m.preparedMu.Unlock()
+	if synchronized {
+		return nil
+	}
+
 	rows, err := connection.Query(ctx, "SELECT name FROM pg_prepared_statements", pgx.QueryExecModeSimpleProtocol)
 	if err != nil {
 		return err
@@ -354,7 +364,7 @@ func (m *Manager) syncPreparedStatements(ctx context.Context, burrow string, con
 	}
 	rows.Close()
 	m.preparedMu.Lock()
-	m.prepared[preparedConnectionKey(burrow, connection.PgConn().PID())] = names
+	m.prepared[key] = names
 	m.preparedMu.Unlock()
 	return nil
 }
@@ -393,6 +403,25 @@ func (s *Session) MarkPrepared(burrows []string, name string) {
 			s.manager.prepared[key] = make(map[string]struct{})
 		}
 		s.manager.prepared[key][name] = struct{}{}
+	}
+}
+
+// InvalidatePreparedStatements forgets connection-local statement knowledge
+// after a frontend command such as DEALLOCATE ALL or DISCARD ALL. The next
+// checkout reconciles the affected physical connections with PostgreSQL before
+// deciding whether a canonical Parse can be skipped.
+func (m *Manager) InvalidatePreparedStatements(burrows []string) {
+	selected := make(map[string]struct{}, len(burrows))
+	for _, burrow := range burrows {
+		selected[burrow] = struct{}{}
+	}
+	m.preparedMu.Lock()
+	defer m.preparedMu.Unlock()
+	for key := range m.prepared {
+		burrow, _, _ := strings.Cut(key, "\x00")
+		if _, ok := selected[burrow]; ok {
+			delete(m.prepared, key)
+		}
 	}
 }
 
@@ -811,7 +840,7 @@ type ShardingInventory struct {
 func (m *Manager) ShardingInventory() ShardingInventory {
 	m.schemaMu.RLock()
 	defer m.schemaMu.RUnlock()
-	return ShardingInventory{Source: "hamstergres-nest", UnshardedMode: m.unshardedMode, PrimaryBurrow: m.primaryBurrow, VirtualShards: len(m.schema.VShardOwners()), Tables: m.schema.Inventory()}
+	return ShardingInventory{Source: "hamstergres-nest", UnshardedMode: m.unshardedMode, PrimaryBurrow: m.primaryBurrow, VirtualShards: m.schema.VShardCount(), Tables: m.schema.Inventory()}
 }
 
 // Schema returns the shard-key registry validated across all Burrows at
@@ -878,11 +907,7 @@ func (m *Manager) NextGlobalID(ctx context.Context) (int64, error) {
 }
 
 func (m *Manager) shardNames() []string {
-	names := make([]string, 0, len(m.shards))
-	for _, shard := range m.shards {
-		names = append(names, shard.name)
-	}
-	return names
+	return m.names
 }
 
 func queryShard(ctx context.Context, pool *pgxpool.Pool, sql string) (Result, error) {

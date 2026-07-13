@@ -1,6 +1,7 @@
 package statistics
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -25,6 +26,22 @@ func TestSnapshotAggregatesWindowsRoutesAndSummaries(t *testing.T) {
 	}
 	if len(snapshot.QuerySummaries) != 1 || snapshot.QuerySummaries[0].QueryShape != "SELECT * FROM accounts WHERE tenant_id = ?" || snapshot.QuerySummaries[0].Fingerprint != Fingerprint("SELECT * FROM accounts WHERE tenant_id = ?") || snapshot.QuerySummaries[0].Statistics.Queries != 2 {
 		t.Fatalf("summaries = %#v, want parameterized and fingerprinted SELECT summary", snapshot.QuerySummaries)
+	}
+}
+
+func TestSummaryLabelCacheEvictsOldSQLInsteadOfFreezing(t *testing.T) {
+	collector := NewCollector()
+	for index := 0; index <= maxSummaryLabels; index++ {
+		collector.summaryLabel(fmt.Sprintf("SELECT %d", index))
+	}
+	if len(collector.labels) != maxSummaryLabels {
+		t.Fatalf("label cache length = %d, want %d", len(collector.labels), maxSummaryLabels)
+	}
+	if _, ok := collector.labels["SELECT 0"]; ok {
+		t.Fatal("oldest SQL was not evicted")
+	}
+	if got := collector.labels[fmt.Sprintf("SELECT %d", maxSummaryLabels)]; got != "SELECT ?" {
+		t.Fatalf("newest SQL label = %q, want SELECT ?", got)
 	}
 }
 

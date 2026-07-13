@@ -1,4 +1,4 @@
-.PHONY: up down logs ps test test-unit test-e2e test-sysbench benchmark-sysbench test-observability run-proxy proxy-status
+.PHONY: up down logs ps test test-unit test-e2e test-sysbench benchmark-sysbench experiment-sharding-cpu test-observability run-proxy proxy-status
 
 up:
 	docker compose up -d --wait
@@ -26,6 +26,9 @@ test-sysbench:
 
 benchmark-sysbench:
 	./scripts/benchmark-sysbench.sh
+
+experiment-sharding-cpu:
+	./scripts/experiment-sharding-cpu.sh
 
 test-observability:
 	./scripts/observability-smoke.sh

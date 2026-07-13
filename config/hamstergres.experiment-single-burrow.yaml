@@ -1,0 +1,25 @@
+# Isolated host-run Proxy configuration for the one-Burrow CPU-scaling case.
+listen:
+  address: "127.0.0.1:16432"
+
+status:
+  address: "127.0.0.1:18080"
+  profiling: true
+
+transactions:
+  two_phase_commit: true
+
+nest:
+  endpoint: "http://127.0.0.1:2379"
+  registry_key: "/hamstergres/experiments/cpu-scaling/single/schema-registry/v3"
+  sequence_key: "/hamstergres/experiments/cpu-scaling/single/global-id/v1"
+
+sharding:
+  backend_pool:
+    max_connections: 64
+  unsharded_tables:
+    mode: "primary"
+    primary_burrow: "burrow-01"
+  physical_shards:
+    burrow-01:
+      dsn: "postgres://hamster:hamster@localhost:5541/hamstergres?sslmode=disable"

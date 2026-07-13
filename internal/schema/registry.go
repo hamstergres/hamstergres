@@ -112,6 +112,21 @@ func (r Registry) IsSharded(table string) bool {
 
 func (r Registry) VShardOwners() []string { return append([]string(nil), r.vshards...) }
 
+// VShardCount returns the size of the validated ownership map without copying
+// it. Routing uses this together with VShardOwner on every query; full copies
+// are reserved for snapshots and serialization boundaries.
+func (r Registry) VShardCount() int { return len(r.vshards) }
+
+// VShardOwner returns one vshard owner without exposing the mutable backing
+// slice. The registry is immutable after construction and swapped atomically by
+// its owner when schema metadata changes.
+func (r Registry) VShardOwner(vshard int) (string, bool) {
+	if vshard < 0 || vshard >= len(r.vshards) {
+		return "", false
+	}
+	return r.vshards[vshard], true
+}
+
 type TableInventory struct {
 	Table     string   `json:"table"`
 	Sharded   bool     `json:"sharded"`
