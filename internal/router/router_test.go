@@ -46,7 +46,7 @@ func TestBurrowForKeyUsesOneIndexedModuloPlacement(t *testing.T) {
 func TestRewriteGeneratedInsertAddsOmittedPrimaryKey(t *testing.T) {
 	registry := schema.NewWithGenerated(map[string][]string{"widgets": {"id"}}, map[string]schema.GeneratedPrimary{"widgets": {Column: "id", Kind: "identity"}})
 	result, ok := RewriteGeneratedInsert("INSERT INTO widgets (name) VALUES ($1) RETURNING id", registry, "$2")
-	if !ok || result.SQL != `INSERT INTO widgets (name, "id") VALUES ($1, $2) RETURNING id` {
+	if !ok || result.SQL != `INSERT INTO widgets (name, id) VALUES ($1, $2) RETURNING id` {
 		t.Fatalf("RewriteGeneratedInsert = %#v, %t", result, ok)
 	}
 	target, routed := TargetForSchema(result.SQL, [][]byte{[]byte("wheel"), []byte("42")}, registry, []string{"burrow-01", "burrow-02"})
@@ -71,6 +71,178 @@ func TestRewriteGeneratedInsertRejectsMultipleRows(t *testing.T) {
 	result, ok := RewriteGeneratedInsert("INSERT INTO widgets (name) VALUES ('first'), ('second')", registry, "42")
 	if ok {
 		t.Fatalf("RewriteGeneratedInsert = %#v, true; want unchanged multi-row insert", result)
+	}
+}
+
+func TestAnalyzeHandlesAliasesCastsCommentsAndReorderedCompoundKeys(t *testing.T) {
+	burrows := []string{"burrow-01", "burrow-02"}
+	registry := schema.New(map[string][]string{"public.accounts": {"region", "tenant_id"}})
+	query := `/* route structurally */ SELECT * FROM public.accounts AS a
+		WHERE (a.tenant_id = ($2)::bigint) AND ('eu-west'::text = a.region)`
+	plan, err := Analyze(query, [][]byte{[]byte("ignored"), []byte("42")}, registry, burrows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.Routed || plan.Table != "public.accounts" || plan.Target != BurrowForKey("eu-west\x0042", burrows) {
+		t.Fatalf("Analyze = %#v, want one compound-key Burrow", plan)
+	}
+}
+
+func TestAnalyzeRoutesTupleEquality(t *testing.T) {
+	burrows := []string{"burrow-01", "burrow-02"}
+	registry := schema.New(map[string][]string{"accounts": {"tenant_id", "region"}})
+	plan, err := Analyze("SELECT * FROM accounts WHERE (tenant_id, region) = (42, 'eu-west')", nil, registry, burrows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.Routed || plan.Target != BurrowForKey("42\x00eu-west", burrows) {
+		t.Fatalf("Analyze = %#v, want tuple-equality target", plan)
+	}
+}
+
+func TestAnalyzeResolvesQuotedQualifiedIdentifiers(t *testing.T) {
+	burrows := []string{"burrow-01", "burrow-02"}
+	registry := schema.New(map[string][]string{
+		"public.Accounts": {"Tenant_ID"},
+		"public.accounts": {"tenant_id"},
+	})
+	plan, err := Analyze(`SELECT * FROM "public"."Accounts" AS "Account" WHERE "Account"."Tenant_ID" = 42`, nil, registry, burrows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.Routed || plan.Table != "public.Accounts" || plan.Target != BurrowForKey("42", burrows) {
+		t.Fatalf("Analyze = %#v, want quoted qualified target", plan)
+	}
+	wrongCase, err := Analyze(`SELECT * FROM "public"."Accounts" WHERE tenant_id = 42`, nil, registry, burrows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wrongCase.Routed {
+		t.Fatalf("wrong-case quoted column routed as %#v", wrongCase)
+	}
+}
+
+func TestAnalyzeCanonicalizesTypedShardKeyValues(t *testing.T) {
+	burrows := []string{"burrow-01", "burrow-02"}
+	registry := schema.NewWithTypes(
+		map[string][]string{"accounts": {"tenant_id"}},
+		map[string][]string{"accounts": {"bigint"}},
+	)
+	queries := []struct {
+		sql        string
+		parameters [][]byte
+	}{
+		{sql: "SELECT * FROM accounts WHERE tenant_id = 1"},
+		{sql: "SELECT * FROM accounts WHERE tenant_id = '01'::bigint"},
+		{sql: "SELECT * FROM accounts WHERE tenant_id = $1", parameters: [][]byte{[]byte("0001")}},
+	}
+	for _, test := range queries {
+		plan, err := Analyze(test.sql, test.parameters, registry, burrows)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !plan.Routed || plan.Target != BurrowForKey("1", burrows) {
+			t.Fatalf("Analyze(%q) = %#v, want canonical integer key", test.sql, plan)
+		}
+	}
+}
+
+func TestAnalyzeFailsClosedForUnsupportedShardKeyType(t *testing.T) {
+	registry := schema.NewWithTypes(
+		map[string][]string{"events": {"occurred_at"}},
+		map[string][]string{"events": {"timestamp with time zone"}},
+	)
+	plan, err := Analyze("UPDATE events SET payload = 'x' WHERE occurred_at = '2026-07-13 12:00:00+02'", nil, registry, []string{"burrow-01", "burrow-02"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Routed {
+		t.Fatalf("unsupported typed key routed as %#v", plan)
+	}
+}
+
+func TestAnalyzeFailsClosedForAmbiguousShapes(t *testing.T) {
+	registry := schema.New(map[string][]string{"accounts": {"tenant_id"}})
+	burrows := []string{"burrow-01", "burrow-02"}
+	tests := []string{
+		"SELECT * FROM accounts WHERE tenant_id = 1 OR tenant_id = 2",
+		"SELECT * FROM accounts WHERE tenant_id BETWEEN 1 AND 2",
+		"SELECT * FROM accounts WHERE tenant_id = (SELECT 1)",
+		"SELECT (SELECT count(*) FROM other) FROM accounts WHERE tenant_id = 1",
+		"SELECT * FROM accounts a JOIN accounts b ON a.tenant_id = b.tenant_id WHERE a.tenant_id = 1",
+		"WITH selected AS (SELECT * FROM accounts WHERE tenant_id = 1) SELECT * FROM selected",
+		"WITH removed AS (DELETE FROM accounts WHERE tenant_id = 1 RETURNING *) SELECT * FROM removed",
+		"WITH source AS (SELECT 1) INSERT INTO accounts (tenant_id) VALUES (1)",
+		"UPDATE accounts SET tenant_id = 2 FROM other WHERE accounts.tenant_id = 1",
+		"UPDATE accounts SET tenant_id = 2 WHERE tenant_id = 1",
+		"DELETE FROM accounts USING other WHERE accounts.tenant_id = 1",
+		"INSERT INTO accounts (tenant_id) VALUES (1), (2)",
+		"INSERT INTO accounts (tenant_id) SELECT tenant_id FROM other",
+		"INSERT INTO accounts (tenant_id) VALUES (1) ON CONFLICT DO NOTHING",
+	}
+	for _, query := range tests {
+		plan, err := Analyze(query, nil, registry, burrows)
+		if err != nil {
+			t.Fatalf("Analyze(%q): %v", query, err)
+		}
+		if plan.Routed {
+			t.Errorf("Analyze(%q) = %#v, want fail-closed unrouted plan", query, plan)
+		}
+	}
+}
+
+func TestAnalyzeSimpleAndExtendedProduceEquivalentPlans(t *testing.T) {
+	registry := schema.New(map[string][]string{"accounts": {"tenant_id"}})
+	burrows := []string{"burrow-01", "burrow-02"}
+	simple, err := Analyze("UPDATE accounts a SET balance = balance + 1 WHERE a.tenant_id = 42", nil, registry, burrows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extended, err := Analyze("UPDATE accounts a SET balance = balance + 1 WHERE a.tenant_id = $1", [][]byte{[]byte("42")}, registry, burrows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !simple.Routed || !extended.Routed || simple.Target != extended.Target || simple.Table != extended.Table || simple.Write != extended.Write {
+		t.Fatalf("simple = %#v, extended = %#v", simple, extended)
+	}
+}
+
+func TestAnalyzeRejectsParserErrorsAndMultiStatementWrites(t *testing.T) {
+	registry := schema.New(map[string][]string{"accounts": {"tenant_id"}})
+	if _, err := Analyze("SELECT * FROM accounts WHERE (", nil, registry, []string{"burrow-01"}); err == nil {
+		t.Fatal("parser error was accepted")
+	}
+	plan, err := Analyze("SELECT 1; DELETE FROM accounts WHERE tenant_id = 1", nil, registry, []string{"burrow-01"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.Write || plan.Routed {
+		t.Fatalf("multi-statement plan = %#v, want unrouted write", plan)
+	}
+}
+
+func TestRewriteGeneratedInsertUsesASTForCommaExpressions(t *testing.T) {
+	registry := schema.NewWithGenerated(map[string][]string{"widgets": {"id"}}, map[string]schema.GeneratedPrimary{"widgets": {Column: "id", Kind: "identity"}})
+	result, ok := RewriteGeneratedInsert("INSERT INTO widgets (name) VALUES (concat('left', ',', 'right')) RETURNING id", registry, "42")
+	if !ok {
+		t.Fatal("AST generated-key rewrite rejected a value expression containing commas")
+	}
+	plan, err := Analyze(result.SQL, nil, registry, []string{"burrow-01", "burrow-02"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.Routed || plan.Target != BurrowForKey("42", []string{"burrow-01", "burrow-02"}) {
+		t.Fatalf("rewritten plan = %#v", plan)
+	}
+}
+
+func TestMaxParameterIgnoresCommentsAndLiterals(t *testing.T) {
+	maximum, err := MaxParameter("SELECT '$99', $2 /* $88 */ FROM accounts WHERE tenant_id = $7 -- $100")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if maximum != 7 {
+		t.Fatalf("MaxParameter = %d, want 7", maximum)
 	}
 }
 

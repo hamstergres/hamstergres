@@ -71,7 +71,7 @@ func Load(path string) (Config, error) {
 		cfg.Status.Address = DefaultStatusAddress
 	}
 	if cfg.Nest.RegistryKey == "" {
-		cfg.Nest.RegistryKey = "/hamstergres/schema-registry/v2"
+		cfg.Nest.RegistryKey = "/hamstergres/schema-registry/v3"
 	}
 	if cfg.Nest.SequenceKey == "" {
 		cfg.Nest.SequenceKey = "/hamstergres/sequences/global-id/v1"

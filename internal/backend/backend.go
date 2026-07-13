@@ -114,7 +114,7 @@ WHERE i.indisprimary
 ORDER BY n.nspname, c.relname, key_column.ordinality`
 
 const shardKeyQuery = `
-SELECT n.nspname, c.relname, a.attname
+SELECT n.nspname, c.relname, a.attname, format_type(a.atttypid, a.atttypmod)
 FROM pg_attribute a
 JOIN pg_class c ON c.oid = a.attrelid
 JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -184,13 +184,14 @@ func (m *Manager) loadSchema(ctx context.Context) (schema.Registry, error) {
 			return schema.Registry{}, fmt.Errorf("inspect shard keys on Burrow %s: %w", shard.name, err)
 		}
 		shardKeys := make(map[string][]string)
+		shardKeyTypes := make(map[string][]string)
 		for keyRows.Next() {
-			var namespace, table, column string
-			if err := keyRows.Scan(&namespace, &table, &column); err != nil {
+			var namespace, table, column, dataType string
+			if err := keyRows.Scan(&namespace, &table, &column, &dataType); err != nil {
 				keyRows.Close()
 				return schema.Registry{}, err
 			}
-			appendShardKey(shardKeys, namespace, table, column)
+			appendShardKey(shardKeys, shardKeyTypes, namespace, table, column, dataType)
 		}
 		if err := keyRows.Err(); err != nil {
 			keyRows.Close()
@@ -231,7 +232,7 @@ func (m *Manager) loadSchema(ctx context.Context) (schema.Registry, error) {
 				owners[vshard] = names[remainder-1]
 			}
 		}
-		registry := schema.NewWithGenerated(shardKeys, generated).WithVShards(owners).WithAllTables(allTables)
+		registry := schema.NewWithGeneratedAndTypes(shardKeys, generated, shardKeyTypes).WithVShards(owners).WithAllTables(allTables)
 		if index == 0 {
 			expected = registry
 			continue
@@ -243,20 +244,22 @@ func (m *Manager) loadSchema(ctx context.Context) (schema.Registry, error) {
 	return expected, nil
 }
 
-func appendShardKey(keys map[string][]string, namespace, table, column string) {
+func appendShardKey(keys, types map[string][]string, namespace, table, column, dataType string) {
 	qualified := namespace + "." + table
 	keys[qualified] = append(keys[qualified], column)
+	types[qualified] = append(types[qualified], dataType)
 	if namespace == "public" {
 		keys[table] = append(keys[table], column)
+		types[table] = append(types[table], dataType)
 	}
 }
 
-// Session owns one PostgreSQL connection to every Burrow for the lifetime of a
+// Session owns lazy PostgreSQL affinity connections for the lifetime of a
 // frontend session. PostgreSQL prepared statements and portals live on a
-// backend connection, so extended-query messages must not be sent through the
-// regular query pools independently.
+// backend connection, so a Burrow is acquired only when that Burrow first
+// participates and is then kept stable until the session is released.
 type Session struct {
-	shards      []*sessionShard
+	shards      map[string]*sessionShard
 	writeGate   chan struct{}
 	writeLocked bool
 	ctx         context.Context
@@ -269,27 +272,66 @@ type sessionShard struct {
 	pooled *pgxpool.Conn
 }
 
-// NewSession establishes an affinity connection to each Burrow. The caller
-// must close the returned session.
+// NewSession creates an empty affinity session. Connections are acquired on
+// first use by SendTo or SendBatchTo, so parsing, validation, and routed work do
+// not contact unrelated Burrows. The caller must close the returned session.
 func (m *Manager) NewSession(ctx context.Context) (*Session, error) {
-	session := &Session{shards: make([]*sessionShard, 0, len(m.shards)), writeGate: m.writeGate, ctx: ctx, manager: m}
-	for _, shard := range m.shards {
-		pooled, err := shard.pool.Acquire(ctx)
-		if err != nil {
-			m.RecordOperation("backend_connection", "failure")
-			slog.Error("Burrow session connection failed", "event", "backend_connection_failed", "component", "hamstergres-proxy", "burrow", shard.name, "error_category", "burrow_unavailable", "error", err)
-			session.Close(context.Background())
-			return nil, fmt.Errorf("connect session to Burrow %s: %w", shard.name, err)
-		}
-		if err := m.syncPreparedStatements(ctx, shard.name, pooled.Conn()); err != nil {
-			pooled.Release()
-			session.Close(context.Background())
-			return nil, fmt.Errorf("synchronize prepared statements on Burrow %s: %w", shard.name, err)
-		}
-		session.shards = append(session.shards, &sessionShard{name: shard.name, conn: pooled.Conn().PgConn(), pooled: pooled})
-		m.RecordOperation("backend_connection", "success")
+	return &Session{shards: make(map[string]*sessionShard), writeGate: m.writeGate, ctx: ctx, manager: m}, nil
+}
+
+func (s *Session) acquire(name string) (*sessionShard, error) {
+	if shard := s.shardByName(name); shard != nil {
+		return shard, nil
 	}
-	return session, nil
+	if s.manager == nil {
+		return nil, fmt.Errorf("unknown Burrow %s", name)
+	}
+	var target *shard
+	for _, candidate := range s.manager.shards {
+		if candidate.name == name {
+			target = candidate
+			break
+		}
+	}
+	if target == nil {
+		return nil, fmt.Errorf("unknown Burrow %s", name)
+	}
+	pooled, err := target.pool.Acquire(s.Context())
+	if err != nil {
+		s.manager.RecordOperation("backend_connection", "failure")
+		slog.Error("Burrow session connection failed", "event", "backend_connection_failed", "component", "hamstergres-proxy", "burrow", target.name, "error_category", "burrow_unavailable", "error", err)
+		return nil, fmt.Errorf("connect session to Burrow %s: %w", target.name, err)
+	}
+	if err := s.manager.syncPreparedStatements(s.Context(), target.name, pooled.Conn()); err != nil {
+		pooled.Release()
+		s.manager.RecordOperation("backend_connection", "failure")
+		return nil, fmt.Errorf("synchronize prepared statements on Burrow %s: %w", target.name, err)
+	}
+	connection := &sessionShard{name: target.name, conn: pooled.Conn().PgConn(), pooled: pooled}
+	s.shards[target.name] = connection
+	s.manager.RecordOperation("backend_connection", "success")
+	return connection, nil
+}
+
+// Ensure acquires one Burrow affinity connection without sending a frontend
+// protocol message. It is used before checking connection-local prepared state.
+func (s *Session) Ensure(name string) error {
+	_, err := s.acquire(name)
+	return err
+}
+
+// ConnectedNames returns acquired Burrows in configured order.
+func (s *Session) ConnectedNames() []string {
+	if s == nil || s.manager == nil {
+		return nil
+	}
+	names := make([]string, 0, len(s.shards))
+	for _, shard := range s.manager.shards {
+		if s.shards[shard.name] != nil {
+			names = append(names, shard.name)
+		}
+	}
+	return names
 }
 
 func (m *Manager) syncPreparedStatements(ctx context.Context, burrow string, connection *pgx.Conn) error {
@@ -405,10 +447,12 @@ func (s *Session) UnlockWrites() {
 	s.writeGate <- struct{}{}
 }
 
-// Send broadcasts one frontend protocol message to every Burrow before
-// flushing, keeping their prepared-statement and portal state in lockstep.
+// Send broadcasts one frontend protocol message to the currently connected
+// Burrows. It never acquires new connections; callers choose participants with
+// SendTo or SendBatchTo before a protocol phase begins.
 func (s *Session) Send(message pgproto3.FrontendMessage) error {
-	for _, shard := range s.shards {
+	shards := s.connectedShards()
+	for _, shard := range shards {
 		shard.conn.Frontend().Send(message)
 		// The frontend connection is processed one protocol message at a time.
 		// PostgreSQL is allowed to hold an extended-query response until a Sync
@@ -416,7 +460,7 @@ func (s *Session) Send(message pgproto3.FrontendMessage) error {
 		// Parse, Bind, Describe, Execute, and Close observable immediately.
 		shard.conn.Frontend().Send(&pgproto3.Flush{})
 	}
-	for _, shard := range s.shards {
+	for _, shard := range shards {
 		if err := shard.conn.Frontend().Flush(); err != nil {
 			return fmt.Errorf("send to Burrow %s: %w", shard.name, err)
 		}
@@ -428,10 +472,11 @@ func (s *Session) Send(message pgproto3.FrontendMessage) error {
 // Flush. PostgreSQL only accepts CopyData, CopyDone, and CopyFail while it is
 // in COPY FROM STDIN mode; the transport buffer is still flushed normally.
 func (s *Session) SendCopy(message pgproto3.FrontendMessage) error {
-	for _, shard := range s.shards {
+	shards := s.connectedShards()
+	for _, shard := range shards {
 		shard.conn.Frontend().Send(message)
 	}
-	for _, shard := range s.shards {
+	for _, shard := range shards {
 		if err := shard.conn.Frontend().Flush(); err != nil {
 			return fmt.Errorf("send COPY data to Burrow %s: %w", shard.name, err)
 		}
@@ -442,9 +487,9 @@ func (s *Session) SendCopy(message pgproto3.FrontendMessage) error {
 // SendTo forwards one frontend protocol message to a single Burrow while
 // preserving that Burrow's prepared-statement and portal state.
 func (s *Session) SendTo(name string, message pgproto3.FrontendMessage) error {
-	shard := s.shardByName(name)
-	if shard == nil {
-		return fmt.Errorf("unknown Burrow %s", name)
+	shard, err := s.acquire(name)
+	if err != nil {
+		return err
 	}
 	shard.conn.Frontend().Send(message)
 	shard.conn.Frontend().Send(&pgproto3.Flush{})
@@ -458,9 +503,9 @@ func (s *Session) SendTo(name string, message pgproto3.FrontendMessage) error {
 // exactly once. PostgreSQL clients normally pipeline Bind, Execute, and Sync;
 // preserving that request boundary avoids a network round trip per message.
 func (s *Session) SendBatchTo(name string, messages ...pgproto3.FrontendMessage) error {
-	shard := s.shardByName(name)
-	if shard == nil {
-		return fmt.Errorf("unknown Burrow %s", name)
+	shard, err := s.acquire(name)
+	if err != nil {
+		return err
 	}
 	for _, message := range messages {
 		shard.conn.Frontend().Send(message)
@@ -474,9 +519,20 @@ func (s *Session) SendBatchTo(name string, messages ...pgproto3.FrontendMessage)
 // ReceiveUntil reads each Burrow's response through its terminating message.
 // The outer slice is ordered by configured Burrow name, just like QueryAll.
 func (s *Session) ReceiveUntil(ctx context.Context, done func(pgproto3.BackendMessage) bool) ([][]pgproto3.BackendMessage, error) {
+	return s.ReceiveUntilFromMany(ctx, s.ConnectedNames(), done)
+}
+
+// ReceiveUntilFromMany reads exactly the named participants in caller order.
+// This avoids waiting on an older affinity connection that received no message
+// in the current routed protocol phase.
+func (s *Session) ReceiveUntilFromMany(ctx context.Context, names []string, done func(pgproto3.BackendMessage) bool) ([][]pgproto3.BackendMessage, error) {
 	ctx = s.receiveContext(ctx)
-	responses := make([][]pgproto3.BackendMessage, len(s.shards))
-	for index, shard := range s.shards {
+	responses := make([][]pgproto3.BackendMessage, len(names))
+	for index, name := range names {
+		shard := s.shardByName(name)
+		if shard == nil {
+			return nil, fmt.Errorf("Burrow %s is not connected", name)
+		}
 		response, err := receiveUntil(ctx, shard, done)
 		if err != nil {
 			return nil, err
@@ -508,12 +564,23 @@ func (s *Session) receiveContext(fallback context.Context) context.Context {
 }
 
 func (s *Session) shardByName(name string) *sessionShard {
-	for _, shard := range s.shards {
-		if shard.name == name {
-			return shard
+	if s == nil {
+		return nil
+	}
+	return s.shards[name]
+}
+
+func (s *Session) connectedShards() []*sessionShard {
+	if s == nil || s.manager == nil {
+		return nil
+	}
+	shards := make([]*sessionShard, 0, len(s.shards))
+	for _, target := range s.manager.shards {
+		if shard := s.shards[target.name]; shard != nil {
+			shards = append(shards, shard)
 		}
 	}
-	return nil
+	return shards
 }
 
 func receiveUntil(ctx context.Context, shard *sessionShard, done func(pgproto3.BackendMessage) bool) ([]pgproto3.BackendMessage, error) {
@@ -575,13 +642,12 @@ func cloneBackendMessage(message pgproto3.BackendMessage) pgproto3.BackendMessag
 	}
 }
 
-// Close releases every affinity connection. It is safe after a partial
-// NewSession failure.
+// Close releases every acquired affinity connection.
 func (s *Session) Close(ctx context.Context, reusable ...bool) {
 	s.UnlockWrites()
 	release := len(reusable) > 0 && reusable[0]
 	success := true
-	for _, shard := range s.shards {
+	for _, shard := range s.connectedShards() {
 		if release {
 			shard.pooled.Release()
 			continue

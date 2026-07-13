@@ -136,6 +136,149 @@ func TestGatewayEndToEnd(t *testing.T) {
 	assertConcurrentQueriesAndMetricScrapes(t, frontendAddress, statusURL+"/metrics")
 }
 
+func TestASTRoutingPlacesRowsOnOnlyTheOwningBurrow(t *testing.T) {
+	repoRoot := repositoryRoot(t)
+	ensureDockerBurrows(t, repoRoot)
+	frontendAddress, statusAddress := availableAddress(t), availableAddress(t)
+	logs := startGateway(t, buildGateway(t, repoRoot), writeGatewayConfig(t, frontendAddress, statusAddress))
+	statusURL := "http://" + statusAddress
+	waitForHealthyGateway(t, statusURL, logs)
+
+	queryGateway(t, frontendAddress, `DROP TABLE IF EXISTS ast_routing_e2e`, func(rows pgx.Rows) {})
+	queryGateway(t, frontendAddress, `DROP TABLE IF EXISTS "QuotedRoutes"`, func(rows pgx.Rows) {})
+	queryGateway(t, frontendAddress, `CREATE TABLE ast_routing_e2e (tenant_id bigint PRIMARY KEY, payload text NOT NULL)`, func(rows pgx.Rows) {})
+	queryGateway(t, frontendAddress, `COMMENT ON COLUMN ast_routing_e2e.tenant_id IS 'hamstergres.shard_key'`, func(rows pgx.Rows) {})
+	queryGateway(t, frontendAddress, `CREATE TABLE "QuotedRoutes" ("Tenant_ID" bigint PRIMARY KEY, payload text NOT NULL)`, func(rows pgx.Rows) {})
+	queryGateway(t, frontendAddress, `COMMENT ON COLUMN "QuotedRoutes"."Tenant_ID" IS 'hamstergres.shard_key'`, func(rows pgx.Rows) {})
+	t.Cleanup(func() {
+		queryGateway(t, frontendAddress, `DROP TABLE IF EXISTS ast_routing_e2e`, func(rows pgx.Rows) {})
+		queryGateway(t, frontendAddress, `DROP TABLE IF EXISTS "QuotedRoutes"`, func(rows pgx.Rows) {})
+	})
+
+	config, err := pgx.ParseConfig("postgres://any-user@" + frontendAddress + "/any-database?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection, err := pgx.ConnectConfig(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close(context.Background())
+
+	keys := keysForDifferentBurrows()
+	connectionsBeforeQuoted := operationTotal(gatewaySnapshot(t, statusURL+"/api/v1/status"), "backend_connection")
+	quotedKey := fmt.Sprintf("%08d", keys[0])
+	quotedResult := connection.PgConn().ExecParams(
+		context.Background(),
+		`INSERT INTO "QuotedRoutes" ("Tenant_ID", payload) VALUES ($1, 'quoted')`,
+		[][]byte{[]byte(quotedKey)},
+		[]uint32{20},
+		[]int16{0},
+		[]int16{0},
+	).Read()
+	if quotedResult.Err != nil {
+		t.Fatalf("quoted canonical-key insert: %v", quotedResult.Err)
+	}
+	connectionsAfterQuoted := operationTotal(gatewaySnapshot(t, statusURL+"/api/v1/status"), "backend_connection")
+	if delta := connectionsAfterQuoted - connectionsBeforeQuoted; delta != 1 {
+		t.Fatalf("routed extended execution acquired %d Burrow connections, want 1", delta)
+	}
+	for index, port := range []string{"5541", "5542"} {
+		direct, err := pgx.Connect(context.Background(), "postgres://hamster:hamster@localhost:"+port+"/hamstergres?sslmode=disable")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var count int
+		err = direct.QueryRow(context.Background(), `SELECT count(*) FROM "QuotedRoutes" WHERE "Tenant_ID" = $1`, keys[0]).Scan(&count)
+		direct.Close(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := 0
+		if index == 0 {
+			want = 1
+		}
+		if count != want {
+			t.Fatalf("quoted canonical-key placement on Burrow %d = %d, want %d", index+1, count, want)
+		}
+	}
+	for index, key := range keys {
+		if _, err := connection.Exec(context.Background(), `INSERT INTO ast_routing_e2e (payload, tenant_id) VALUES ($1, ($2)::bigint)`, fmt.Sprintf("value,%d", index), key); err != nil {
+			t.Fatalf("AST-routed insert for key %d: %v", key, err)
+		}
+	}
+
+	for index, port := range []string{"5541", "5542"} {
+		direct, err := pgx.Connect(context.Background(), "postgres://hamster:hamster@localhost:"+port+"/hamstergres?sslmode=disable")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var own, other int
+		err = direct.QueryRow(context.Background(), `SELECT count(*) FILTER (WHERE tenant_id = $1), count(*) FILTER (WHERE tenant_id = $2) FROM ast_routing_e2e`, keys[index], keys[1-index]).Scan(&own, &other)
+		direct.Close(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if own != 1 || other != 0 {
+			t.Fatalf("Burrow %d placement = own:%d other:%d, want own:1 other:0", index+1, own, other)
+		}
+	}
+
+	beforeUnsafe := gatewaySnapshot(t, statusURL+"/api/v1/status")
+	cacheBefore := operationTotal(beforeUnsafe, "prepared_statement_cache")
+	connectionsBefore := operationTotal(beforeUnsafe, "backend_connection")
+	if _, err := connection.Exec(context.Background(), `UPDATE ast_routing_e2e AS a SET payload = 'unsafe' WHERE a.tenant_id = $1 OR a.tenant_id = $2`, keys[0], keys[1]); err == nil {
+		t.Fatal("ambiguous OR write reached a Burrow")
+	} else {
+		var postgresError *pgconn.PgError
+		if !errors.As(err, &postgresError) || postgresError.Code != "0A000" {
+			t.Fatalf("ambiguous write error = %v, want 0A000", err)
+		}
+	}
+	afterUnsafe := gatewaySnapshot(t, statusURL+"/api/v1/status")
+	cacheAfter := operationTotal(afterUnsafe, "prepared_statement_cache")
+	if cacheAfter != cacheBefore {
+		t.Fatalf("ambiguous write changed backend Parse cache operations from %d to %d", cacheBefore, cacheAfter)
+	}
+	connectionsAfter := operationTotal(afterUnsafe, "backend_connection")
+	if connectionsAfter != connectionsBefore {
+		t.Fatalf("ambiguous write opened Burrow connections: backend_connection changed from %d to %d", connectionsBefore, connectionsAfter)
+	}
+	if _, err := connection.Exec(context.Background(), `UPDATE ast_routing_e2e AS a SET payload = 'targeted' WHERE (($1)::bigint = a.tenant_id)`, keys[0]); err != nil {
+		t.Fatalf("AST-routed aliased update: %v", err)
+	}
+
+	for index, port := range []string{"5541", "5542"} {
+		direct, err := pgx.Connect(context.Background(), "postgres://hamster:hamster@localhost:"+port+"/hamstergres?sslmode=disable")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var payload string
+		err = direct.QueryRow(context.Background(), `SELECT payload FROM ast_routing_e2e WHERE tenant_id = $1`, keys[index]).Scan(&payload)
+		direct.Close(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := fmt.Sprintf("value,%d", index)
+		if index == 0 {
+			want = "targeted"
+		}
+		if payload != want {
+			t.Fatalf("Burrow %d payload = %q, want %q", index+1, payload, want)
+		}
+	}
+}
+
+func operationTotal(snapshot status.Snapshot, operation string) int64 {
+	var total int64
+	for _, item := range snapshot.QueryMetrics.Operations {
+		if item.Operation == operation {
+			total += item.Count
+		}
+	}
+	return total
+}
+
 func TestReplicatedUnshardedTablesEndToEnd(t *testing.T) {
 	repoRoot := repositoryRoot(t)
 	ensureDockerBurrows(t, repoRoot)
@@ -928,7 +1071,7 @@ func ensureDockerBurrows(t *testing.T, repositoryRoot string) {
 	if _, err := exec.LookPath("docker"); err != nil {
 		t.Skip("Docker is required for the end-to-end gateway test")
 	}
-	command := exec.Command("docker", "compose", "up", "-d", "--wait")
+	command := exec.Command("docker", "compose", "up", "-d", "--wait", "hamstergres-nest", "burrow-01", "burrow-02")
 	command.Dir = repositoryRoot
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("start Docker Burrows: %v\n%s", err, output)

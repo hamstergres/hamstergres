@@ -11,7 +11,6 @@ import (
 	"log/slog"
 	"net"
 	"reflect"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,6 +19,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
+	"github.com/jackc/pgx/v5/pgtype"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -168,14 +168,25 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 		message := next.message
 		switch message := message.(type) {
 		case *pgproto3.Parse:
-			if active, ok := ensureSession(); ok && !state.failed {
+			if !state.failed {
 				prepared, err := prepareStatement(message, s.backends.Schema())
 				if err != nil {
 					s.sendExtendedError(frontend, "42601", err.Error())
 					state.failed = true
 					break
 				}
-				if s.handleCachedParse(frontend, active, prepared) {
+				decision, err := s.routePortal(prepared.sql, placeholderRoutingParameters(prepared.sql), s.backends.ShardNames())
+				if err != nil {
+					s.sendExtendedError(frontend, "42601", err.Error())
+					state.failed = true
+					break
+				}
+				if decision.keyedWrite && !decision.routed {
+					s.sendExtendedError(frontend, "0A000", "write to a sharded table must include one unambiguous annotated shard key")
+					state.failed = true
+					break
+				}
+				if s.handleCachedParse(frontend, prepared) {
 					state.statements[message.Name] = prepared
 				} else {
 					state.failed = true
@@ -204,8 +215,13 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 					state.failed = true
 					break
 				}
-				target, routed := s.routePortal(statement.sql, parameters, s.backends.ShardNames())
-				if s.requiresKeyedWrite(statement.sql) && !routed {
+				decision, err := s.routePortal(statement.sql, parameters, s.backends.ShardNames())
+				if err != nil {
+					s.sendExtendedError(frontend, "42601", err.Error())
+					state.failed = true
+					break
+				}
+				if decision.keyedWrite && !decision.routed {
 					s.sendExtendedError(frontend, "0A000", "write to a sharded table must include its annotated shard key")
 					state.failed = true
 					break
@@ -214,17 +230,18 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 					sql:        statement.sql,
 					parameters: parameters,
 					schema:     statement.schema,
-					target:     target,
-					routed:     routed,
+					target:     decision.target,
+					routed:     decision.routed,
+					keyedWrite: decision.keyedWrite,
 				}
 				if state.pending == nil {
 					state.portals[message.DestinationPortal] = portal
 					targets := s.backends.ShardNames()
-					if routed {
-						targets = []string{target}
+					if decision.routed {
+						targets = []string{decision.target}
 					}
 					state.pending = &pendingExtended{targets: targets, bind: bound, portalName: message.DestinationPortal, portal: portal, statement: statement}
-				} else if s.handleBind(frontend, active, bound, target, routed) {
+				} else if s.handleBind(frontend, active, bound, decision.target, decision.routed, statement) {
 					state.portals[message.DestinationPortal] = portal
 				} else {
 					state.failed = true
@@ -232,6 +249,7 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 			}
 		case *pgproto3.Describe:
 			if active, ok := ensureSession(); ok && !state.failed {
+				clientObjectName := message.Name
 				if state.pending != nil && message.ObjectType == 'P' && state.pending.portalName == message.Name {
 					state.pending.describe = message
 					break
@@ -241,16 +259,43 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 					break
 				}
 				generated := message.ObjectType == 'S' && state.statements[message.Name].generated
+				describeTarget := ""
+				describeRouted := false
 				if message.ObjectType == 'S' {
-					if statement, ok := state.statements[message.Name]; ok {
-						rewritten := *message
-						rewritten.Name = statement.backendName
-						message = &rewritten
+					statement, exists := state.statements[message.Name]
+					if !exists {
+						s.sendExtendedError(frontend, "26000", fmt.Sprintf("prepared statement %q does not exist", message.Name))
+						state.failed = true
+						break
 					}
+					targets := s.backends.ShardNames()
+					if len(targets) == 0 {
+						s.sendExtendedError(frontend, "08006", "no Burrows configured")
+						state.failed = true
+						break
+					}
+					describeTarget, describeRouted = targets[0], true
+					if !s.materializeStatement(frontend, active, statement, []string{describeTarget}) {
+						state.failed = true
+						break
+					}
+					rewritten := *message
+					rewritten.Name = statement.backendName
+					message = &rewritten
 				}
 				portal := state.portals[message.Name]
-				if !s.handleDescribe(frontend, active, message, generated, portal.target, message.ObjectType == 'P' && portal.routed) {
+				if message.ObjectType == 'P' {
+					describeTarget, describeRouted = portal.target, portal.routed
+				}
+				described, parameterOIDs := s.handleDescribe(frontend, active, message, generated, describeTarget, describeRouted)
+				if !described {
 					state.failed = true
+				} else if message.ObjectType == 'S' && len(parameterOIDs) > 0 {
+					statement := state.statements[clientObjectName]
+					parsed := *statement.message
+					parsed.ParameterOIDs = append([]uint32(nil), parameterOIDs...)
+					statement.message = &parsed
+					state.statements[clientObjectName] = statement
 				}
 			}
 		case *pgproto3.Execute:
@@ -372,7 +417,11 @@ func prepareStatement(message *pgproto3.Parse, registry schema.Registry) (statem
 	if err != nil {
 		return statementState{}, err
 	}
-	parameter := maxParameter(normalized.sql) + 1
+	maximum, err := router.MaxParameter(normalized.sql)
+	if err != nil {
+		return statementState{}, err
+	}
+	parameter := maximum + 1
 	rewritten, generated := router.RewriteGeneratedInsert(normalized.sql, registry, fmt.Sprintf("$%d", parameter))
 	if !generated {
 		if normalized.sql == message.Query {
@@ -427,17 +476,17 @@ func normalizeDDL(sql string) (normalizedSQL, error) {
 	return normalizedSQL{sql: result.SQL, schema: result.Schema}, nil
 }
 
-var parameterReference = regexp.MustCompile(`\$(\d+)`)
-
 func maxParameter(sql string) int {
-	maximum := 0
-	for _, match := range parameterReference.FindAllStringSubmatch(sql, -1) {
-		value, _ := strconv.Atoi(match[1])
-		if value > maximum {
-			maximum = value
-		}
-	}
+	maximum, _ := router.MaxParameter(sql)
 	return maximum
+}
+
+func placeholderRoutingParameters(sql string) [][]byte {
+	parameters := make([][]byte, maxParameter(sql))
+	for index := range parameters {
+		parameters[index] = []byte("0")
+	}
+	return parameters
 }
 
 func (s *Server) prepareBind(message *pgproto3.Bind, statement statementState) (*pgproto3.Bind, [][]byte, error) {
@@ -472,6 +521,7 @@ func (s *Server) prepareBind(message *pgproto3.Bind, statement statementState) (
 
 func routingParameters(message *pgproto3.Bind, parameterOIDs []uint32) [][]byte {
 	parameters := cloneParameters(message.Parameters)
+	typeMap := pgtype.NewMap()
 	for index, value := range parameters {
 		format := int16(0)
 		if len(message.ParameterFormatCodes) == 1 {
@@ -479,22 +529,12 @@ func routingParameters(message *pgproto3.Bind, parameterOIDs []uint32) [][]byte 
 		} else if index < len(message.ParameterFormatCodes) {
 			format = message.ParameterFormatCodes[index]
 		}
-		if format != 1 || index >= len(parameterOIDs) {
+		if format != pgtype.BinaryFormatCode || index >= len(parameterOIDs) || parameterOIDs[index] == 0 || value == nil {
 			continue
 		}
-		switch parameterOIDs[index] {
-		case 20:
-			if len(value) == 8 {
-				parameters[index] = []byte(strconv.FormatInt(int64(binary.BigEndian.Uint64(value)), 10))
-			}
-		case 21:
-			if len(value) == 2 {
-				parameters[index] = []byte(strconv.FormatInt(int64(int16(binary.BigEndian.Uint16(value))), 10))
-			}
-		case 23:
-			if len(value) == 4 {
-				parameters[index] = []byte(strconv.FormatInt(int64(int32(binary.BigEndian.Uint32(value))), 10))
-			}
+		var decoded string
+		if err := typeMap.Scan(parameterOIDs[index], format, value, &decoded); err == nil {
+			parameters[index] = []byte(decoded)
 		}
 	}
 	return parameters
@@ -513,6 +553,7 @@ type portalState struct {
 	schema     bool
 	target     string
 	routed     bool
+	keyedWrite bool
 }
 
 func cloneParameters(parameters [][]byte) [][]byte {
@@ -526,17 +567,24 @@ func cloneParameters(parameters [][]byte) [][]byte {
 	return cloned
 }
 
-func (s *Server) handleCachedParse(frontend *pgproto3.Backend, session *backend.Session, statement statementState) bool {
-	missing := make([]string, 0)
-	for _, target := range s.backends.ShardNames() {
+func (s *Server) handleCachedParse(frontend *pgproto3.Backend, _ statementState) bool {
+	// Parse is acknowledged after Proxy-side AST validation. The canonical
+	// statement is materialized lazily when a Describe or Bind selects an actual
+	// Burrow, avoiding one connection and Parse per configured Burrow.
+	frontend.Send(&pgproto3.ParseComplete{})
+	return true
+}
+
+func (s *Server) materializeStatement(frontend *pgproto3.Backend, session *backend.Session, statement statementState, targets []string) bool {
+	missing := make([]string, 0, len(targets))
+	for _, target := range targets {
+		if err := session.Ensure(target); err != nil {
+			s.sendExtendedError(frontend, "08006", err.Error())
+			return false
+		}
 		if !session.Prepared(target, statement.backendName) {
 			missing = append(missing, target)
 		}
-	}
-	if len(missing) == 0 {
-		s.backends.RecordOperation("prepared_statement_cache", "hit")
-		frontend.Send(&pgproto3.ParseComplete{})
-		return true
 	}
 	for _, target := range missing {
 		responses, err := exchangeOne(session, target, statement.message, isParseDone)
@@ -549,30 +597,48 @@ func (s *Server) handleCachedParse(frontend *pgproto3.Backend, session *backend.
 			return false
 		}
 	}
-	session.MarkPrepared(missing, statement.backendName)
-	s.backends.RecordOperation("prepared_statement_cache", "miss")
-	frontend.Send(&pgproto3.ParseComplete{})
+	if len(missing) > 0 {
+		session.MarkPrepared(missing, statement.backendName)
+		s.backends.RecordOperation("prepared_statement_cache", "miss")
+	} else {
+		s.backends.RecordOperation("prepared_statement_cache", "hit")
+	}
 	return true
 }
 
-func (s *Server) handleBind(frontend *pgproto3.Backend, session *backend.Session, message *pgproto3.Bind, target string, routed bool) bool {
+func (s *Server) handleBind(frontend *pgproto3.Backend, session *backend.Session, message *pgproto3.Bind, target string, routed bool, statement statementState) bool {
+	targets := s.backends.ShardNames()
+	if routed {
+		targets = []string{target}
+	}
+	if !s.materializeStatement(frontend, session, statement, targets) {
+		return false
+	}
 	var responses [][]pgproto3.BackendMessage
 	var err error
 	if routed {
 		responses, err = exchangeOne(session, target, message, isBindDone)
 	} else {
-		responses, err = exchange(session, message, isBindDone)
+		responses, err = exchange(session, targets, message, isBindDone)
 	}
 	return s.relayUniform(frontend, responses, err, "Bind")
 }
 
-func (s *Server) handleDescribe(frontend *pgproto3.Backend, session *backend.Session, message *pgproto3.Describe, generated bool, target string, routed bool) bool {
+func (s *Server) handleDescribe(frontend *pgproto3.Backend, session *backend.Session, message *pgproto3.Describe, generated bool, target string, routed bool) (bool, []uint32) {
 	var responses [][]pgproto3.BackendMessage
 	var err error
 	if routed {
 		responses, err = exchangeOne(session, target, message, isDescribeDone)
 	} else {
-		responses, err = exchange(session, message, isDescribeDone)
+		responses, err = exchange(session, s.backends.ShardNames(), message, isDescribeDone)
+	}
+	var parameterOIDs []uint32
+	for _, response := range responses {
+		for _, wireMessage := range response {
+			if parameters, ok := wireMessage.(*pgproto3.ParameterDescription); ok && parameterOIDs == nil {
+				parameterOIDs = append([]uint32(nil), parameters.ParameterOIDs...)
+			}
+		}
 	}
 	if generated {
 		for _, response := range responses {
@@ -583,7 +649,7 @@ func (s *Server) handleDescribe(frontend *pgproto3.Backend, session *backend.Ses
 			}
 		}
 	}
-	return s.relayUniform(frontend, responses, err, "Describe")
+	return s.relayUniform(frontend, responses, err, "Describe"), parameterOIDs
 }
 
 func (s *Server) handleClose(frontend *pgproto3.Backend, session *backend.Session, message *pgproto3.Close, target string, routed bool) bool {
@@ -592,7 +658,7 @@ func (s *Server) handleClose(frontend *pgproto3.Backend, session *backend.Sessio
 	if routed {
 		responses, err = exchangeOne(session, target, message, isCloseDone)
 	} else {
-		responses, err = exchange(session, message, isCloseDone)
+		responses, err = exchange(session, s.backends.ShardNames(), message, isCloseDone)
 	}
 	return s.relayUniform(frontend, responses, err, "Close")
 }
@@ -621,7 +687,7 @@ func (s *Server) handleCopyQuery(frontend *pgproto3.Backend, session *backend.Se
 			finishCopyTrace(state, traceErr)
 		}
 	}()
-	responses, err := exchange(session, &pgproto3.Query{String: sql}, isCopyStarted)
+	responses, err := exchange(session, s.backends.ShardNames(), &pgproto3.Query{String: sql}, isCopyStarted)
 	if err != nil {
 		s.sendExtendedError(frontend, "08006", err.Error())
 		return false
@@ -764,7 +830,12 @@ func finishCopyTrace(state *extendedState, err error) {
 }
 
 func (s *Server) handleSync(frontend *pgproto3.Backend, session *backend.Session, state *extendedState) bool {
-	responses, err := exchange(session, &pgproto3.Sync{}, isSyncDone)
+	targets := session.ConnectedNames()
+	if len(targets) == 0 {
+		frontend.Send(&pgproto3.ReadyForQuery{TxStatus: state.txStatus()})
+		return true
+	}
+	responses, err := exchange(session, targets, &pgproto3.Sync{}, isSyncDone)
 	if err != nil {
 		s.sendExtendedError(frontend, "08006", err.Error())
 		return false
@@ -811,6 +882,10 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 	messages = append(messages, &pgproto3.Sync{})
 	preparedMisses := make([]string, 0, len(pending.targets))
 	for _, target := range pending.targets {
+		if err := session.Ensure(target); err != nil {
+			s.sendExtendedError(frontend, "08006", err.Error())
+			return false
+		}
 		targetMessages := messages
 		if pending.statement.backendName != "" && !session.Prepared(target, pending.statement.backendName) {
 			targetMessages = append([]pgproto3.FrontendMessage{pending.statement.message}, messages...)
@@ -826,7 +901,7 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 	if len(pending.targets) == 1 {
 		responses, err = session.ReceiveUntilFrom(context.Background(), pending.targets[0], isSyncDone)
 	} else {
-		responses, err = session.ReceiveUntil(context.Background(), isSyncDone)
+		responses, err = session.ReceiveUntilFromMany(context.Background(), pending.targets, isSyncDone)
 	}
 	if err != nil {
 		s.sendExtendedError(frontend, "08006", err.Error())
@@ -1011,7 +1086,7 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 	}
 
 	target, routed := portal.target, portal.routed
-	if s.requiresKeyedWrite(portal.sql) && !routed {
+	if portal.keyedWrite && !routed {
 		errorCategory = "unsafe_routing"
 		s.sendExtendedError(frontend, "0A000", "write to a sharded table must include its annotated shard key")
 		return false
@@ -1028,7 +1103,7 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 	if len(targets) == 1 {
 		responses, err = exchangeOne(session, targets[0], message, isExecuteDone)
 	} else {
-		responses, err = exchange(session, message, isExecuteDone)
+		responses, err = exchange(session, targets, message, isExecuteDone)
 	}
 	if err != nil {
 		errorCategory = "burrow_transport"
@@ -1103,18 +1178,17 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 	return true
 }
 
-func exchange(session *backend.Session, message pgproto3.FrontendMessage, done func(pgproto3.BackendMessage) bool) ([][]pgproto3.BackendMessage, error) {
-	if err := session.Send(message); err != nil {
-		return nil, err
+func exchange(session *backend.Session, targets []string, message pgproto3.FrontendMessage, done func(pgproto3.BackendMessage) bool) ([][]pgproto3.BackendMessage, error) {
+	for _, target := range targets {
+		if err := session.SendTo(target, message); err != nil {
+			return nil, err
+		}
 	}
-	return session.ReceiveUntil(context.Background(), done)
+	return session.ReceiveUntilFromMany(context.Background(), targets, done)
 }
 
 func exchangeOne(session *backend.Session, target string, message pgproto3.FrontendMessage, done func(pgproto3.BackendMessage) bool) ([][]pgproto3.BackendMessage, error) {
-	if err := session.SendTo(target, message); err != nil {
-		return nil, err
-	}
-	return session.ReceiveUntilFrom(context.Background(), target, done)
+	return exchange(session, []string{target}, message, done)
 }
 
 func (s *Server) relayUniform(frontend *pgproto3.Backend, responses [][]pgproto3.BackendMessage, err error, operation string) bool {
@@ -1396,8 +1470,14 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 
 	var responses [][]pgproto3.BackendMessage
 	var tunnelSpans []trace.Span
-	target, routed := s.routeSQL(sql, targets)
-	if s.requiresKeyedWrite(sql) && !routed {
+	decision, err := s.routeSQL(sql, targets)
+	if err != nil {
+		errorCategory = "sql_error"
+		s.sendSessionError(frontend, state.txStatus(), "42601", err.Error())
+		return false
+	}
+	target, routed := decision.target, decision.routed
+	if decision.keyedWrite && !routed {
 		errorCategory = "unsafe_routing"
 		s.sendSessionError(frontend, state.txStatus(), "0A000", "write to a sharded table must include its annotated shard key")
 		return false
@@ -1415,7 +1495,7 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 	} else {
 		querySpan.SetAttributes(attribute.String("hamstergres.route", "scatter"))
 		tunnelSpans = startTunnelSpans(traceContext, targets)
-		responses, err = exchange(session, &pgproto3.Query{String: sql}, isQueryDone)
+		responses, err = exchange(session, targets, &pgproto3.Query{String: sql}, isQueryDone)
 	}
 	if err != nil {
 		errorCategory = "burrow_transport"
@@ -1628,45 +1708,48 @@ func runTransactionCommand(session *backend.Session, burrow, sql string) *pgprot
 	return firstError(responses)
 }
 
-func (s *Server) routeSQL(sql string, burrows []string) (string, bool) {
+type routeDecision struct {
+	target     string
+	routed     bool
+	keyedWrite bool
+}
+
+func (s *Server) routeSQL(sql string, burrows []string) (routeDecision, error) {
 	return s.route(sql, nil, burrows)
 }
 
-func (s *Server) routePortal(sql string, parameters [][]byte, burrows []string) (string, bool) {
+func (s *Server) routePortal(sql string, parameters [][]byte, burrows []string) (routeDecision, error) {
 	return s.route(sql, parameters, burrows)
 }
 
-func (s *Server) route(sql string, parameters [][]byte, burrows []string) (string, bool) {
+func (s *Server) route(sql string, parameters [][]byte, burrows []string) (routeDecision, error) {
 	registry := s.backends.Schema()
-	if target, ok := router.TargetForSchema(sql, parameters, registry, burrows); ok {
-		return target, true
+	plan, err := router.Analyze(sql, parameters, registry, burrows)
+	if err != nil {
+		return routeDecision{}, err
 	}
-	table, ok := router.TableForSQL(sql)
-	if !ok || registry.IsSharded(table) {
-		return "", false
+	decision := routeDecision{target: plan.Target, routed: plan.Routed, keyedWrite: plan.Write && (plan.Table == "" || plan.Sharded)}
+	if plan.Routed || plan.Table == "" || plan.Sharded {
+		return decision, nil
 	}
 	if s.backends.UnshardedMode() == "primary" {
-		return s.backends.PrimaryBurrow(), true
+		decision.target, decision.routed = s.backends.PrimaryBurrow(), true
+		return decision, nil
 	}
-	if requiresRoutedWrite(sql) {
-		return "", false
+	if plan.Write {
+		return decision, nil
 	}
 	if len(burrows) == 0 {
-		return "", false
+		return decision, nil
 	}
 	var value [8]byte
 	if _, err := rand.Read(value[:]); err != nil {
-		return burrows[0], true
+		decision.target, decision.routed = burrows[0], true
+		return decision, nil
 	}
-	return burrows[binary.LittleEndian.Uint64(value[:])%uint64(len(burrows))], true
-}
-
-func (s *Server) requiresKeyedWrite(sql string) bool {
-	if !requiresRoutedWrite(sql) {
-		return false
-	}
-	table, ok := router.TableForSQL(sql)
-	return !ok || s.backends.Schema().IsSharded(table)
+	decision.target = burrows[binary.LittleEndian.Uint64(value[:])%uint64(len(burrows))]
+	decision.routed = true
+	return decision, nil
 }
 
 func requiresRoutedWrite(sql string) bool {
@@ -1811,8 +1894,14 @@ func (s *Server) handleQuery(frontend *pgproto3.Backend, sql string) {
 		defer unlock()
 	}
 	var result backend.Result
-	target, routed := s.routeSQL(sql, s.backends.ShardNames())
-	if s.requiresKeyedWrite(sql) && !routed {
+	decision, err := s.routeSQL(sql, s.backends.ShardNames())
+	if err != nil {
+		errorCategory = "sql_error"
+		s.sendError(frontend, "42601", err.Error())
+		return
+	}
+	target, routed := decision.target, decision.routed
+	if decision.keyedWrite && !routed {
 		errorCategory = "unsafe_routing"
 		s.sendError(frontend, "0A000", "write to a sharded table must include its annotated shard key")
 		return

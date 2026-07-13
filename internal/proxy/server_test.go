@@ -103,7 +103,7 @@ func TestPrepareStatementAddsHiddenGeneratedParameter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !prepared.generated || prepared.sql != `INSERT INTO widgets (name, "id") VALUES ($1, $2) RETURNING id` {
+	if !prepared.generated || prepared.sql != `INSERT INTO widgets (name, id) VALUES ($1, $2) RETURNING id` {
 		t.Fatalf("prepared statement = %#v", prepared)
 	}
 	if len(prepared.message.ParameterOIDs) != 2 || prepared.message.ParameterOIDs[1] != 0 {
