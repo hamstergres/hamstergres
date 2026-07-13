@@ -9,6 +9,21 @@ import (
 	"github.com/jruszo/hamstergres/internal/schema"
 )
 
+func TestMergedCopyFromTagUsesLogicalRowCounts(t *testing.T) {
+	if tag, err := mergedCopyFromTag([]string{"COPY 2", "COPY 3"}, true, false, 5); err != nil || tag != "COPY 5" {
+		t.Fatalf("sharded tag = %q, %v", tag, err)
+	}
+	if tag, err := mergedCopyFromTag([]string{"COPY 5", "COPY 5"}, false, true, -1); err != nil || tag != "COPY 5" {
+		t.Fatalf("replicated tag = %q, %v", tag, err)
+	}
+	if _, err := mergedCopyFromTag([]string{"COPY 5", "COPY 4"}, false, true, -1); err == nil {
+		t.Fatal("mismatched replicated COPY counts were accepted")
+	}
+	if _, err := mergedCopyFromTag([]string{"COPY 2", "COPY 2"}, true, false, 5); err == nil {
+		t.Fatal("mismatched sharded COPY count was accepted")
+	}
+}
+
 func TestCloneFrontendMessageOwnsCopyAndBindBuffers(t *testing.T) {
 	copyData := &pgproto3.CopyData{Data: []byte("first frame")}
 	clonedCopy := cloneFrontendMessage(copyData).(*pgproto3.CopyData)

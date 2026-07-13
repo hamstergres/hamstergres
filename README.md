@@ -230,10 +230,26 @@ Prepared statements and portals are pinned to the frontend session and retain
 supplied text or binary parameter and result formats. Unsharded `COPY FROM
 STDIN` follows the configured table policy: `primary` sends each row only to the
 primary Burrow, while `replicated` sends it once to every Burrow. Unsharded
-`COPY TO STDOUT` likewise reads from one policy-selected Burrow. Sharded COPY
-retains the temporary fleet fan-out and ordered merge behavior tracked in issue
-#28. Authentication, TLS,
-cancellation, and `COPY BOTH` remain outside this initial gateway milestone.
+`COPY TO STDOUT` likewise reads from one policy-selected Burrow. Sharded `COPY
+FROM STDIN` requires an explicit column list containing the complete annotated
+shard key, decodes text, CSV, and supported binary rows, and sends each row
+exactly once to its vshard's owning Burrow. Compound and quoted key columns are
+supported; NULL, omitted, generated, or undecodable key values fail closed.
+CSV headers and binary envelopes reach every input Burrow without being counted
+as rows. The Proxy retains at most one incomplete input row, enforces a 16 MiB
+per-row limit, and flushes routed chunks synchronously for backpressure.
+
+Sharded `COPY TO STDOUT` appends Burrows in configured order. CSV output has one
+header and binary output has one valid header/trailer envelope. This is a
+deterministic concatenation, not a global sort; use an explicitly ordered query
+when global row order matters. COPY command tags report logical rows rather
+than replicated physical writes. A row-routing error aborts and drains every
+active Burrow COPY before the frontend returns to ready state. Use an explicit
+transaction when a multi-Burrow COPY must commit atomically through two-phase
+commit; without one, a transport failure during final completion can leave an
+already-completed Burrow committed and requires reconciliation. `COPY BOTH`
+remains unsupported. Authentication, TLS, and cancellation requests remain
+outside this initial gateway milestone.
 
 Single-column integer identity and `serial`/`bigserial` primary keys may be
 omitted in a single-row insert. Hamstergres Proxy allocates a fleet-wide,

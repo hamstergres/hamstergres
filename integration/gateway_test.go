@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -770,6 +771,239 @@ func TestCopyProtocolEndToEnd(t *testing.T) {
 			t.Fatalf("Burrow %s COPY row count = %d, want %d, err = %v", port, count, want, err)
 		}
 	}
+}
+
+func TestShardAwareCopyProtocolEndToEnd(t *testing.T) {
+	repoRoot := repositoryRoot(t)
+	ensureDockerBurrows(t, repoRoot)
+	frontendAddress, statusAddress := availableAddress(t), availableAddress(t)
+	logs := startGateway(t, buildGateway(t, repoRoot), writeGatewayConfig(t, frontendAddress, statusAddress))
+	waitForHealthyGateway(t, "http://"+statusAddress, logs)
+
+	connection, err := pgconn.Connect(context.Background(), "postgres://any-user@"+frontendAddress+"/any-database?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close(context.Background())
+	if _, err := connection.Exec(context.Background(), `
+		DROP TABLE IF EXISTS shard_copy_e2e;
+		CREATE TABLE shard_copy_e2e (
+			tenant_id bigint NOT NULL,
+			region text NOT NULL,
+			payload text NOT NULL,
+			PRIMARY KEY (tenant_id, region)
+		);
+		COMMENT ON COLUMN shard_copy_e2e.tenant_id IS 'hamstergres.shard_key';
+		COMMENT ON COLUMN shard_copy_e2e.region IS 'hamstergres.shard_key'`).ReadAll(); err != nil {
+		t.Fatalf("prepare shard-aware COPY table: %v\ngateway logs:\n%s", err, logs.String())
+	}
+	t.Cleanup(func() {
+		queryGateway(t, frontendAddress, "DROP TABLE IF EXISTS shard_copy_e2e", func(rows pgx.Rows) {})
+	})
+
+	textKeys := compoundKeysForDifferentBurrows("eu-west")
+	textInput := fmt.Sprintf("%d\teu-west\ttext-one\n%d\teu-west\ttext-two\n", textKeys[0], textKeys[1])
+	tag, err := connection.CopyFrom(context.Background(), strings.NewReader(textInput), "COPY shard_copy_e2e (tenant_id, region, payload) FROM STDIN")
+	if err != nil || tag.RowsAffected() != 2 {
+		t.Fatalf("sharded text COPY = %s, %v\ngateway logs:\n%s", tag, err, logs.String())
+	}
+	assertCopiedRowPlacement(t, textKeys[0], "eu-west", "text-one")
+	assertCopiedRowPlacement(t, textKeys[1], "eu-west", "text-two")
+
+	csvKeys := compoundKeysForDifferentBurrows("eu,west")
+	csvInput := fmt.Sprintf("region,payload,tenant_id\n\"eu,west\",csv-one,%d\n\"eu,west\",\"csv,two\",%d\n", csvKeys[0], csvKeys[1])
+	tag, err = connection.CopyFrom(context.Background(), strings.NewReader(csvInput), `COPY shard_copy_e2e (region, payload, tenant_id) FROM STDIN WITH (FORMAT csv, HEADER true)`)
+	if err != nil || tag.RowsAffected() != 2 {
+		t.Fatalf("sharded CSV COPY = %s, %v\ngateway logs:\n%s", tag, err, logs.String())
+	}
+	assertCopiedRowPlacement(t, csvKeys[0], "eu,west", "csv-one")
+	assertCopiedRowPlacement(t, csvKeys[1], "eu,west", "csv,two")
+	var copiedCSV bytes.Buffer
+	tag, err = connection.CopyTo(context.Background(), &copiedCSV, `COPY shard_copy_e2e (tenant_id, region, payload) TO STDOUT WITH (FORMAT csv, HEADER true)`)
+	if err != nil || tag.RowsAffected() != 4 || strings.Count(copiedCSV.String(), "tenant_id,region,payload\n") != 1 {
+		t.Fatalf("merged CSV COPY TO = %s, header count %d, err %v: %q", tag, strings.Count(copiedCSV.String(), "tenant_id,region,payload\n"), err, copiedCSV.String())
+	}
+
+	binaryKeys := compoundKeysForDifferentBurrows("binary")
+	binaryInput := binaryCOPYInput([]binaryCOPYRow{
+		{tenantID: binaryKeys[0], region: "binary", payload: "binary-one"},
+		{tenantID: binaryKeys[1], region: "binary", payload: "binary-two"},
+	})
+	tag, err = connection.CopyFrom(context.Background(), bytes.NewReader(binaryInput), `COPY shard_copy_e2e (tenant_id, region, payload) FROM STDIN WITH (FORMAT binary)`)
+	if err != nil || tag.RowsAffected() != 2 {
+		t.Fatalf("sharded binary COPY = %s, %v\ngateway logs:\n%s", tag, err, logs.String())
+	}
+	assertCopiedRowPlacement(t, binaryKeys[0], "binary", "binary-one")
+	assertCopiedRowPlacement(t, binaryKeys[1], "binary", "binary-two")
+
+	var copiedBinary bytes.Buffer
+	tag, err = connection.CopyTo(context.Background(), &copiedBinary, `COPY shard_copy_e2e (tenant_id, region, payload) TO STDOUT WITH (FORMAT binary)`)
+	if err != nil || tag.RowsAffected() != 6 || countBinaryCOPYRows(t, copiedBinary.Bytes()) != 6 {
+		t.Fatalf("merged binary COPY TO = %s, rows %d, err %v\ngateway logs:\n%s", tag, countBinaryCOPYRows(t, copiedBinary.Bytes()), err, logs.String())
+	}
+
+	failureKey := compoundKeysForDifferentBurrows("failure")[0]
+	badInput := fmt.Sprintf("%d\tfailure\tshould-rollback\n\\N\tfailure\tinvalid\n", failureKey)
+	if _, err := connection.CopyFrom(context.Background(), strings.NewReader(badInput), "COPY shard_copy_e2e (tenant_id, region, payload) FROM STDIN"); err == nil {
+		t.Fatal("COPY with a NULL shard key succeeded")
+	}
+	resynchronized := connection.ExecParams(context.Background(), "SELECT $1::int", [][]byte{[]byte("1")}, []uint32{23}, []int16{0}, []int16{0}).Read()
+	if resynchronized.Err != nil || len(resynchronized.Rows) != 2 {
+		t.Fatalf("extended protocol did not resynchronize after COPY failure: rows %d, err %v", len(resynchronized.Rows), resynchronized.Err)
+	}
+	assertCopiedRowAbsent(t, failureKey, "failure")
+
+	constraintKeys := compoundKeysForDifferentBurrows("constraint")
+	preexisting := fmt.Sprintf("INSERT INTO shard_copy_e2e (tenant_id, region, payload) VALUES (%d, 'constraint', 'preexisting')", constraintKeys[0])
+	if _, err := connection.Exec(context.Background(), preexisting).ReadAll(); err != nil {
+		t.Fatalf("seed COPY constraint failure: %v", err)
+	}
+	if _, err := connection.Exec(context.Background(), "BEGIN").ReadAll(); err != nil {
+		t.Fatal(err)
+	}
+	constraintInput := fmt.Sprintf("%d\tconstraint\tduplicate\n%d\tconstraint\tshould-rollback\n", constraintKeys[0], constraintKeys[1])
+	if _, err := connection.CopyFrom(context.Background(), strings.NewReader(constraintInput), "COPY shard_copy_e2e (tenant_id, region, payload) FROM STDIN"); err == nil {
+		t.Fatal("COPY with a Burrow constraint failure succeeded")
+	}
+	if _, err := connection.Exec(context.Background(), "ROLLBACK").ReadAll(); err != nil {
+		t.Fatalf("rollback after Burrow COPY failure: %v", err)
+	}
+	assertCopiedRowAbsent(t, constraintKeys[1], "constraint")
+	assertCopiedRowPlacement(t, constraintKeys[0], "constraint", "preexisting")
+
+	transactionKeys := compoundKeysForDifferentBurrows("transaction")
+	if _, err := connection.Exec(context.Background(), "BEGIN").ReadAll(); err != nil {
+		t.Fatal(err)
+	}
+	transactionInput := fmt.Sprintf("%d\ttransaction\ttx-one\n%d\ttransaction\ttx-two\n", transactionKeys[0], transactionKeys[1])
+	if tag, err := connection.CopyFrom(context.Background(), strings.NewReader(transactionInput), "COPY shard_copy_e2e (tenant_id, region, payload) FROM STDIN"); err != nil || tag.RowsAffected() != 2 {
+		t.Fatalf("transactional COPY = %s, %v", tag, err)
+	}
+	if _, err := connection.Exec(context.Background(), "COMMIT").ReadAll(); err != nil {
+		t.Fatalf("commit transactional COPY: %v", err)
+	}
+	assertCopiedRowPlacement(t, transactionKeys[0], "transaction", "tx-one")
+	assertCopiedRowPlacement(t, transactionKeys[1], "transaction", "tx-two")
+}
+
+func compoundKeysForDifferentBurrows(region string) [2]int64 {
+	var keys [2]int64
+	found := map[string]bool{}
+	for key := int64(1); len(found) < 2; key++ {
+		target := router.BurrowForKey(strconv.FormatInt(key, 10)+"\x00"+region, []string{"burrow-01", "burrow-02"})
+		if found[target] {
+			continue
+		}
+		found[target] = true
+		if target == "burrow-01" {
+			keys[0] = key
+		} else {
+			keys[1] = key
+		}
+	}
+	return keys
+}
+
+func assertCopiedRowPlacement(t *testing.T, tenantID int64, region, payload string) {
+	t.Helper()
+	wantBurrow := router.BurrowForKey(strconv.FormatInt(tenantID, 10)+"\x00"+region, []string{"burrow-01", "burrow-02"})
+	for index, port := range []string{"5541", "5542"} {
+		connection, err := pgx.Connect(context.Background(), "postgres://hamster:hamster@localhost:"+port+"/hamstergres?sslmode=disable")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var count int
+		err = connection.QueryRow(context.Background(), "SELECT count(*) FROM shard_copy_e2e WHERE tenant_id = $1 AND region = $2 AND payload = $3", tenantID, region, payload).Scan(&count)
+		connection.Close(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := 0
+		if wantBurrow == fmt.Sprintf("burrow-%02d", index+1) {
+			want = 1
+		}
+		if count != want {
+			t.Fatalf("row (%d, %q) count on burrow-%02d = %d, want %d", tenantID, region, index+1, count, want)
+		}
+	}
+}
+
+func assertCopiedRowAbsent(t *testing.T, tenantID int64, region string) {
+	t.Helper()
+	for _, port := range []string{"5541", "5542"} {
+		connection, err := pgx.Connect(context.Background(), "postgres://hamster:hamster@localhost:"+port+"/hamstergres?sslmode=disable")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var count int
+		err = connection.QueryRow(context.Background(), "SELECT count(*) FROM shard_copy_e2e WHERE tenant_id = $1 AND region = $2", tenantID, region).Scan(&count)
+		connection.Close(context.Background())
+		if err != nil || count != 0 {
+			t.Fatalf("failed COPY row count on Burrow %s = %d, err %v", port, count, err)
+		}
+	}
+}
+
+type binaryCOPYRow struct {
+	tenantID int64
+	region   string
+	payload  string
+}
+
+func binaryCOPYInput(rows []binaryCOPYRow) []byte {
+	var output bytes.Buffer
+	output.Write([]byte{'P', 'G', 'C', 'O', 'P', 'Y', '\n', 0xff, '\r', '\n', 0})
+	_ = binary.Write(&output, binary.BigEndian, uint32(0))
+	_ = binary.Write(&output, binary.BigEndian, uint32(0))
+	for _, row := range rows {
+		_ = binary.Write(&output, binary.BigEndian, int16(3))
+		_ = binary.Write(&output, binary.BigEndian, int32(8))
+		_ = binary.Write(&output, binary.BigEndian, row.tenantID)
+		for _, value := range []string{row.region, row.payload} {
+			_ = binary.Write(&output, binary.BigEndian, int32(len(value)))
+			output.WriteString(value)
+		}
+	}
+	_ = binary.Write(&output, binary.BigEndian, int16(-1))
+	return output.Bytes()
+}
+
+func countBinaryCOPYRows(t *testing.T, data []byte) int {
+	t.Helper()
+	if len(data) < 21 || !bytes.Equal(data[:11], []byte{'P', 'G', 'C', 'O', 'P', 'Y', '\n', 0xff, '\r', '\n', 0}) {
+		t.Fatalf("invalid merged binary COPY header")
+	}
+	position := 19 + int(binary.BigEndian.Uint32(data[15:19]))
+	rows := 0
+	for position+2 <= len(data) {
+		columns := int(int16(binary.BigEndian.Uint16(data[position : position+2])))
+		position += 2
+		if columns == -1 {
+			if position != len(data) {
+				t.Fatalf("binary COPY has %d bytes after trailer", len(data)-position)
+			}
+			return rows
+		}
+		if columns < 0 {
+			t.Fatalf("invalid binary COPY column count %d", columns)
+		}
+		for column := 0; column < columns; column++ {
+			if position+4 > len(data) {
+				t.Fatal("truncated binary COPY field length")
+			}
+			length := int(int32(binary.BigEndian.Uint32(data[position : position+4])))
+			position += 4
+			if length >= 0 {
+				position += length
+			}
+			if position > len(data) {
+				t.Fatal("truncated binary COPY field")
+			}
+		}
+		rows++
+	}
+	t.Fatal("binary COPY trailer is missing")
+	return 0
 }
 
 func TestCrossBurrowTransactionUsesTwoPhaseCommit(t *testing.T) {
