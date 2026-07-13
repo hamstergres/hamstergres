@@ -4,6 +4,7 @@ package integration
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +29,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/jruszo/hamstergres/internal/router"
+	"github.com/jruszo/hamstergres/internal/schema"
 	"github.com/jruszo/hamstergres/internal/statistics"
 	"github.com/jruszo/hamstergres/internal/status"
 )
@@ -296,15 +298,24 @@ func TestReplicatedUnshardedTablesEndToEnd(t *testing.T) {
 	waitForHealthyGateway(t, "http://"+statusAddress, logs)
 	queryGateway(t, frontendAddress, "DROP TABLE IF EXISTS replicated_e2e; CREATE TABLE replicated_e2e (value bigint)", func(rows pgx.Rows) {})
 	queryGateway(t, frontendAddress, "INSERT INTO replicated_e2e (value) VALUES (42)", func(rows pgx.Rows) {})
+	copyConnection, err := pgconn.Connect(context.Background(), "postgres://any-user@"+frontendAddress+"/any-database?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := copyConnection.CopyFrom(context.Background(), strings.NewReader("43\n44\n"), "COPY replicated_e2e (value) FROM STDIN"); err != nil {
+		copyConnection.Close(context.Background())
+		t.Fatalf("replicated COPY FROM STDIN: %v\ngateway logs:\n%s", err, logs.String())
+	}
+	copyConnection.Close(context.Background())
 	for _, port := range []string{"5541", "5542"} {
 		connection, err := pgx.Connect(context.Background(), "postgres://hamster:hamster@localhost:"+port+"/hamstergres?sslmode=disable")
 		if err != nil {
 			t.Fatal(err)
 		}
 		var count int
-		err = connection.QueryRow(context.Background(), "SELECT count(*) FROM replicated_e2e WHERE value = 42").Scan(&count)
+		err = connection.QueryRow(context.Background(), "SELECT count(*) FROM replicated_e2e WHERE value IN (42, 43, 44)").Scan(&count)
 		connection.Close(context.Background())
-		if err != nil || count != 1 {
+		if err != nil || count != 3 {
 			t.Fatalf("Burrow %s count = %d, err = %v", port, count, err)
 		}
 	}
@@ -313,8 +324,8 @@ func TestReplicatedUnshardedTablesEndToEnd(t *testing.T) {
 		for rows.Next() {
 			count++
 		}
-		if count != 1 {
-			t.Fatalf("replicated read returned %d rows, want one Burrow's row", count)
+		if count != 3 {
+			t.Fatalf("replicated read returned %d rows, want one Burrow's three rows", count)
 		}
 	})
 	snapshot := gatewaySnapshot(t, "http://"+statusAddress+"/api/v1/status")
@@ -326,6 +337,97 @@ func TestReplicatedUnshardedTablesEndToEnd(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("unsharded table missing from Nest inventory: %#v", snapshot.Sharding.Tables)
+	}
+}
+
+func TestPgbenchInitializationThroughProxy(t *testing.T) {
+	repoRoot := repositoryRoot(t)
+	ensureDockerBurrows(t, repoRoot)
+	pgbench := ensurePgbench(t)
+
+	frontendAddress, statusAddress := availableAddress(t), availableAddress(t)
+	testKey := fmt.Sprintf("pgbench-init-%d", time.Now().UnixNano())
+	logs := startGateway(t, buildGateway(t, repoRoot), writeGatewayConfigWithKey(t, frontendAddress, statusAddress, testKey))
+	statusURL := "http://" + statusAddress
+	waitForHealthyGateway(t, statusURL, logs)
+
+	const cleanupSQL = "DROP TABLE IF EXISTS pgbench_accounts, pgbench_branches, pgbench_history, pgbench_tellers"
+	if err := execGateway(frontendAddress, cleanupSQL); err != nil {
+		t.Fatalf("clean pgbench tables before initialization: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := execGateway(frontendAddress, cleanupSQL); err != nil {
+			t.Logf("clean pgbench tables: %v", err)
+		}
+	})
+
+	if output, err := runPgbench(pgbench, frontendAddress, "-i", "-s", "1"); err != nil {
+		t.Fatalf("pgbench initialization through Hamstergres Proxy: %v\n%s\ngateway logs:\n%s", err, output, logs.String())
+	}
+
+	tables := []struct {
+		name string
+		key  string
+		rows int
+	}{
+		{name: "pgbench_accounts", key: "aid", rows: 100000},
+		{name: "pgbench_branches", key: "bid", rows: 1},
+		{name: "pgbench_tellers", key: "tid", rows: 10},
+	}
+	for index, port := range []string{"5541", "5542"} {
+		direct, err := pgx.Connect(context.Background(), "postgres://hamster:hamster@localhost:"+port+"/hamstergres?sslmode=disable")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, table := range tables {
+			var rows, distinctKeys int
+			query := fmt.Sprintf("SELECT count(*), count(DISTINCT %s) FROM %s", table.key, table.name)
+			if err := direct.QueryRow(context.Background(), query).Scan(&rows, &distinctKeys); err != nil {
+				direct.Close(context.Background())
+				t.Fatal(err)
+			}
+			want := 0
+			if index == 0 {
+				want = table.rows
+			}
+			if rows != want || distinctKeys != want {
+				direct.Close(context.Background())
+				t.Fatalf("Burrow %s %s rows/distinct keys = %d/%d, want %d/%d", port, table.name, rows, distinctKeys, want, want)
+			}
+			var primaryKey bool
+			if err := direct.QueryRow(context.Background(), `SELECT EXISTS (
+				SELECT 1 FROM pg_index i
+				JOIN pg_class c ON c.oid = i.indrelid
+				WHERE c.oid = $1::regclass AND i.indisprimary
+			)`, table.name).Scan(&primaryKey); err != nil || !primaryKey {
+				direct.Close(context.Background())
+				t.Fatalf("Burrow %s %s primary key missing, err = %v", port, table.name, err)
+			}
+		}
+		direct.Close(context.Background())
+	}
+
+	snapshot := gatewaySnapshot(t, statusURL+"/api/v1/status")
+	assertNestInventoryMatches(t, "/hamstergres/tests/"+testKey+"/schema-registry", snapshot.Sharding.Tables)
+	for _, mode := range []string{"simple", "extended", "prepared"} {
+		output, err := runPgbench(pgbench, frontendAddress, "-S", "-M", mode, "-c", "1", "-j", "1", "-t", "10")
+		if err != nil {
+			t.Fatalf("read-only pgbench %s protocol: %v\n%s\ngateway logs:\n%s", mode, err, output, logs.String())
+		}
+		if !strings.Contains(output, "number of failed transactions: 0") {
+			t.Fatalf("read-only pgbench %s did not report zero failures:\n%s", mode, output)
+		}
+	}
+
+	if err := execGateway(frontendAddress, cleanupSQL); err != nil {
+		t.Fatalf("clean pgbench tables after initialization: %v", err)
+	}
+	snapshot = gatewaySnapshot(t, statusURL+"/api/v1/status")
+	assertNestInventoryMatches(t, "/hamstergres/tests/"+testKey+"/schema-registry", snapshot.Sharding.Tables)
+	for _, table := range snapshot.Sharding.Tables {
+		if strings.HasPrefix(table.Table, "public.pgbench_") {
+			t.Fatalf("pgbench table remained in live inventory after cleanup: %#v", table)
+		}
 	}
 }
 
@@ -649,8 +751,24 @@ func TestCopyProtocolEndToEnd(t *testing.T) {
 	if _, err := connection.CopyTo(context.Background(), &copied, "COPY copy_e2e (id, value) TO STDOUT"); err != nil {
 		t.Fatalf("COPY TO STDOUT: %v\ngateway logs:\n%s", err, logs.String())
 	}
-	if got := strings.Count(copied.String(), "\n"); got != 4 {
-		t.Fatalf("COPY TO rows = %d, want two rows from each Burrow: %q", got, copied.String())
+	if got := strings.Count(copied.String(), "\n"); got != 2 {
+		t.Fatalf("COPY TO rows = %d, want two primary-Burrow rows: %q", got, copied.String())
+	}
+	for index, port := range []string{"5541", "5542"} {
+		direct, err := pgx.Connect(context.Background(), "postgres://hamster:hamster@localhost:"+port+"/hamstergres?sslmode=disable")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var count int
+		err = direct.QueryRow(context.Background(), "SELECT count(*) FROM copy_e2e").Scan(&count)
+		direct.Close(context.Background())
+		want := 0
+		if index == 0 {
+			want = 2
+		}
+		if err != nil || count != want {
+			t.Fatalf("Burrow %s COPY row count = %d, want %d, err = %v", port, count, want, err)
+		}
 	}
 }
 
@@ -994,6 +1112,90 @@ func insertGeneratedID(address string, simple bool, payload int) (int64, error) 
 }
 
 const sysbenchVersion = "1.0.20"
+
+func ensurePgbench(t *testing.T) string {
+	t.Helper()
+	path, err := exec.LookPath("pgbench")
+	if err != nil {
+		t.Skip("pgbench is required for the initialization compatibility test")
+	}
+	return path
+}
+
+func runPgbench(path, address string, options ...string) (string, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return "", err
+	}
+	arguments := append([]string(nil), options...)
+	arguments = append(arguments, "-h", host, "-p", port, "-U", "hamster", "hamstergres")
+	command := exec.Command(path, arguments...)
+	command.Env = append(os.Environ(), "PGPASSWORD=hamster")
+	output, err := command.CombinedOutput()
+	return string(output), err
+}
+
+func execGateway(address, sql string) error {
+	config, err := pgx.ParseConfig("postgres://any-user@" + address + "/any-database?sslmode=disable")
+	if err != nil {
+		return err
+	}
+	config.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	connection, err := pgx.ConnectConfig(context.Background(), config)
+	if err != nil {
+		return err
+	}
+	defer connection.Close(context.Background())
+	_, err = connection.Exec(context.Background(), sql)
+	return err
+}
+
+func assertNestInventoryMatches(t *testing.T, key string, live []schema.TableInventory) {
+	t.Helper()
+	body, err := json.Marshal(map[string]string{"key": base64.StdEncoding.EncodeToString([]byte(key))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.Post("http://127.0.0.1:2379/v3/kv/range", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		contents, _ := io.ReadAll(response.Body)
+		t.Fatalf("read Nest schema registry = %s: %s", response.Status, contents)
+	}
+	var result struct {
+		KVs []struct {
+			Value string `json:"value"`
+		} `json:"kvs"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.KVs) != 1 {
+		t.Fatalf("Nest schema registry %q values = %d, want 1", key, len(result.KVs))
+	}
+	encoded, err := base64.StdEncoding.DecodeString(result.KVs[0].Value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := schema.FromJSON(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nestInventory, err := json.Marshal(registry.Inventory())
+	if err != nil {
+		t.Fatal(err)
+	}
+	liveInventory, err := json.Marshal(live)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(nestInventory, liveInventory) {
+		t.Fatalf("Nest inventory = %s, live inventory = %s", nestInventory, liveInventory)
+	}
+}
 
 // TestSysbenchReadWriteEndToEnd is an opt-in compatibility test. It exercises
 // sysbench's PostgreSQL extended-query workload against the Docker Burrows;

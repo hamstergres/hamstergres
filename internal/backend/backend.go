@@ -497,11 +497,19 @@ func (s *Session) Send(message pgproto3.FrontendMessage) error {
 	return nil
 }
 
-// SendCopy broadcasts a COPY data-phase message without injecting a protocol
-// Flush. PostgreSQL only accepts CopyData, CopyDone, and CopyFail while it is
-// in COPY FROM STDIN mode; the transport buffer is still flushed normally.
-func (s *Session) SendCopy(message pgproto3.FrontendMessage) error {
-	shards := s.connectedShards()
+// SendCopyTo forwards a COPY data-phase message to exactly the named Burrows
+// without injecting a protocol Flush. PostgreSQL only accepts CopyData,
+// CopyDone, and CopyFail while it is in COPY FROM STDIN mode; the transport
+// buffer is still flushed normally.
+func (s *Session) SendCopyTo(names []string, message pgproto3.FrontendMessage) error {
+	shards := make([]*sessionShard, 0, len(names))
+	for _, name := range names {
+		shard := s.shardByName(name)
+		if shard == nil {
+			return fmt.Errorf("Burrow %s is not connected for COPY", name)
+		}
+		shards = append(shards, shard)
+	}
 	for _, shard := range shards {
 		shard.conn.Frontend().Send(message)
 	}

@@ -227,9 +227,12 @@ two-phase commit by default, while read-only and single-Burrow transactions use
 ordinary commit. Operators who accept partial cross-Burrow commit risk may set
 `transactions.two_phase_commit: false` to use sequential ordinary commits.
 Prepared statements and portals are pinned to the frontend session and retain
-supplied text or binary parameter and result formats. `COPY FROM STDIN` is
-streamed to every Burrow, while `COPY TO STDOUT`
-merges each Burrow's stream in configured order. Authentication, TLS,
+supplied text or binary parameter and result formats. Unsharded `COPY FROM
+STDIN` follows the configured table policy: `primary` sends each row only to the
+primary Burrow, while `replicated` sends it once to every Burrow. Unsharded
+`COPY TO STDOUT` likewise reads from one policy-selected Burrow. Sharded COPY
+retains the temporary fleet fan-out and ordered merge behavior tracked in issue
+#28. Authentication, TLS,
 cancellation, and `COPY BOTH` remain outside this initial gateway milestone.
 
 Single-column integer identity and `serial`/`bigserial` primary keys may be

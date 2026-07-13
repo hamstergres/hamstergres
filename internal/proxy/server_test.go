@@ -1,12 +1,35 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/binary"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/jruszo/hamstergres/internal/schema"
 )
+
+func TestCloneFrontendMessageOwnsCopyAndBindBuffers(t *testing.T) {
+	copyData := &pgproto3.CopyData{Data: []byte("first frame")}
+	clonedCopy := cloneFrontendMessage(copyData).(*pgproto3.CopyData)
+	copy(copyData.Data, "overwritten!")
+	if string(clonedCopy.Data) != "first frame" {
+		t.Fatalf("cloned CopyData = %q, want owned first frame", clonedCopy.Data)
+	}
+
+	bind := &pgproto3.Bind{
+		ParameterFormatCodes: []int16{1},
+		Parameters:           [][]byte{[]byte("42")},
+		ResultFormatCodes:    []int16{1},
+	}
+	clonedBind := cloneFrontendMessage(bind).(*pgproto3.Bind)
+	bind.ParameterFormatCodes[0] = 0
+	bind.Parameters[0][0] = '9'
+	bind.ResultFormatCodes[0] = 0
+	if !bytes.Equal(clonedBind.Parameters[0], []byte("42")) || clonedBind.ParameterFormatCodes[0] != 1 || clonedBind.ResultFormatCodes[0] != 1 {
+		t.Fatalf("cloned Bind reused receive buffers: %#v", clonedBind)
+	}
+}
 
 func TestRoutingParametersDecodeBinaryIntegers(t *testing.T) {
 	bigint := make([]byte, 8)

@@ -207,6 +207,24 @@ func TestAnalyzeSimpleAndExtendedProduceEquivalentPlans(t *testing.T) {
 	}
 }
 
+func TestAnalyzeCopyRecordsRelationAndDirection(t *testing.T) {
+	from, err := Analyze("COPY public.accounts (id, value) FROM STDIN", nil, schema.Registry{}, []string{"burrow-01", "burrow-02"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if from.Table != "public.accounts" || !from.Write || from.Routed {
+		t.Fatalf("COPY FROM plan = %#v", from)
+	}
+
+	to, err := Analyze("COPY public.accounts TO STDOUT", nil, schema.Registry{}, []string{"burrow-01", "burrow-02"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if to.Table != "public.accounts" || to.Write || to.Routed {
+		t.Fatalf("COPY TO plan = %#v", to)
+	}
+}
+
 func TestPreparedAnalyzeReusesSyntaxWithCurrentBindingsAndRegistry(t *testing.T) {
 	burrows := []string{"burrow-01", "burrow-02"}
 	prepared, err := Prepare("SELECT payload FROM accounts WHERE tenant_id = $1")
