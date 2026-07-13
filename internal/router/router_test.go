@@ -207,6 +207,30 @@ func TestAnalyzeSimpleAndExtendedProduceEquivalentPlans(t *testing.T) {
 	}
 }
 
+func TestPreparedAnalyzeReusesSyntaxWithCurrentBindingsAndRegistry(t *testing.T) {
+	burrows := []string{"burrow-01", "burrow-02"}
+	prepared, err := Prepare("SELECT payload FROM accounts WHERE tenant_id = $1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prepared.MaxParameter() != 1 {
+		t.Fatalf("MaxParameter = %d, want 1", prepared.MaxParameter())
+	}
+
+	unsharded := prepared.Analyze([][]byte{[]byte("41")}, schema.Registry{}, burrows)
+	if unsharded.Routed || unsharded.Sharded || unsharded.Table != "accounts" {
+		t.Fatalf("unsharded prepared plan = %#v", unsharded)
+	}
+
+	registry := schema.New(map[string][]string{"accounts": {"tenant_id"}})
+	for _, value := range []string{"41", "42"} {
+		plan := prepared.Analyze([][]byte{[]byte(value)}, registry, burrows)
+		if !plan.Routed || plan.Target != BurrowForKey(value, burrows) {
+			t.Fatalf("prepared Analyze(%q) = %#v", value, plan)
+		}
+	}
+}
+
 func TestAnalyzeRejectsParserErrorsAndMultiStatementWrites(t *testing.T) {
 	registry := schema.New(map[string][]string{"accounts": {"tenant_id"}})
 	if _, err := Analyze("SELECT * FROM accounts WHERE (", nil, registry, []string{"burrow-01"}); err == nil {
@@ -252,5 +276,23 @@ func BenchmarkTargetForSchemaBoundPrimaryKey(b *testing.B) {
 	parameters := [][]byte{[]byte("42")}
 	for b.Loop() {
 		TargetForSchema("SELECT c FROM sbtest1 WHERE id=$1", parameters, registry, burrows)
+	}
+}
+
+func BenchmarkPreparedAnalyzeBoundPrimaryKey(b *testing.B) {
+	owners := make([]string, VirtualShards)
+	for vshard := range owners {
+		owners[vshard] = []string{"burrow-01", "burrow-02"}[vshard%2]
+	}
+	registry := schema.New(map[string][]string{"sbtest1": {"id"}}).WithVShards(owners)
+	burrows := []string{"burrow-01", "burrow-02"}
+	parameters := [][]byte{[]byte("42")}
+	prepared, err := Prepare("SELECT c FROM sbtest1 WHERE id=$1")
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		prepared.Analyze(parameters, registry, burrows)
 	}
 }

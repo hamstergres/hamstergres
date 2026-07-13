@@ -8,6 +8,8 @@ import (
 	"html/template"
 	"log/slog"
 	"net/http"
+	"net/http/pprof"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -56,12 +58,23 @@ func New(backends *backend.Manager, frontend *proxy.Server) *Server {
 	return &Server{collector: NewCollector(backends, frontend)}
 }
 
-func (s *Server) Handler() http.Handler {
+func (s *Server) Handler(profiling ...bool) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleHTML)
 	mux.HandleFunc("/api/v1/status", s.handleJSON)
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/metrics", s.handleMetrics)
+	if len(profiling) > 0 && profiling[0] {
+		runtime.SetBlockProfileRate(1)
+		runtime.SetMutexProfileFraction(1)
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	} else {
+		mux.HandleFunc("/debug/pprof/", http.NotFound)
+	}
 	return mux
 }
 

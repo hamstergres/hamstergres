@@ -20,6 +20,9 @@ func TestLoadAppliesDefaultStatusAddress(t *testing.T) {
 	if config.Status.Address != DefaultStatusAddress {
 		t.Fatalf("status address = %q, want %q", config.Status.Address, DefaultStatusAddress)
 	}
+	if config.BackendPoolMaxConnections() != DefaultBackendPoolMaxConnections {
+		t.Fatalf("backend pool maximum = %d, want %d", config.BackendPoolMaxConnections(), DefaultBackendPoolMaxConnections)
+	}
 	if config.Nest.RegistryKey != "/hamstergres/schema-registry/v3" {
 		t.Fatalf("registry key = %q", config.Nest.RegistryKey)
 	}
@@ -28,6 +31,21 @@ func TestLoadAppliesDefaultStatusAddress(t *testing.T) {
 	}
 	if config.Sharding.Unsharded.Mode != UnshardedPrimary || config.Sharding.Unsharded.PrimaryBurrow != "burrow-01" {
 		t.Fatalf("unsharded defaults = %#v", config.Sharding.Unsharded)
+	}
+}
+
+func TestLoadConfiguresBackendPoolCapacity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hamstergres.yaml")
+	contents := []byte("listen:\n  address: 127.0.0.1:6432\nsharding:\n  backend_pool:\n    max_connections: 32\n  physical_shards:\n    burrow-01:\n      dsn: postgres://example\n")
+	if err := os.WriteFile(path, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.BackendPoolMaxConnections(); got != 32 {
+		t.Fatalf("backend pool maximum = %d, want 32", got)
 	}
 }
 
@@ -43,6 +61,21 @@ func TestLoadValidatesUnshardedPolicy(t *testing.T) {
 	}
 	if cfg.Sharding.Unsharded.Mode != UnshardedReplicated {
 		t.Fatalf("mode = %q", cfg.Sharding.Unsharded.Mode)
+	}
+}
+
+func TestLoadEnablesStatusProfilingExplicitly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hamstergres.yaml")
+	contents := []byte("listen:\n  address: 127.0.0.1:6432\nstatus:\n  profiling: true\nsharding:\n  physical_shards:\n    burrow-01:\n      dsn: postgres://example\n")
+	if err := os.WriteFile(path, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Status.Profiling {
+		t.Fatal("status profiling was not enabled")
 	}
 }
 

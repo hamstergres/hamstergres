@@ -49,3 +49,18 @@ func TestRegistryPreservesQuotedIdentifierCase(t *testing.T) {
 		t.Fatalf("unquoted shard key = %#v, %v", unquoted, ok)
 	}
 }
+
+func TestVShardOwnerReadsOneValidatedEntry(t *testing.T) {
+	registry := New(nil).WithVShards([]string{"burrow-01", "burrow-02"})
+	if registry.VShardCount() != 2 {
+		t.Fatalf("VShardCount = %d, want 2", registry.VShardCount())
+	}
+	if owner, ok := registry.VShardOwner(1); !ok || owner != "burrow-02" {
+		t.Fatalf("VShardOwner(1) = %q, %v", owner, ok)
+	}
+	for _, invalid := range []int{-1, 2} {
+		if owner, ok := registry.VShardOwner(invalid); ok || owner != "" {
+			t.Fatalf("VShardOwner(%d) = %q, %v", invalid, owner, ok)
+		}
+	}
+}

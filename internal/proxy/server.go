@@ -175,7 +175,7 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 					state.failed = true
 					break
 				}
-				decision, err := s.routePortal(prepared.sql, placeholderRoutingParameters(prepared.sql), s.backends.ShardNames())
+				decision, err := s.routePortal(prepared.routing, placeholderRoutingParameters(prepared.routing.MaxParameter()), s.backends.ShardNames())
 				if err != nil {
 					s.sendExtendedError(frontend, "42601", err.Error())
 					state.failed = true
@@ -215,7 +215,7 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 					state.failed = true
 					break
 				}
-				decision, err := s.routePortal(statement.sql, parameters, s.backends.ShardNames())
+				decision, err := s.routePortal(statement.routing, parameters, s.backends.ShardNames())
 				if err != nil {
 					s.sendExtendedError(frontend, "42601", err.Error())
 					state.failed = true
@@ -410,6 +410,7 @@ type statementState struct {
 	schema      bool
 	backendName string
 	message     *pgproto3.Parse
+	routing     *router.Prepared
 }
 
 func prepareStatement(message *pgproto3.Parse, registry schema.Registry) (statementState, error) {
@@ -427,12 +428,20 @@ func prepareStatement(message *pgproto3.Parse, registry schema.Registry) (statem
 		if normalized.sql == message.Query {
 			prepared := *message
 			prepared.Name = canonicalStatementName(message.Query, message.ParameterOIDs)
-			return statementState{sql: message.Query, schema: normalized.schema, backendName: prepared.Name, message: &prepared}, nil
+			routing, err := router.Prepare(message.Query)
+			if err != nil {
+				return statementState{}, err
+			}
+			return statementState{sql: message.Query, schema: normalized.schema, backendName: prepared.Name, message: &prepared, routing: routing}, nil
 		}
 		prepared := *message
 		prepared.Query = normalized.sql
 		prepared.Name = canonicalStatementName(normalized.sql, prepared.ParameterOIDs)
-		return statementState{sql: normalized.sql, schema: normalized.schema, backendName: prepared.Name, message: &prepared}, nil
+		routing, err := router.Prepare(normalized.sql)
+		if err != nil {
+			return statementState{}, err
+		}
+		return statementState{sql: normalized.sql, schema: normalized.schema, backendName: prepared.Name, message: &prepared, routing: routing}, nil
 	}
 	oids := append([]uint32(nil), message.ParameterOIDs...)
 	for len(oids) < parameter {
@@ -442,7 +451,11 @@ func prepareStatement(message *pgproto3.Parse, registry schema.Registry) (statem
 	prepared.Query = rewritten.SQL
 	prepared.ParameterOIDs = oids
 	prepared.Name = canonicalStatementName(rewritten.SQL, oids)
-	return statementState{sql: rewritten.SQL, generated: true, schema: normalized.schema, backendName: prepared.Name, message: &prepared}, nil
+	routing, err := router.Prepare(rewritten.SQL)
+	if err != nil {
+		return statementState{}, err
+	}
+	return statementState{sql: rewritten.SQL, generated: true, schema: normalized.schema, backendName: prepared.Name, message: &prepared, routing: routing}, nil
 }
 
 func canonicalStatementName(sql string, oids []uint32) string {
@@ -463,7 +476,7 @@ type normalizedSQL struct {
 
 func normalizeDDL(sql string) (normalizedSQL, error) {
 	keyword := firstSQLKeyword(sql)
-	if keyword == "COMMENT" {
+	if keyword == "COMMENT" || keyword == "DROP" {
 		return normalizedSQL{sql: sql, schema: true}, nil
 	}
 	if keyword != "CREATE" && keyword != "ALTER" {
@@ -481,8 +494,8 @@ func maxParameter(sql string) int {
 	return maximum
 }
 
-func placeholderRoutingParameters(sql string) [][]byte {
-	parameters := make([][]byte, maxParameter(sql))
+func placeholderRoutingParameters(maximum int) [][]byte {
+	parameters := make([][]byte, maximum)
 	for index := range parameters {
 		parameters[index] = []byte("0")
 	}
@@ -521,7 +534,7 @@ func (s *Server) prepareBind(message *pgproto3.Bind, statement statementState) (
 
 func routingParameters(message *pgproto3.Bind, parameterOIDs []uint32) [][]byte {
 	parameters := cloneParameters(message.Parameters)
-	typeMap := pgtype.NewMap()
+	var typeMap *pgtype.Map
 	for index, value := range parameters {
 		format := int16(0)
 		if len(message.ParameterFormatCodes) == 1 {
@@ -531,6 +544,9 @@ func routingParameters(message *pgproto3.Bind, parameterOIDs []uint32) [][]byte 
 		}
 		if format != pgtype.BinaryFormatCode || index >= len(parameterOIDs) || parameterOIDs[index] == 0 || value == nil {
 			continue
+		}
+		if typeMap == nil {
+			typeMap = pgtype.NewMap()
 		}
 		var decoded string
 		if err := typeMap.Scan(parameterOIDs[index], format, value, &decoded); err == nil {
@@ -979,6 +995,9 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 		} else if pending.statement.backendName != "" {
 			s.backends.RecordOperation("prepared_statement_cache", "hit")
 		}
+		if invalidatesPreparedStatements(pending.portal.sql) {
+			s.backends.InvalidatePreparedStatements(pending.targets)
+		}
 		if bindComplete {
 			frontend.Send(&pgproto3.BindComplete{})
 		}
@@ -1165,6 +1184,9 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 		frontend.Send(&pgproto3.EmptyQueryResponse{})
 	}
 	success = true
+	if invalidatesPreparedStatements(portal.sql) {
+		s.backends.InvalidatePreparedStatements(targets)
+	}
 	if portal.schema {
 		state.schemaDirty = true
 	}
@@ -1572,6 +1594,9 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 		state.mutated = state.mutated || requiresRoutedWrite(sql)
 	}
 	updateTransactionState(state, sql)
+	if invalidatesPreparedStatements(sql) {
+		s.backends.InvalidatePreparedStatements(targets)
+	}
 	frontend.Send(&pgproto3.ReadyForQuery{TxStatus: state.txStatus()})
 	if !state.transaction {
 		session.UnlockWrites()
@@ -1715,46 +1740,59 @@ type routeDecision struct {
 }
 
 func (s *Server) routeSQL(sql string, burrows []string) (routeDecision, error) {
-	return s.route(sql, nil, burrows)
-}
-
-func (s *Server) routePortal(sql string, parameters [][]byte, burrows []string) (routeDecision, error) {
-	return s.route(sql, parameters, burrows)
-}
-
-func (s *Server) route(sql string, parameters [][]byte, burrows []string) (routeDecision, error) {
-	registry := s.backends.Schema()
-	plan, err := router.Analyze(sql, parameters, registry, burrows)
+	plan, err := router.Analyze(sql, nil, s.backends.Schema(), burrows)
 	if err != nil {
 		return routeDecision{}, err
 	}
+	return s.routePlan(plan, burrows), nil
+}
+
+func (s *Server) routePortal(prepared *router.Prepared, parameters [][]byte, burrows []string) (routeDecision, error) {
+	if prepared == nil {
+		// Preserve PostgreSQL's normal 26000 error for an unknown or closed
+		// statement by leaving it unrouted and letting the backend execute it.
+		return s.routePlan(router.Plan{}, burrows), nil
+	}
+	return s.routePlan(prepared.Analyze(parameters, s.backends.Schema(), burrows), burrows), nil
+}
+
+func (s *Server) routePlan(plan router.Plan, burrows []string) routeDecision {
 	decision := routeDecision{target: plan.Target, routed: plan.Routed, keyedWrite: plan.Write && (plan.Table == "" || plan.Sharded)}
 	if plan.Routed || plan.Table == "" || plan.Sharded {
-		return decision, nil
+		return decision
 	}
 	if s.backends.UnshardedMode() == "primary" {
 		decision.target, decision.routed = s.backends.PrimaryBurrow(), true
-		return decision, nil
+		return decision
 	}
 	if plan.Write {
-		return decision, nil
+		return decision
 	}
 	if len(burrows) == 0 {
-		return decision, nil
+		return decision
 	}
 	var value [8]byte
 	if _, err := rand.Read(value[:]); err != nil {
 		decision.target, decision.routed = burrows[0], true
-		return decision, nil
+		return decision
 	}
 	decision.target = burrows[binary.LittleEndian.Uint64(value[:])%uint64(len(burrows))]
 	decision.routed = true
-	return decision, nil
+	return decision
 }
 
 func requiresRoutedWrite(sql string) bool {
 	switch firstSQLKeyword(sql) {
 	case "INSERT", "UPDATE", "DELETE", "MERGE":
+		return true
+	default:
+		return false
+	}
+}
+
+func invalidatesPreparedStatements(sql string) bool {
+	switch firstSQLKeyword(sql) {
+	case "DEALLOCATE", "DISCARD":
 		return true
 	default:
 		return false
@@ -1932,6 +1970,9 @@ func (s *Server) handleQuery(frontend *pgproto3.Backend, sql string) {
 			s.sendError(frontend, "55000", fmt.Sprintf("refresh schema registry after DDL: %v", err))
 			return
 		}
+	}
+	if invalidatesPreparedStatements(sql) {
+		s.backends.InvalidatePreparedStatements(targets)
 	}
 	if len(result.Fields) > 0 {
 		frontend.Send(&pgproto3.RowDescription{Fields: result.Fields})

@@ -12,8 +12,9 @@ import (
 )
 
 const (
-	maxEventAge       = 10 * time.Minute
+	rollingBuckets    = 10 * 60
 	maxQuerySummaries = 100
+	maxSummaryLabels  = 100
 )
 
 var windows = []Window{
@@ -45,10 +46,10 @@ type QueryEvent struct {
 	ErrorCategory string
 }
 
-type event struct {
-	at time.Time
-	QueryEvent
-	summary string
+type timeBucket struct {
+	second     int64
+	statistics Statistics
+	shards     map[string]int64
 }
 
 // Statistics contains aggregate counts and duration information.
@@ -128,17 +129,25 @@ type summary struct {
 	lastSeenAt time.Time
 }
 
-// Collector keeps ten minutes of individual events plus a bounded set of
+type operationKey struct {
+	operation string
+	outcome   string
+}
+
+// Collector keeps ten minutes of one-second aggregates plus a bounded set of
 // process-lifetime query shapes. It has no external dependency or persistence.
 type Collector struct {
 	mu         sync.Mutex
 	now        func() time.Time
-	events     []event
+	buckets    []timeBucket
 	total      Statistics
 	shards     map[string]int64
 	summaries  map[string]*summary
+	labels     map[string]string
+	labelOrder []string
+	labelNext  int
 	latency    Histogram
-	operations map[string]int64
+	operations map[operationKey]int64
 	failures   map[string]int64
 }
 
@@ -151,26 +160,25 @@ func newCollector(now func() time.Time) *Collector {
 	for i, upper := range LatencyBuckets {
 		buckets[i].UpperBound = upper
 	}
-	return &Collector{now: now, shards: make(map[string]int64), summaries: make(map[string]*summary), latency: Histogram{Buckets: buckets}, operations: make(map[string]int64), failures: make(map[string]int64)}
+	return &Collector{now: now, buckets: make([]timeBucket, rollingBuckets), shards: make(map[string]int64), summaries: make(map[string]*summary), labels: make(map[string]string), latency: Histogram{Buckets: buckets}, operations: make(map[operationKey]int64), failures: make(map[string]int64)}
 }
 
 // RecordOperation records a bounded operational event. Callers must use stable
 // operation and outcome constants; dynamic errors and identifiers belong in logs.
 func (c *Collector) RecordOperation(operation, outcome string) {
 	c.mu.Lock()
-	c.operations[operation+"\x00"+outcome]++
+	c.operations[operationKey{operation: operation, outcome: outcome}]++
 	c.mu.Unlock()
 }
 
 func (c *Collector) Record(query QueryEvent) {
 	now := c.now().UTC()
-	summaryLabel := Normalize(query.SQL)
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	summaryLabel := c.summaryLabel(query.SQL)
 
-	c.events = append(c.events, event{at: now, QueryEvent: copyEvent(query), summary: summaryLabel})
-	c.events = discardExpired(c.events, now.Add(-maxEventAge))
 	add(&c.total, query)
+	c.recordWindow(now.Unix(), query)
 	if !query.Success {
 		category := query.ErrorCategory
 		if category == "" {
@@ -189,6 +197,44 @@ func (c *Collector) Record(query QueryEvent) {
 		c.shards[shard]++
 	}
 	c.recordSummary(summaryLabel, now, query)
+}
+
+func (c *Collector) summaryLabel(sql string) string {
+	if label, ok := c.labels[sql]; ok {
+		return label
+	}
+	label := Normalize(sql)
+	if len(c.labels) < maxSummaryLabels {
+		c.labels[sql] = label
+		c.labelOrder = append(c.labelOrder, sql)
+	} else if maxSummaryLabels > 0 {
+		delete(c.labels, c.labelOrder[c.labelNext])
+		c.labels[sql] = label
+		c.labelOrder[c.labelNext] = sql
+		c.labelNext = (c.labelNext + 1) % maxSummaryLabels
+	}
+	return label
+}
+
+func (c *Collector) recordWindow(second int64, query QueryEvent) {
+	index := int(second % int64(len(c.buckets)))
+	if index < 0 {
+		index += len(c.buckets)
+	}
+	bucket := &c.buckets[index]
+	if bucket.second != second {
+		bucket.second = second
+		bucket.statistics = Statistics{}
+		if bucket.shards == nil {
+			bucket.shards = make(map[string]int64)
+		} else {
+			clear(bucket.shards)
+		}
+	}
+	add(&bucket.statistics, query)
+	for _, shard := range query.Shards {
+		bucket.shards[shard]++
+	}
 }
 
 func (c *Collector) recordSummary(label string, now time.Time, query QueryEvent) {
@@ -222,12 +268,10 @@ func (c *Collector) Snapshot() Snapshot {
 	now := c.now().UTC()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.events = discardExpired(c.events, now.Add(-maxEventAge))
 
 	snapshot := Snapshot{Total: finalize(c.total), ShardExecutions: sortedShardCounts(c.shards), Latency: copyHistogram(c.latency)}
 	for key, count := range c.operations {
-		parts := strings.SplitN(key, "\x00", 2)
-		snapshot.Operations = append(snapshot.Operations, OperationCount{Operation: parts[0], Outcome: parts[1], Count: count})
+		snapshot.Operations = append(snapshot.Operations, OperationCount{Operation: key.operation, Outcome: key.outcome, Count: count})
 	}
 	for category, count := range c.failures {
 		snapshot.Failures = append(snapshot.Failures, FailureCount{Category: category, Count: count})
@@ -240,7 +284,7 @@ func (c *Collector) Snapshot() Snapshot {
 		return snapshot.Operations[i].Operation < snapshot.Operations[j].Operation
 	})
 	for _, window := range windows {
-		statistics, shards := summarize(c.events, now.Add(-window.Duration))
+		statistics, shards := summarizeBuckets(c.buckets, now.Unix(), window.Duration)
 		snapshot.Windows = append(snapshot.Windows, WindowStatistics{
 			Name: window.Name, Seconds: int64(window.Duration.Seconds()), Statistics: finalize(statistics), ShardExecutions: sortedShardCounts(shards),
 		})
@@ -273,16 +317,21 @@ func Fingerprint(normalizedQuery string) string {
 	return hex.EncodeToString(digest[:8])
 }
 
-func summarize(events []event, cutoff time.Time) (Statistics, map[string]int64) {
+func summarizeBuckets(buckets []timeBucket, now int64, window time.Duration) (Statistics, map[string]int64) {
 	statistics := Statistics{}
 	shards := make(map[string]int64)
-	for _, event := range events {
-		if event.at.Before(cutoff) {
+	cutoff := now - int64(window/time.Second) + 1
+	for _, bucket := range buckets {
+		if bucket.second < cutoff || bucket.second > now {
 			continue
 		}
-		add(&statistics, event.QueryEvent)
-		for _, shard := range event.Shards {
-			shards[shard]++
+		statistics.Queries += bucket.statistics.Queries
+		statistics.FailedQueries += bucket.statistics.FailedQueries
+		statistics.ScatteredQueries += bucket.statistics.ScatteredQueries
+		statistics.SingleShardQueries += bucket.statistics.SingleShardQueries
+		statistics.TotalDurationMillis += bucket.statistics.TotalDurationMillis
+		for shard, queries := range bucket.shards {
+			shards[shard] += queries
 		}
 	}
 	return statistics, shards
@@ -315,19 +364,6 @@ func sortedShardCounts(counts map[string]int64) []ShardCount {
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
 	return result
-}
-
-func discardExpired(events []event, cutoff time.Time) []event {
-	first := 0
-	for first < len(events) && events[first].at.Before(cutoff) {
-		first++
-	}
-	return events[first:]
-}
-
-func copyEvent(query QueryEvent) QueryEvent {
-	query.Shards = append([]string(nil), query.Shards...)
-	return query
 }
 
 // Normalize returns a safe, bounded label for grouping similar simple queries.

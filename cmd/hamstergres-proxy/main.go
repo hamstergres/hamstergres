@@ -78,7 +78,7 @@ func serveCommand(args []string) {
 
 	frontend := proxy.New(backends, slog.Default(), cfg.TwoPhaseCommitEnabled())
 	statusServer := status.New(backends, frontend)
-	httpServer := &http.Server{Addr: cfg.Status.Address, Handler: statusServer.Handler(), ReadHeaderTimeout: 5 * time.Second}
+	httpServer := &http.Server{Addr: cfg.Status.Address, Handler: statusServer.Handler(cfg.Status.Profiling), ReadHeaderTimeout: 5 * time.Second}
 	listener, err := net.Listen("tcp", cfg.Listen.Address)
 	if err != nil {
 		slog.Error("listen for PostgreSQL clients", "event", "frontend_listen_failed", "error_category", "network", "address", cfg.Listen.Address, "error", err)

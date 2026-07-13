@@ -17,11 +17,37 @@ func TestRoutingParametersDecodeBinaryIntegers(t *testing.T) {
 	}
 }
 
+func BenchmarkRoutingParametersTextBigint(b *testing.B) {
+	message := &pgproto3.Bind{Parameters: [][]byte{[]byte("42")}}
+	for b.Loop() {
+		routingParameters(message, []uint32{20})
+	}
+}
+
+func BenchmarkRoutingParametersBinaryBigint(b *testing.B) {
+	bigint := make([]byte, 8)
+	binary.BigEndian.PutUint64(bigint, 42)
+	message := &pgproto3.Bind{ParameterFormatCodes: []int16{1}, Parameters: [][]byte{bigint}}
+	for b.Loop() {
+		routingParameters(message, []uint32{20})
+	}
+}
+
 func TestCanonicalStatementNameDeduplicatesEquivalentParses(t *testing.T) {
 	first := canonicalStatementName("SELECT $1::int8", []uint32{20})
 	second := canonicalStatementName("SELECT $1::int8", []uint32{20})
 	if first != second || first == canonicalStatementName("SELECT $1::int8", []uint32{23}) {
 		t.Fatalf("canonical names were not stable and type-sensitive: %q %q", first, second)
+	}
+}
+
+func TestNormalizeDDLMarksDropAsSchemaChange(t *testing.T) {
+	got, err := normalizeDDL("DROP TABLE accounts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.sql != "DROP TABLE accounts" || !got.schema {
+		t.Fatalf("normalized DROP = %#v, want unchanged schema DDL", got)
 	}
 }
 
@@ -84,6 +110,17 @@ func TestRequiresGlobalWriteOrderLeavesReadsAndTransactionsUnlocked(t *testing.T
 	}
 }
 
+func TestPreparedCacheInvalidationCommands(t *testing.T) {
+	for _, sql := range []string{"DEALLOCATE ALL", "discard all"} {
+		if !invalidatesPreparedStatements(sql) {
+			t.Fatalf("invalidatesPreparedStatements(%q) = false", sql)
+		}
+	}
+	if invalidatesPreparedStatements("SELECT 1") {
+		t.Fatal("ordinary query invalidated prepared statements")
+	}
+}
+
 func TestTransactionStatePinsAndClearsTarget(t *testing.T) {
 	state := extendedState{}
 	updateTransactionState(&state, "BEGIN")
@@ -108,6 +145,9 @@ func TestPrepareStatementAddsHiddenGeneratedParameter(t *testing.T) {
 	}
 	if len(prepared.message.ParameterOIDs) != 2 || prepared.message.ParameterOIDs[1] != 0 {
 		t.Fatalf("parameter OIDs = %#v, want client parameter plus inferred generated parameter", prepared.message.ParameterOIDs)
+	}
+	if prepared.routing == nil || prepared.routing.MaxParameter() != 2 {
+		t.Fatal("prepared statement did not retain its rewritten routing AST")
 	}
 }
 
