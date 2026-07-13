@@ -101,12 +101,45 @@ Hamstergres Proxy supports the PostgreSQL streaming COPY protocol for `COPY
 FROM STDIN` and `COPY TO STDOUT`. For an unsharded table in `primary` mode,
 COPY uses only the configured primary Burrow; the table definition still exists
 on every Burrow because DDL remains fleet-wide. In `replicated` mode, COPY input
-is sent once to every Burrow and COPY output uses one read Burrow. Sharded COPY
-input retains the temporary fleet broadcast contract until row-level shard-key
-routing in issue #28 replaces it; sharded COPY output is appended in configured
-Burrow order. Format metadata must agree across participating Burrows, and
-`COPY BOTH` remains unsupported. COPY inside a multi-Burrow transaction joins
-the same two-phase commit.
+is sent once to every Burrow and COPY output uses one read Burrow.
+
+Sharded `COPY FROM STDIN` is planned from PostgreSQL's COPY AST and the
+Nest-validated schema registry before any Burrow enters COPY mode. The command
+must name the relation and an explicit column list containing every annotated
+shard-key component. Each completed row is decoded, its typed compound key is
+canonicalized through the ordinary router, and the row is sent exactly once to
+the vshard owner. Quoted identifiers retain catalog case. A generated shard key
+must be supplied explicitly with a fleet-wide value; the Proxy never consumes
+Burrow-local sequences during COPY. Missing, duplicate, NULL, unsupported, or
+undecodable key shapes fail closed.
+
+Text and CSV input support delimiter, NULL marker, header, quote, escape, and
+UTF8 encoding options. CSV headers are copied to every participant because each
+backend validates its own stream. Binary input supports integer, OID,
+floating-point, boolean, UUID, and text-family shard keys; binary numeric and
+other equality representations that the router cannot canonicalize are
+rejected before streaming. Options whose row semantics are not implemented,
+including `FORCE_NULL`, `FORCE_NOT_NULL`, and error-skipping modes, are rejected
+for sharded input. `COPY BOTH` remains unsupported.
+
+The input router buffers only an incomplete row, caps it at 16 MiB, and flushes
+each frontend frame's per-Burrow batches synchronously so backend pressure
+propagates to the client. A routing or cancellation failure sends `CopyFail` to
+every participant, drains their responses, and returns the frontend to a known
+ready state; inside a transaction the state is failed and the client must roll
+back. COPY in an explicit multi-Burrow write transaction joins the normal
+two-phase commit path. Outside an explicit transaction, each Burrow's COPY
+statement is atomic, but a transport failure while final completions are being
+collected can still leave an earlier Burrow committed; the error is reported
+and operators must reconcile that documented partial-failure case.
+
+Sharded `COPY TO STDOUT` streams Burrows in configured order without buffering
+the complete export. CSV headers from later Burrows and redundant binary stream
+envelopes are removed, yielding one valid frontend stream. The merged command
+tag sums physical row counts for sharded data and reports one logical count for
+replicated input. COPY output does not promise global row ordering; applications
+that require it must use an explicitly ordered query-based alternative. Format
+metadata must agree across all participants.
 
 ## Schema registry contract
 

@@ -593,6 +593,30 @@ func (s *Session) ReceiveUntilFrom(ctx context.Context, name string, done func(p
 	return [][]pgproto3.BackendMessage{response}, nil
 }
 
+// ReceiveEachFrom streams one Burrow response through handle until done. The
+// callback must consume the flyweight message before returning. COPY TO uses
+// this path so large exports are forwarded with frontend backpressure instead
+// of being retained in a response slice.
+func (s *Session) ReceiveEachFrom(ctx context.Context, name string, done func(pgproto3.BackendMessage) bool, handle func(pgproto3.BackendMessage) error) error {
+	ctx = s.receiveContext(ctx)
+	shard := s.shardByName(name)
+	if shard == nil {
+		return fmt.Errorf("unknown Burrow %s", name)
+	}
+	for {
+		message, err := shard.conn.ReceiveMessage(ctx)
+		if err != nil {
+			return fmt.Errorf("receive from Burrow %s: %w", name, err)
+		}
+		if err := handle(message); err != nil {
+			return err
+		}
+		if done(message) {
+			return nil
+		}
+	}
+}
+
 func (s *Session) receiveContext(fallback context.Context) context.Context {
 	if s.ctx != nil {
 		return s.ctx

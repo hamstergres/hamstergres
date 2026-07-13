@@ -152,15 +152,35 @@ func (p *Prepared) Analyze(parameters [][]byte, registry schema.Registry, burrow
 		return plan
 	}
 
-	key := strings.Join(values, "\x00")
+	plan.Target, plan.Routed = TargetForShardKey(values, types, registry, burrows)
+	return plan
+}
+
+// TargetForShardKey canonicalizes a complete shard-key tuple exactly as SQL
+// routing does and resolves its vshard owner. COPY uses this entry point after
+// decoding text, CSV, or binary fields from one input row.
+func TargetForShardKey(values, types []string, registry schema.Registry, burrows []string) (string, bool) {
+	if len(values) == 0 || len(types) != 0 && len(values) != len(types) || len(burrows) == 0 {
+		return "", false
+	}
+	canonical := make([]string, len(values))
+	for index, value := range values {
+		dataType := ""
+		if len(types) == len(values) {
+			dataType = types[index]
+		}
+		var ok bool
+		canonical[index], ok = canonicalScalar(value, dataType)
+		if !ok {
+			return "", false
+		}
+	}
+	key := strings.Join(canonical, "\x00")
 	vshard := int(HashKey(key) % VirtualShards)
 	if registry.VShardCount() == VirtualShards {
-		plan.Target, _ = registry.VShardOwner(vshard)
-	} else {
-		plan.Target = BurrowForKey(key, burrows)
+		return registry.VShardOwner(vshard)
 	}
-	plan.Routed = true
-	return plan
+	return BurrowForKey(key, burrows), true
 }
 
 // Analyze parses exactly one PostgreSQL statement and derives its routing plan.

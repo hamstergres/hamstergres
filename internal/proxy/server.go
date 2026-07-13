@@ -26,6 +26,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/jruszo/hamstergres/internal/backend"
+	"github.com/jruszo/hamstergres/internal/copyrouter"
 	"github.com/jruszo/hamstergres/internal/ddl"
 	"github.com/jruszo/hamstergres/internal/router"
 	"github.com/jruszo/hamstergres/internal/schema"
@@ -352,19 +353,28 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 				state.failed = true
 			}
 		case *pgproto3.CopyData:
-			if !state.copyIn || session == nil {
+			if state.copyAborted {
+				// The frontend may already have queued more CopyData before it
+				// observes the Proxy's asynchronous COPY error. The Burrows have
+				// been drained, so discard input through CopyDone or CopyFail.
+			} else if !state.copyIn || session == nil {
 				s.sendExtendedError(frontend, "08P01", "CopyData received outside COPY FROM STDIN")
 				state.failed = true
-			} else if err := session.SendCopyTo(state.copyTargets, message); err != nil {
-				s.sendExtendedError(frontend, "08006", err.Error())
-				state.failed = true
+			} else if !s.handleCopyData(frontend, session, message, &state) {
+				// COPY is initiated by a simple Query message. Error paths emit
+				// ReadyForQuery after draining CopyFail, so the next simple query
+				// starts a fresh protocol cycle without waiting for Sync.
+				state.failed = false
 			}
 		case *pgproto3.CopyDone, *pgproto3.CopyFail:
-			if !state.copyIn || session == nil {
+			if state.copyAborted {
+				state.copyAborted = false
+				state.failed = false
+			} else if !state.copyIn || session == nil {
 				s.sendExtendedError(frontend, "08P01", "COPY completion received outside COPY FROM STDIN")
 				state.failed = true
 			} else if !s.handleCopyCompletion(frontend, session, message, &state) {
-				state.failed = true
+				state.failed = false
 			}
 		case *pgproto3.Terminate:
 			return nil
@@ -383,20 +393,25 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 }
 
 type extendedState struct {
-	statements      map[string]statementState
-	portals         map[string]portalState
-	failed          bool
-	transaction     bool
-	mutated         bool
-	target          string
-	schemaDirty     bool
-	copyIn          bool
-	copyTargets     []string
-	copyTraceSpan   trace.Span
-	copyTunnelSpans []trace.Span
-	participants    map[string]struct{}
-	pending         *pendingExtended
-	syncConsumed    bool
+	statements        map[string]statementState
+	portals           map[string]portalState
+	failed            bool
+	transaction       bool
+	transactionFailed bool
+	mutated           bool
+	target            string
+	schemaDirty       bool
+	copyIn            bool
+	copyTargets       []string
+	copyPlan          copyrouter.Plan
+	copyStream        *copyrouter.Stream
+	copyReplicated    bool
+	copyAborted       bool
+	copyTraceSpan     trace.Span
+	copyTunnelSpans   []trace.Span
+	participants      map[string]struct{}
+	pending           *pendingExtended
+	syncConsumed      bool
 }
 
 func cloneFrontendMessage(message pgproto3.FrontendMessage) pgproto3.FrontendMessage {
@@ -621,6 +636,9 @@ func routingParameters(message *pgproto3.Bind, parameterOIDs []uint32) [][]byte 
 }
 
 func (s extendedState) txStatus() byte {
+	if s.transaction && s.transactionFailed {
+		return 'E'
+	}
 	if s.transaction {
 		return 'T'
 	}
@@ -746,10 +764,23 @@ func (s *Server) handleClose(frontend *pgproto3.Backend, session *backend.Sessio
 func (s *Server) handleCopyQuery(frontend *pgproto3.Backend, session *backend.Session, sql string, state *extendedState) bool {
 	success := false
 	retained := false
+	copyPlan, err := copyrouter.Parse(sql, s.backends.Schema())
+	if err != nil {
+		s.sendSessionError(frontend, state.txStatus(), "0A000", err.Error())
+		return false
+	}
 	targets, err := s.copyTargets(sql)
 	if err != nil {
-		s.sendExtendedError(frontend, "42601", err.Error())
+		s.sendSessionError(frontend, state.txStatus(), "42601", err.Error())
 		return false
+	}
+	var copyStream *copyrouter.Stream
+	if copyPlan.From && copyPlan.Sharded {
+		copyStream, err = copyrouter.NewStream(copyPlan, s.backends.Schema(), s.backends.ShardNames())
+		if err != nil {
+			s.sendSessionError(frontend, state.txStatus(), "0A000", err.Error())
+			return false
+		}
 	}
 	route := "scatter"
 	if len(targets) == 1 {
@@ -778,22 +809,24 @@ func (s *Server) handleCopyQuery(frontend *pgproto3.Backend, session *backend.Se
 	}()
 	responses, err := exchange(session, targets, &pgproto3.Query{String: sql}, isCopyStarted)
 	if err != nil {
-		s.sendExtendedError(frontend, "08006", err.Error())
+		state.transactionFailed = state.transaction
+		s.sendSessionError(frontend, state.txStatus(), "08006", err.Error())
 		return false
 	}
 	if response := firstError(responses); response != nil {
+		state.transactionFailed = state.transaction
 		frontend.Send(response)
 		frontend.Send(&pgproto3.ReadyForQuery{TxStatus: state.txStatus()})
 		return false
 	}
 	if len(responses) == 0 || len(responses[0]) == 0 {
-		s.sendExtendedError(frontend, "XX000", "no Burrow COPY response")
+		s.sendSessionError(frontend, state.txStatus(), "XX000", "no Burrow COPY response")
 		return false
 	}
 	first := responses[0][len(responses[0])-1]
 	for _, response := range responses[1:] {
 		if len(response) == 0 || reflect.TypeOf(response[len(response)-1]) != reflect.TypeOf(first) {
-			s.sendExtendedError(frontend, "XX000", "incompatible COPY responses from Burrows")
+			s.sendSessionError(frontend, state.txStatus(), "XX000", "incompatible COPY responses from Burrows")
 			return false
 		}
 	}
@@ -801,15 +834,22 @@ func (s *Server) handleCopyQuery(frontend *pgproto3.Backend, session *backend.Se
 	case *pgproto3.CopyInResponse:
 		frontend.Send(response)
 		state.copyIn = true
+		state.copyAborted = false
 		state.copyTargets = append(state.copyTargets[:0], targets...)
+		state.copyPlan = copyPlan
+		state.copyStream = copyStream
+		state.copyReplicated = copyPlan.From && !copyPlan.Sharded && len(targets) > 1
 		s.markParticipants(state, targets)
+		if state.transaction {
+			state.mutated = true
+		}
 		success = true
 		retained = true
 		return true
 	case *pgproto3.CopyOutResponse:
 		frontend.Send(response)
 		s.markParticipants(state, targets)
-		success = s.handleCopyOut(frontend, session, targets, state)
+		success = s.handleCopyOut(frontend, session, targets, copyPlan, state)
 		return success
 	case *pgproto3.CopyBothResponse:
 		s.sendExtendedError(frontend, "0A000", "COPY BOTH is not supported by Hamstergres Proxy")
@@ -818,6 +858,63 @@ func (s *Server) handleCopyQuery(frontend *pgproto3.Backend, session *backend.Se
 		s.sendExtendedError(frontend, "08P01", fmt.Sprintf("unexpected COPY response %T", first))
 		return false
 	}
+}
+
+func (s *Server) handleCopyData(frontend *pgproto3.Backend, session *backend.Session, message *pgproto3.CopyData, state *extendedState) bool {
+	if state.copyStream == nil {
+		if err := session.SendCopyTo(state.copyTargets, message); err != nil {
+			s.abortCopy(frontend, session, state, "08006", err)
+			return false
+		}
+		return true
+	}
+	chunks, err := state.copyStream.Write(message.Data)
+	if err != nil {
+		s.abortCopy(frontend, session, state, "22023", err)
+		return false
+	}
+	if err := sendCopyChunks(session, state.copyTargets, chunks); err != nil {
+		s.abortCopy(frontend, session, state, "08006", err)
+		return false
+	}
+	return true
+}
+
+func sendCopyChunks(session *backend.Session, targets []string, chunks []copyrouter.Chunk) error {
+	byTarget := make(map[string][]byte, len(targets))
+	for _, chunk := range chunks {
+		if chunk.Target == "" {
+			for _, target := range targets {
+				byTarget[target] = append(byTarget[target], chunk.Data...)
+			}
+			continue
+		}
+		byTarget[chunk.Target] = append(byTarget[chunk.Target], chunk.Data...)
+	}
+	for _, target := range targets {
+		if len(byTarget[target]) == 0 {
+			continue
+		}
+		if err := session.SendCopyTo([]string{target}, &pgproto3.CopyData{Data: byTarget[target]}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) abortCopy(frontend *pgproto3.Backend, session *backend.Session, state *extendedState, code string, cause error) {
+	targets := append([]string(nil), state.copyTargets...)
+	_ = session.SendCopyTo(targets, &pgproto3.CopyFail{Message: cause.Error()})
+	_, _ = session.ReceiveUntilFromMany(context.Background(), targets, isQueryDone)
+	state.copyIn = false
+	state.copyTargets = nil
+	state.copyStream = nil
+	state.copyReplicated = false
+	state.copyAborted = true
+	state.transactionFailed = state.transaction
+	finishCopyTrace(state, cause)
+	frontend.Send(&pgproto3.ErrorResponse{Severity: "ERROR", Code: code, Message: cause.Error()})
+	frontend.Send(&pgproto3.ReadyForQuery{TxStatus: state.txStatus()})
 }
 
 func (s *Server) copyTargets(sql string) ([]string, error) {
@@ -841,28 +938,54 @@ func (s *Server) markParticipants(state *extendedState, targets []string) {
 	}
 }
 
-func (s *Server) handleCopyOut(frontend *pgproto3.Backend, session *backend.Session, targets []string, state *extendedState) bool {
-	responses, err := session.ReceiveUntilFromMany(context.Background(), targets, isQueryDone)
-	if err != nil {
-		s.sendExtendedError(frontend, "08006", err.Error())
-		return false
-	}
-	if response := firstError(responses); response != nil {
-		frontend.Send(response)
-		frontend.Send(&pgproto3.ReadyForQuery{TxStatus: state.txStatus()})
-		return false
-	}
+func (s *Server) handleCopyOut(frontend *pgproto3.Backend, session *backend.Session, targets []string, plan copyrouter.Plan, state *extendedState) bool {
 	var tags []string
-	for _, response := range responses {
-		for _, message := range response {
+	for index, target := range targets {
+		output := copyrouter.NewOutputStream(plan, index, len(targets))
+		var backendError *pgproto3.ErrorResponse
+		err := session.ReceiveEachFrom(context.Background(), target, isQueryDone, func(message pgproto3.BackendMessage) error {
 			switch message := message.(type) {
 			case *pgproto3.CopyData:
-				frontend.Send(message)
+				parts, err := output.Write(message.Data)
+				if err != nil {
+					return err
+				}
+				for _, data := range parts {
+					frontend.Send(&pgproto3.CopyData{Data: data})
+					if err := frontend.Flush(); err != nil {
+						return err
+					}
+				}
 			case *pgproto3.CommandComplete:
 				tags = append(tags, string(message.CommandTag))
+			case *pgproto3.ErrorResponse:
+				copy := *message
+				backendError = &copy
 			case *pgproto3.CopyDone, *pgproto3.ReadyForQuery, *pgproto3.NoticeResponse:
 			default:
-				s.sendExtendedError(frontend, "08P01", fmt.Sprintf("unexpected COPY TO response %T", message))
+				return fmt.Errorf("unexpected COPY TO response %T", message)
+			}
+			return nil
+		})
+		if err != nil {
+			state.transactionFailed = state.transaction
+			s.sendSessionError(frontend, state.txStatus(), "08006", err.Error())
+			return false
+		}
+		if backendError != nil {
+			state.transactionFailed = state.transaction
+			frontend.Send(backendError)
+			frontend.Send(&pgproto3.ReadyForQuery{TxStatus: state.txStatus()})
+			return false
+		}
+		parts, err := output.Finish()
+		if err != nil {
+			s.sendSessionError(frontend, state.txStatus(), "08P01", err.Error())
+			return false
+		}
+		for _, data := range parts {
+			frontend.Send(&pgproto3.CopyData{Data: data})
+			if err := frontend.Flush(); err != nil {
 				return false
 			}
 		}
@@ -884,19 +1007,43 @@ func (s *Server) handleCopyCompletion(frontend *pgproto3.Backend, session *backe
 		}
 		finishCopyTrace(state, err)
 	}()
-	state.copyIn = false
 	targets := append([]string(nil), state.copyTargets...)
+	stream := state.copyStream
+	sharded := state.copyPlan.Sharded
+	replicated := state.copyReplicated
+	if _, failed := message.(*pgproto3.CopyFail); failed {
+		state.transactionFailed = state.transaction
+	}
+	if _, done := message.(*pgproto3.CopyDone); done && stream != nil {
+		chunks, err := stream.Finish()
+		if err != nil {
+			s.abortCopy(frontend, session, state, "22023", err)
+			state.copyAborted = false
+			return false
+		}
+		if err := sendCopyChunks(session, targets, chunks); err != nil {
+			s.abortCopy(frontend, session, state, "08006", err)
+			state.copyAborted = false
+			return false
+		}
+	}
+	state.copyIn = false
 	state.copyTargets = nil
+	state.copyStream = nil
+	state.copyReplicated = false
 	if err := session.SendCopyTo(targets, message); err != nil {
-		s.sendExtendedError(frontend, "08006", err.Error())
+		state.transactionFailed = state.transaction
+		s.sendSessionError(frontend, state.txStatus(), "08006", err.Error())
 		return false
 	}
 	responses, err := session.ReceiveUntilFromMany(context.Background(), targets, isQueryDone)
 	if err != nil {
-		s.sendExtendedError(frontend, "08006", err.Error())
+		state.transactionFailed = state.transaction
+		s.sendSessionError(frontend, state.txStatus(), "08006", err.Error())
 		return false
 	}
 	if response := firstError(responses); response != nil {
+		state.transactionFailed = state.transaction
 		frontend.Send(response)
 		frontend.Send(&pgproto3.ReadyForQuery{TxStatus: state.txStatus()})
 		return false
@@ -910,11 +1057,42 @@ func (s *Server) handleCopyCompletion(frontend *pgproto3.Backend, session *backe
 		}
 	}
 	if len(tags) > 0 {
-		frontend.Send(&pgproto3.CommandComplete{CommandTag: []byte(mergedCommandTag(tags, 0))})
+		rows := int64(-1)
+		if stream != nil {
+			rows = stream.Rows()
+		}
+		tag, err := mergedCopyFromTag(tags, sharded, replicated, rows)
+		if err != nil {
+			s.sendSessionError(frontend, state.txStatus(), "XX000", err.Error())
+			return false
+		}
+		frontend.Send(&pgproto3.CommandComplete{CommandTag: []byte(tag)})
 	}
 	frontend.Send(&pgproto3.ReadyForQuery{TxStatus: state.txStatus()})
 	success = true
 	return true
+}
+
+func mergedCopyFromTag(tags []string, sharded, replicated bool, expectedRows int64) (string, error) {
+	if len(tags) == 0 {
+		return "", fmt.Errorf("no Burrow COPY completion tag")
+	}
+	if replicated {
+		for _, tag := range tags[1:] {
+			if tag != tags[0] {
+				return "", fmt.Errorf("replicated COPY row counts differ across Burrows: %s", strings.Join(tags, ", "))
+			}
+		}
+		return tags[0], nil
+	}
+	tag := mergedCommandTag(tags, 0)
+	if sharded && expectedRows >= 0 {
+		expected := fmt.Sprintf("COPY %d", expectedRows)
+		if tag != expected {
+			return "", fmt.Errorf("sharded COPY row count is %q, expected %q", tag, expected)
+		}
+	}
+	return tag, nil
 }
 
 func finishCopyTrace(state *extendedState, err error) {
@@ -1532,7 +1710,7 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 		frontend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 		return true
 	}
-	if state.transaction && state.mutated && s.twoPhaseCommit && (firstSQLKeyword(sql) == "COMMIT" || firstSQLKeyword(sql) == "END") && len(state.participants) > 1 {
+	if state.transaction && !state.transactionFailed && state.mutated && s.twoPhaseCommit && (firstSQLKeyword(sql) == "COMMIT" || firstSQLKeyword(sql) == "END") && len(state.participants) > 1 {
 		return s.handleTwoPhaseCommit(frontend, session, state)
 	}
 	normalized, err := normalizeDDL(sql)
@@ -1891,11 +2069,13 @@ func updateTransactionState(state *extendedState, sql string) {
 	switch firstSQLKeyword(sql) {
 	case "BEGIN", "START":
 		state.transaction = true
+		state.transactionFailed = false
 		state.target = ""
 		state.mutated = false
 		clear(state.participants)
 	case "COMMIT", "END", "ROLLBACK", "ABORT":
 		state.transaction = false
+		state.transactionFailed = false
 		state.target = ""
 		state.mutated = false
 		clear(state.participants)
