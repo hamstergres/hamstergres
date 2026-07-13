@@ -98,9 +98,13 @@ operator must reconcile application data.
 ## COPY protocol
 
 Hamstergres Proxy supports the PostgreSQL streaming COPY protocol for `COPY
-FROM STDIN` and `COPY TO STDOUT`. COPY input is deliberately fanned out to every
-Burrow, matching the current extended-query contract. COPY output is appended
-in configured Burrow order. Format metadata must agree across the fleet, and
+FROM STDIN` and `COPY TO STDOUT`. For an unsharded table in `primary` mode,
+COPY uses only the configured primary Burrow; the table definition still exists
+on every Burrow because DDL remains fleet-wide. In `replicated` mode, COPY input
+is sent once to every Burrow and COPY output uses one read Burrow. Sharded COPY
+input retains the temporary fleet broadcast contract until row-level shard-key
+routing in issue #28 replaces it; sharded COPY output is appended in configured
+Burrow order. Format metadata must agree across participating Burrows, and
 `COPY BOTH` remains unsupported. COPY inside a multi-Burrow transaction joins
 the same two-phase commit.
 

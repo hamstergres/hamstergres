@@ -74,6 +74,12 @@ func Prepare(sql string) (*Prepared, error) {
 		if value.DeleteStmt.WithClause != nil || len(value.DeleteStmt.UsingClause) != 0 {
 			prepared.predicate = nil
 		}
+	case *pg_query.Node_CopyStmt:
+		// COPY data-phase routing is completed by the Proxy. Recording the
+		// relation and direction here lets it apply the same unsharded-table
+		// policy as ordinary queries without guessing from SQL text.
+		prepared.plan.Write = value.CopyStmt.IsFrom
+		prepared.relation = value.CopyStmt.Relation
 	case *pg_query.Node_MergeStmt:
 		// MERGE can contain multiple conditional write actions. Resolve its
 		// target relation for policy purposes, but keep sharded MERGE unrouted

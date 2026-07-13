@@ -126,6 +126,10 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 				}
 				return
 			}
+			// pgproto3 returns flyweight frontend messages that are valid only
+			// until the next Receive call. This goroutine reads ahead, so take
+			// ownership before handing a message to the query loop.
+			message = cloneFrontendMessage(message)
 			select {
 			case received <- frontendReceive{message: message}:
 			case <-sessionContext.Done():
@@ -351,7 +355,7 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 			if !state.copyIn || session == nil {
 				s.sendExtendedError(frontend, "08P01", "CopyData received outside COPY FROM STDIN")
 				state.failed = true
-			} else if err := session.SendCopy(message); err != nil {
+			} else if err := session.SendCopyTo(state.copyTargets, message); err != nil {
 				s.sendExtendedError(frontend, "08006", err.Error())
 				state.failed = true
 			}
@@ -387,11 +391,71 @@ type extendedState struct {
 	target          string
 	schemaDirty     bool
 	copyIn          bool
+	copyTargets     []string
 	copyTraceSpan   trace.Span
 	copyTunnelSpans []trace.Span
 	participants    map[string]struct{}
 	pending         *pendingExtended
 	syncConsumed    bool
+}
+
+func cloneFrontendMessage(message pgproto3.FrontendMessage) pgproto3.FrontendMessage {
+	switch message := message.(type) {
+	case *pgproto3.Bind:
+		clone := *message
+		clone.ParameterFormatCodes = append([]int16(nil), message.ParameterFormatCodes...)
+		clone.Parameters = make([][]byte, len(message.Parameters))
+		for index, parameter := range message.Parameters {
+			clone.Parameters[index] = append([]byte(nil), parameter...)
+		}
+		clone.ResultFormatCodes = append([]int16(nil), message.ResultFormatCodes...)
+		return &clone
+	case *pgproto3.Close:
+		clone := *message
+		return &clone
+	case *pgproto3.CopyData:
+		clone := *message
+		clone.Data = append([]byte(nil), message.Data...)
+		return &clone
+	case *pgproto3.CopyDone:
+		clone := *message
+		return &clone
+	case *pgproto3.CopyFail:
+		clone := *message
+		return &clone
+	case *pgproto3.Describe:
+		clone := *message
+		return &clone
+	case *pgproto3.Execute:
+		clone := *message
+		return &clone
+	case *pgproto3.Flush:
+		clone := *message
+		return &clone
+	case *pgproto3.FunctionCall:
+		clone := *message
+		clone.ArgFormatCodes = append([]uint16(nil), message.ArgFormatCodes...)
+		clone.Arguments = make([][]byte, len(message.Arguments))
+		for index, argument := range message.Arguments {
+			clone.Arguments[index] = append([]byte(nil), argument...)
+		}
+		return &clone
+	case *pgproto3.Parse:
+		clone := *message
+		clone.ParameterOIDs = append([]uint32(nil), message.ParameterOIDs...)
+		return &clone
+	case *pgproto3.Query:
+		clone := *message
+		return &clone
+	case *pgproto3.Sync:
+		clone := *message
+		return &clone
+	case *pgproto3.Terminate:
+		clone := *message
+		return &clone
+	default:
+		return message
+	}
 }
 
 type pendingExtended struct {
@@ -682,10 +746,19 @@ func (s *Server) handleClose(frontend *pgproto3.Backend, session *backend.Sessio
 func (s *Server) handleCopyQuery(frontend *pgproto3.Backend, session *backend.Session, sql string, state *extendedState) bool {
 	success := false
 	retained := false
+	targets, err := s.copyTargets(sql)
+	if err != nil {
+		s.sendExtendedError(frontend, "42601", err.Error())
+		return false
+	}
+	route := "scatter"
+	if len(targets) == 1 {
+		route = "single_burrow"
+	}
 	traceContext, span := otel.Tracer("github.com/jruszo/hamstergres/proxy").Start(context.Background(), "proxy.query", trace.WithAttributes(
-		attribute.String("db.operation.name", "COPY"), attribute.String("hamstergres.route", "scatter")))
+		attribute.String("db.operation.name", "COPY"), attribute.String("hamstergres.route", route)))
 	state.copyTraceSpan = span
-	state.copyTunnelSpans = startTunnelSpans(traceContext, s.backends.ShardNames())
+	state.copyTunnelSpans = startTunnelSpans(traceContext, targets)
 	defer func() {
 		outcome := "failure"
 		if success {
@@ -703,7 +776,7 @@ func (s *Server) handleCopyQuery(frontend *pgproto3.Backend, session *backend.Se
 			finishCopyTrace(state, traceErr)
 		}
 	}()
-	responses, err := exchange(session, s.backends.ShardNames(), &pgproto3.Query{String: sql}, isCopyStarted)
+	responses, err := exchange(session, targets, &pgproto3.Query{String: sql}, isCopyStarted)
 	if err != nil {
 		s.sendExtendedError(frontend, "08006", err.Error())
 		return false
@@ -728,14 +801,15 @@ func (s *Server) handleCopyQuery(frontend *pgproto3.Backend, session *backend.Se
 	case *pgproto3.CopyInResponse:
 		frontend.Send(response)
 		state.copyIn = true
-		s.markAllParticipants(state)
+		state.copyTargets = append(state.copyTargets[:0], targets...)
+		s.markParticipants(state, targets)
 		success = true
 		retained = true
 		return true
 	case *pgproto3.CopyOutResponse:
 		frontend.Send(response)
-		s.markAllParticipants(state)
-		success = s.handleCopyOut(frontend, session, state)
+		s.markParticipants(state, targets)
+		success = s.handleCopyOut(frontend, session, targets, state)
 		return success
 	case *pgproto3.CopyBothResponse:
 		s.sendExtendedError(frontend, "0A000", "COPY BOTH is not supported by Hamstergres Proxy")
@@ -746,17 +820,29 @@ func (s *Server) handleCopyQuery(frontend *pgproto3.Backend, session *backend.Se
 	}
 }
 
-func (s *Server) markAllParticipants(state *extendedState) {
+func (s *Server) copyTargets(sql string) ([]string, error) {
+	burrows := s.backends.ShardNames()
+	decision, err := s.routeSQL(sql, burrows)
+	if err != nil {
+		return nil, err
+	}
+	if decision.routed {
+		return []string{decision.target}, nil
+	}
+	return burrows, nil
+}
+
+func (s *Server) markParticipants(state *extendedState, targets []string) {
 	if !state.transaction {
 		return
 	}
-	for _, name := range s.backends.ShardNames() {
+	for _, name := range targets {
 		state.participants[name] = struct{}{}
 	}
 }
 
-func (s *Server) handleCopyOut(frontend *pgproto3.Backend, session *backend.Session, state *extendedState) bool {
-	responses, err := session.ReceiveUntil(context.Background(), isQueryDone)
+func (s *Server) handleCopyOut(frontend *pgproto3.Backend, session *backend.Session, targets []string, state *extendedState) bool {
+	responses, err := session.ReceiveUntilFromMany(context.Background(), targets, isQueryDone)
 	if err != nil {
 		s.sendExtendedError(frontend, "08006", err.Error())
 		return false
@@ -799,11 +885,13 @@ func (s *Server) handleCopyCompletion(frontend *pgproto3.Backend, session *backe
 		finishCopyTrace(state, err)
 	}()
 	state.copyIn = false
-	if err := session.SendCopy(message); err != nil {
+	targets := append([]string(nil), state.copyTargets...)
+	state.copyTargets = nil
+	if err := session.SendCopyTo(targets, message); err != nil {
 		s.sendExtendedError(frontend, "08006", err.Error())
 		return false
 	}
-	responses, err := session.ReceiveUntil(context.Background(), isQueryDone)
+	responses, err := session.ReceiveUntilFromMany(context.Background(), targets, isQueryDone)
 	if err != nil {
 		s.sendExtendedError(frontend, "08006", err.Error())
 		return false
