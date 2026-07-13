@@ -107,7 +107,7 @@ the same two-phase commit.
 ## Schema registry contract
 
 Hamstergres Nest persists the validated table inventory, shard-key, and vshard
-registry at `/hamstergres/schema-registry/v2` by default. On first startup, a Proxy seeds
+registry at `/hamstergres/schema-registry/v3` by default. On first startup, a Proxy seeds
 an empty registry from the live Burrow catalogs. Later startup compares the
 live registry with both every other Burrow and the Nest snapshot. Any mismatch
 is a startup error: the Proxy never guesses which schema is authoritative or
@@ -120,6 +120,34 @@ catalog are unsharded. The configuration-wide
 `sharding.unsharded_tables.mode` chooses `primary` (all traffic uses one
 configured Burrow) or `replicated` (writes reach all Burrows and reads choose
 one Burrow). This policy is deliberately not selectable per table.
+
+Hamstergres Proxy parses DML with PostgreSQL's AST before it makes a routing
+decision. Simple and extended-query execution use the same plan. Relation and
+column aliases, schema qualification, quoted identifiers, comments,
+parentheses, casts, constants, and bound parameters are resolved from syntax
+nodes rather than SQL text. A sharded statement targets one Burrow only when
+the AST proves every component of one shard-key tuple. `INSERT` routing
+requires exactly one `VALUES` row; keyed `SELECT`, `UPDATE`, and `DELETE`
+routing requires unambiguous equality or tuple-equality predicates.
+
+Shapes that can span routing domains stay conservative. Reads with `OR`,
+ranges, joins, CTEs, subqueries, set operations, or multiple physical
+relations scatter. Sharded writes with those shapes, multi-row `VALUES`,
+`INSERT ... SELECT`, `ON CONFLICT`, a shard-key-changing `UPDATE`, or multiple
+SQL statements are rejected before opening a Tunnel. A parser failure never
+falls back to text matching or permissive routing.
+
+Quoted identifiers retain their PostgreSQL catalog case and are never folded
+together with unquoted names. Nest schema metadata also records each shard-key
+type. The Proxy canonicalizes equivalent typed values before hashing (for
+example, `1`, `'01'::bigint`, and a text-format bound bigint all route alike);
+types whose equality representation is not understood remain unrouted.
+
+Extended-query affinity is lazy. Parse and AST validation open no Burrow
+connections, statement Describe uses one representative Burrow, and Bind or
+Execute acquires only its selected participants. A routed execution therefore
+does not create affinity connections to every configured Burrow; scatter and
+COPY acquire the fleet only when their execution semantics require it.
 
 The Proxy keeps the validated Nest inventory in process and exposes it through
 the status HTML, JSON API, CLI, and Prometheus metrics. Status requests never

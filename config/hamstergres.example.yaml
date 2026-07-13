@@ -23,7 +23,7 @@ transactions:
 # hostname when the Proxy runs in Compose, or localhost:2379 from the host.
 nest:
   endpoint: "http://hamstergres-nest:2379"
-  registry_key: "/hamstergres/schema-registry/v2"
+  registry_key: "/hamstergres/schema-registry/v3"
   sequence_key: "/hamstergres/sequences/global-id/v1"
 
 sharding:

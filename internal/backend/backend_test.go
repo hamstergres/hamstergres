@@ -13,13 +13,31 @@ import (
 
 func TestAppendShardKeyPreservesCompoundColumnOrder(t *testing.T) {
 	keys := make(map[string][]string)
-	appendShardKey(keys, "public", "events", "tenant")
-	appendShardKey(keys, "public", "events", "region")
+	types := make(map[string][]string)
+	appendShardKey(keys, types, "public", "events", "tenant", "bigint")
+	appendShardKey(keys, types, "public", "events", "region", "text")
 	want := []string{"tenant", "region"}
 	for _, name := range []string{"events", "public.events"} {
 		if !reflect.DeepEqual(keys[name], want) {
 			t.Fatalf("%s shard key = %#v", name, keys[name])
 		}
+		if !reflect.DeepEqual(types[name], []string{"bigint", "text"}) {
+			t.Fatalf("%s shard-key types = %#v", name, types[name])
+		}
+	}
+}
+
+func TestNewSessionDoesNotAcquireHundredsOfBurrows(t *testing.T) {
+	manager := &Manager{writeGate: newWriteGate(), prepared: make(map[string]map[string]struct{})}
+	for index := 0; index < 500; index++ {
+		manager.shards = append(manager.shards, &shard{name: fmt.Sprintf("burrow-%03d", index+1)})
+	}
+	session, err := manager.NewSession(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if names := session.ConnectedNames(); len(names) != 0 {
+		t.Fatalf("new lazy session connected to %d Burrows: %#v", len(names), names)
 	}
 }
 
