@@ -29,6 +29,7 @@ import (
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/jruszo/hamstergres/internal/nest"
 	"github.com/jruszo/hamstergres/internal/router"
 	"github.com/jruszo/hamstergres/internal/schema"
 	"github.com/jruszo/hamstergres/internal/statistics"
@@ -1562,6 +1563,13 @@ sharding:
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, err := nest.NewMaintenanceClient("http://127.0.0.1:2379").DeleteTestNamespace(ctx, testKey); err != nil {
+			t.Errorf("clean Nest test namespace %q: %v", testKey, err)
+		}
+	})
 	return path
 }
 

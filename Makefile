@@ -1,4 +1,4 @@
-.PHONY: up down logs ps test test-unit test-e2e test-sysbench benchmark-sysbench experiment-sharding-cpu test-observability run-proxy proxy-status
+.PHONY: up down logs ps test test-unit test-e2e test-sysbench benchmark-sysbench experiment-sharding-cpu test-observability run-proxy proxy-status nest-status clean-nest-tests
 
 up:
 	docker compose up -d --wait
@@ -38,3 +38,9 @@ run-proxy:
 
 proxy-status:
 	go run ./cmd/hamstergres-proxy status
+
+nest-status:
+	./scripts/nest-status.sh
+
+clean-nest-tests:
+	./scripts/clean-nest-tests.sh

@@ -270,6 +270,45 @@ through the Proxy is an intentional transition and refreshes the registry after
 all Burrows agree. Out-of-band schema changes still require an explicit
 Hamstergres Migrations workflow.
 
+### Nest storage maintenance
+
+Docker-backed tests keep their isolated schema registry and generated-ID
+sequence below `/hamstergres/tests/<test-key>/`. Each test deletes that exact
+namespace during `t.Cleanup` and logically compacts through its cleanup
+revision, keeping repeated suites from retaining the large prior values. The
+default schema registry, sequence, benchmark, and experiment namespaces are
+outside the deletion range. An abrupt machine or container stop can prevent
+lifecycle cleanup, so remove previously accumulated test state with:
+
+```sh
+make nest-status
+make clean-nest-tests
+```
+
+`nest-status` reports etcd database size, database size in use, Hamstergres and
+test key counts, and active alarms. `clean-nest-tests` deletes only
+`/hamstergres/tests/`, compacts through the resulting current revision, and
+defragments the local single-member Nest so BoltDB pages return to the
+filesystem. Run bulk cleanup while no integration suite is active. Online
+compaction is safe for current values, but it removes access to older revisions;
+defragmentation briefly blocks Nest reads and writes. Hamstergres Nest does not
+need a restart afterward.
+
+The demo Nest enables periodic one-hour auto-compaction and a 1 GiB backend
+quota. Override them with `NEST_AUTO_COMPACTION_RETENTION` and
+`NEST_QUOTA_BACKEND_BYTES` when Compose starts. These are bounded local-demo
+defaults, not production retention, capacity, backup, or multi-member
+maintenance guidance.
+
+After a `NOSPACE` alarm, stop test writers, run `make clean-nest-tests`, verify
+the reclaimed size with `make nest-status`, then run
+`docker compose exec -T hamstergres-nest etcdctl alarm disarm`. If the Nest was
+OOM-killed, first restart it with `docker compose up -d --wait
+hamstergres-nest`; etcd reopens the durable volume, after which the same cleanup
+reclaims the test history. If the backend quota prevents recovery, temporarily
+start Compose with a larger `NEST_QUOTA_BACKEND_BYTES`, clean and defragment,
+then return to the normal bound.
+
 This is a local-development gateway. Its frontend currently accepts every
 startup user without a password and the example listener is reachable on all
 interfaces. Do not expose it outside a trusted development network.
