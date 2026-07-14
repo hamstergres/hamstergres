@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -11,6 +12,8 @@ import (
 const (
 	DefaultStatusAddress             = "127.0.0.1:8080"
 	DefaultBackendPoolMaxConnections = 8
+	DefaultRuntimeMaxProcs           = 4
+	DefaultTransactionLockTimeout    = "1s"
 )
 
 const (
@@ -20,6 +23,9 @@ const (
 
 // Config is the static development configuration for a gateway instance.
 type Config struct {
+	Runtime struct {
+		MaxProcs int `yaml:"max_procs"`
+	} `yaml:"runtime"`
 	Listen struct {
 		Address string `yaml:"address"`
 	} `yaml:"listen"`
@@ -36,7 +42,8 @@ type Config struct {
 		LogFile string `yaml:"log_file"`
 	} `yaml:"observability"`
 	Transactions struct {
-		TwoPhaseCommit *bool `yaml:"two_phase_commit"`
+		TwoPhaseCommit *bool  `yaml:"two_phase_commit"`
+		LockTimeout    string `yaml:"lock_timeout"`
 	} `yaml:"transactions"`
 	Sharding struct {
 		PhysicalShards map[string]Shard `yaml:"physical_shards"`
@@ -77,6 +84,16 @@ func Load(path string) (Config, error) {
 	if cfg.Status.Address == "" {
 		cfg.Status.Address = DefaultStatusAddress
 	}
+	if cfg.Runtime.MaxProcs < 0 {
+		return Config{}, fmt.Errorf("config %q: runtime.max_procs must not be negative", path)
+	}
+	if cfg.Transactions.LockTimeout == "" {
+		cfg.Transactions.LockTimeout = DefaultTransactionLockTimeout
+	}
+	lockTimeout, err := time.ParseDuration(cfg.Transactions.LockTimeout)
+	if err != nil || lockTimeout <= 0 {
+		return Config{}, fmt.Errorf("config %q: transactions.lock_timeout must be a positive duration", path)
+	}
 	if cfg.Nest.RegistryKey == "" {
 		cfg.Nest.RegistryKey = "/hamstergres/schema-registry/v3"
 	}
@@ -112,6 +129,30 @@ func Load(path string) (Config, error) {
 		}
 	}
 	return cfg, nil
+}
+
+// TransactionLockTimeout bounds each PostgreSQL lock wait. Independent
+// Burrows cannot detect a distributed lock cycle, so a finite timeout turns it
+// into a retryable transaction error instead of an indefinitely blocked Proxy.
+func (c Config) TransactionLockTimeout() string {
+	if c.Transactions.LockTimeout == "" {
+		return DefaultTransactionLockTimeout
+	}
+	return c.Transactions.LockTimeout
+}
+
+// RuntimeMaxProcs returns the configured Go scheduler width. The Proxy defaults
+// to four execution threads so routing can keep up with concurrent Burrows. An
+// explicit configuration value overrides GOMAXPROCS; otherwise GOMAXPROCS
+// retains precedence over the default.
+func (c Config) RuntimeMaxProcs() int {
+	if c.Runtime.MaxProcs > 0 {
+		return c.Runtime.MaxProcs
+	}
+	if _, configured := os.LookupEnv("GOMAXPROCS"); configured {
+		return 0
+	}
+	return DefaultRuntimeMaxProcs
 }
 
 // BackendPoolMaxConnections returns the per-Burrow connection limit. Config

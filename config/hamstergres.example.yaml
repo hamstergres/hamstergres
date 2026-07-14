@@ -3,6 +3,12 @@
 listen:
   address: "0.0.0.0:6432"
 
+# Four Go execution threads preserve routing concurrency without tying the
+# scheduler width to the host CPU count. Tune this after measuring the deployed
+# workload, or set GOMAXPROCS instead when this value is omitted.
+runtime:
+  max_procs: 4
+
 # The operator status page, JSON API, and unauthenticated Prometheus endpoint
 # at /metrics. Keep this on a private network or behind your usual access
 # control in any non-development deployment.
@@ -18,6 +24,9 @@ observability:
 # accepted risk; the Proxy will use ordinary sequential COMMIT instead of 2PC.
 transactions:
   two_phase_commit: true
+  # Bounds waits that PostgreSQL cannot identify as cross-Burrow lock cycles.
+  # Applications should retry the complete transaction after SQLSTATE 55P03.
+  lock_timeout: "1s"
 
 # Hamstergres Nest stores the schema registry in etcd. Use the Docker service
 # hostname when the Proxy runs in Compose, or localhost:2379 from the host.

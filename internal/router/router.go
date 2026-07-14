@@ -113,6 +113,15 @@ func (p *Prepared) MaxParameter() int {
 	return p.maximumParameter
 }
 
+// Table returns the parser-resolved primary physical relation. It lets callers
+// consult schema metadata without reparsing the statement.
+func (p *Prepared) Table() string {
+	if p == nil {
+		return ""
+	}
+	return p.plan.Table
+}
+
 // Analyze resolves one execution of a prepared statement against bound values
 // and the current registry. The cached AST is read-only; schema and vshard
 // ownership changes therefore remain visible without reparsing SQL.

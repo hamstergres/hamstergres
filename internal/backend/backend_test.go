@@ -28,7 +28,7 @@ func TestAppendShardKeyPreservesCompoundColumnOrder(t *testing.T) {
 }
 
 func TestNewSessionDoesNotAcquireHundredsOfBurrows(t *testing.T) {
-	manager := &Manager{writeGate: newWriteGate(), prepared: make(map[string]map[string]struct{})}
+	manager := &Manager{fleetWriteGate: newFleetWriteGate(), prepared: make(map[string]map[string]struct{})}
 	for index := 0; index < 500; index++ {
 		manager.shards = append(manager.shards, &shard{name: fmt.Sprintf("burrow-%03d", index+1)})
 	}
@@ -117,11 +117,11 @@ func TestMergeRejectsDifferentResultShapes(t *testing.T) {
 	}
 }
 
-func TestSessionWriteLockIsHeldUntilUnlock(t *testing.T) {
-	writeGate := newWriteGate()
-	session := &Session{writeGate: writeGate}
-	session.LockWrites()
-	session.LockWrites()
+func TestSessionFleetWriteLockIsHeldUntilUnlock(t *testing.T) {
+	writeGate := newFleetWriteGate()
+	session := &Session{fleetWriteGate: writeGate}
+	session.LockFleetWrites()
+	session.LockFleetWrites()
 
 	acquired := make(chan struct{})
 	go func() {
@@ -132,11 +132,11 @@ func TestSessionWriteLockIsHeldUntilUnlock(t *testing.T) {
 
 	select {
 	case <-acquired:
-		t.Fatal("write lock was released before UnlockWrites")
+		t.Fatal("fleet-write lock was released before UnlockFleetWrites")
 	case <-time.After(10 * time.Millisecond):
 	}
 
-	session.UnlockWrites()
+	session.UnlockFleetWrites()
 	select {
 	case <-acquired:
 	case <-time.After(time.Second):
@@ -144,15 +144,15 @@ func TestSessionWriteLockIsHeldUntilUnlock(t *testing.T) {
 	}
 }
 
-func TestSessionWriteLockWaitIsCanceled(t *testing.T) {
-	writeGate := newWriteGate()
-	first := &Session{writeGate: writeGate}
-	first.LockWrites()
+func TestSessionFleetWriteLockWaitIsCanceled(t *testing.T) {
+	writeGate := newFleetWriteGate()
+	first := &Session{fleetWriteGate: writeGate}
+	first.LockFleetWrites()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	second := &Session{writeGate: writeGate}
+	second := &Session{fleetWriteGate: writeGate}
 	result := make(chan bool, 1)
-	go func() { result <- second.LockWritesContext(ctx) }()
+	go func() { result <- second.LockFleetWritesContext(ctx) }()
 	cancel()
 
 	select {
@@ -163,5 +163,5 @@ func TestSessionWriteLockWaitIsCanceled(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("write gate wait did not observe cancellation")
 	}
-	first.UnlockWrites()
+	first.UnlockFleetWrites()
 }

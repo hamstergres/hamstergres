@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -41,6 +42,9 @@ func serveCommand(args []string) {
 	if err != nil {
 		slog.Error("load configuration", "event", "configuration_load_failed", "component", "hamstergres-proxy", "error_category", "configuration", "error", err)
 		os.Exit(1)
+	}
+	if maxProcs := cfg.RuntimeMaxProcs(); maxProcs > 0 {
+		runtime.GOMAXPROCS(maxProcs)
 	}
 	closeLog, err := configureLogging(cfg.Observability.LogFile)
 	if err != nil {
