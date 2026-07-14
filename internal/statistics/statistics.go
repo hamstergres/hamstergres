@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Package statistics collects bounded, process-local gateway query telemetry.
 package statistics
 

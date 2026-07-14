@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Command hamstergres-proxy runs the Hamstergres PostgreSQL gateway.
 package main
 

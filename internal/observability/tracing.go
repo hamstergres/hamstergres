@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Package observability configures optional process-local telemetry hooks.
 package observability
 

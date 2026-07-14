@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Package ddl parses and normalizes schema statements before they reach Burrows.
 package ddl
 
