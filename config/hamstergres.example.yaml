@@ -3,6 +3,12 @@
 listen:
   address: "0.0.0.0:6432"
 
+# The Proxy defaults to one Go execution thread, which avoids scheduler churn
+# for its I/O-bound workload. Raise this after measuring a CPU-bound deployment,
+# or set GOMAXPROCS instead when this value is omitted.
+runtime:
+  max_procs: 1
+
 # The operator status page, JSON API, and unauthenticated Prometheus endpoint
 # at /metrics. Keep this on a private network or behind your usual access
 # control in any non-development deployment.

@@ -11,6 +11,7 @@ import (
 const (
 	DefaultStatusAddress             = "127.0.0.1:8080"
 	DefaultBackendPoolMaxConnections = 8
+	DefaultRuntimeMaxProcs           = 1
 )
 
 const (
@@ -20,6 +21,9 @@ const (
 
 // Config is the static development configuration for a gateway instance.
 type Config struct {
+	Runtime struct {
+		MaxProcs int `yaml:"max_procs"`
+	} `yaml:"runtime"`
 	Listen struct {
 		Address string `yaml:"address"`
 	} `yaml:"listen"`
@@ -77,6 +81,9 @@ func Load(path string) (Config, error) {
 	if cfg.Status.Address == "" {
 		cfg.Status.Address = DefaultStatusAddress
 	}
+	if cfg.Runtime.MaxProcs < 0 {
+		return Config{}, fmt.Errorf("config %q: runtime.max_procs must not be negative", path)
+	}
 	if cfg.Nest.RegistryKey == "" {
 		cfg.Nest.RegistryKey = "/hamstergres/schema-registry/v3"
 	}
@@ -112,6 +119,20 @@ func Load(path string) (Config, error) {
 		}
 	}
 	return cfg, nil
+}
+
+// RuntimeMaxProcs returns the configured Go scheduler width. The I/O-bound
+// Proxy defaults to one execution thread to avoid scheduler churn. An explicit
+// configuration value overrides GOMAXPROCS; otherwise GOMAXPROCS retains
+// precedence over the default.
+func (c Config) RuntimeMaxProcs() int {
+	if c.Runtime.MaxProcs > 0 {
+		return c.Runtime.MaxProcs
+	}
+	if _, configured := os.LookupEnv("GOMAXPROCS"); configured {
+		return 0
+	}
+	return DefaultRuntimeMaxProcs
 }
 
 // BackendPoolMaxConnections returns the per-Burrow connection limit. Config

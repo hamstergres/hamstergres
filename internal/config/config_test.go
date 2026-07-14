@@ -79,6 +79,37 @@ func TestLoadEnablesStatusProfilingExplicitly(t *testing.T) {
 	}
 }
 
+func TestRuntimeMaxProcsUsesConservativeDefault(t *testing.T) {
+	previous, configured := os.LookupEnv("GOMAXPROCS")
+	if err := os.Unsetenv("GOMAXPROCS"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if configured {
+			_ = os.Setenv("GOMAXPROCS", previous)
+		} else {
+			_ = os.Unsetenv("GOMAXPROCS")
+		}
+	})
+	var cfg Config
+	if got := cfg.RuntimeMaxProcs(); got != DefaultRuntimeMaxProcs {
+		t.Fatalf("RuntimeMaxProcs = %d, want default %d", got, DefaultRuntimeMaxProcs)
+	}
+}
+
+func TestRuntimeMaxProcsRespectsExplicitConfigurationAndEnvironment(t *testing.T) {
+	var cfg Config
+	cfg.Runtime.MaxProcs = 3
+	if got := cfg.RuntimeMaxProcs(); got != 3 {
+		t.Fatalf("configured RuntimeMaxProcs = %d, want 3", got)
+	}
+	cfg.Runtime.MaxProcs = 0
+	t.Setenv("GOMAXPROCS", "8")
+	if got := cfg.RuntimeMaxProcs(); got != 0 {
+		t.Fatalf("environment-controlled RuntimeMaxProcs = %d, want 0", got)
+	}
+}
+
 func TestLoadRejectsIncompleteConfiguration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "hamstergres.yaml")
 	if err := os.WriteFile(path, []byte("listen:\n  address: 127.0.0.1:6432\n"), 0o600); err != nil {

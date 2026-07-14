@@ -65,8 +65,10 @@ func (s *Server) Handler(profiling ...bool) http.Handler {
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/metrics", s.handleMetrics)
 	if len(profiling) > 0 && profiling[0] {
-		runtime.SetBlockProfileRate(1)
-		runtime.SetMutexProfileFraction(1)
+		// Keep diagnostic contention profiles representative without tracing
+		// every synchronization event in a busy Proxy.
+		runtime.SetBlockProfileRate(1_000_000)
+		runtime.SetMutexProfileFraction(100)
 		mux.HandleFunc("/debug/pprof/", pprof.Index)
 		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
 		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)

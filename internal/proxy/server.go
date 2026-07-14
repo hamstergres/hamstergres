@@ -142,7 +142,7 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 		}
 	}()
 
-	state := extendedState{statements: make(map[string]statementState), portals: make(map[string]portalState), participants: make(map[string]struct{})}
+	state := extendedState{statements: make(map[string]statementState), portals: make(map[string]portalState), writeParticipants: make(map[string]struct{})}
 	defer finishCopyTrace(&state, fmt.Errorf("frontend session ended during COPY"))
 	var session *backend.Session
 	defer func() {
@@ -395,28 +395,6 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 	}
 }
 
-type extendedState struct {
-	statements        map[string]statementState
-	portals           map[string]portalState
-	failed            bool
-	transaction       bool
-	transactionFailed bool
-	mutated           bool
-	target            string
-	schemaDirty       bool
-	copyIn            bool
-	copyTargets       []string
-	copyPlan          copyrouter.Plan
-	copyStream        *copyrouter.Stream
-	copyReplicated    bool
-	copyAborted       bool
-	copyTraceSpan     trace.Span
-	copyTunnelSpans   []trace.Span
-	participants      map[string]struct{}
-	pending           *pendingExtended
-	syncConsumed      bool
-}
-
 func cloneFrontendMessage(message pgproto3.FrontendMessage) pgproto3.FrontendMessage {
 	switch message := message.(type) {
 	case *pgproto3.Bind:
@@ -476,6 +454,28 @@ func cloneFrontendMessage(message pgproto3.FrontendMessage) pgproto3.FrontendMes
 	}
 }
 
+type extendedState struct {
+	statements        map[string]statementState
+	portals           map[string]portalState
+	failed            bool
+	transaction       bool
+	transactionFailed bool
+	mutated           bool
+	target            string
+	schemaDirty       bool
+	copyIn            bool
+	copyTargets       []string
+	copyPlan          copyrouter.Plan
+	copyStream        *copyrouter.Stream
+	copyReplicated    bool
+	copyAborted       bool
+	copyTraceSpan     trace.Span
+	copyTunnelSpans   []trace.Span
+	writeParticipants map[string]struct{}
+	pending           *pendingExtended
+	syncConsumed      bool
+}
+
 type pendingExtended struct {
 	targets    []string
 	bind       *pgproto3.Bind
@@ -500,29 +500,27 @@ func prepareStatement(message *pgproto3.Parse, registry schema.Registry) (statem
 	if err != nil {
 		return statementState{}, err
 	}
-	maximum, err := router.MaxParameter(normalized.sql)
+	routing, err := router.Prepare(normalized.sql)
 	if err != nil {
 		return statementState{}, err
 	}
-	parameter := maximum + 1
-	rewritten, generated := router.RewriteGeneratedInsert(normalized.sql, registry, fmt.Sprintf("$%d", parameter))
+	parameter := routing.MaxParameter() + 1
+	var rewritten router.GeneratedInsert
+	generated := false
+	if firstSQLKeyword(normalized.sql) == "INSERT" {
+		if _, ok := registry.GeneratedPrimaryKey(routing.Table()); ok {
+			rewritten, generated = router.RewriteGeneratedInsert(normalized.sql, registry, fmt.Sprintf("$%d", parameter))
+		}
+	}
 	if !generated {
 		if normalized.sql == message.Query {
 			prepared := *message
 			prepared.Name = canonicalStatementName(message.Query, message.ParameterOIDs)
-			routing, err := router.Prepare(message.Query)
-			if err != nil {
-				return statementState{}, err
-			}
 			return statementState{sql: message.Query, schema: normalized.schema, backendName: prepared.Name, message: &prepared, routing: routing}, nil
 		}
 		prepared := *message
 		prepared.Query = normalized.sql
 		prepared.Name = canonicalStatementName(normalized.sql, prepared.ParameterOIDs)
-		routing, err := router.Prepare(normalized.sql)
-		if err != nil {
-			return statementState{}, err
-		}
 		return statementState{sql: normalized.sql, schema: normalized.schema, backendName: prepared.Name, message: &prepared, routing: routing}, nil
 	}
 	oids := append([]uint32(nil), message.ParameterOIDs...)
@@ -533,7 +531,7 @@ func prepareStatement(message *pgproto3.Parse, registry schema.Registry) (statem
 	prepared.Query = rewritten.SQL
 	prepared.ParameterOIDs = oids
 	prepared.Name = canonicalStatementName(rewritten.SQL, oids)
-	routing, err := router.Prepare(rewritten.SQL)
+	routing, err = router.Prepare(rewritten.SQL)
 	if err != nil {
 		return statementState{}, err
 	}
@@ -694,6 +692,12 @@ func (s *Server) materializeStatement(frontend *pgproto3.Backend, session *backe
 			return false
 		}
 		if response := firstError(responses); response != nil {
+			// Canonical names are a stable hash of SQL and parameter types. A
+			// retained PostgreSQL statement can outlive local cache knowledge
+			// after pool reconciliation, so duplicate Parse is idempotent.
+			if response.Code == "42P05" {
+				continue
+			}
 			frontend.Send(response)
 			return false
 		}
@@ -842,7 +846,7 @@ func (s *Server) handleCopyQuery(frontend *pgproto3.Backend, session *backend.Se
 		state.copyPlan = copyPlan
 		state.copyStream = copyStream
 		state.copyReplicated = copyPlan.From && !copyPlan.Sharded && len(targets) > 1
-		s.markParticipants(state, targets)
+		s.markWriteParticipants(state, targets)
 		if state.transaction {
 			state.mutated = true
 		}
@@ -851,7 +855,6 @@ func (s *Server) handleCopyQuery(frontend *pgproto3.Backend, session *backend.Se
 		return true
 	case *pgproto3.CopyOutResponse:
 		frontend.Send(response)
-		s.markParticipants(state, targets)
 		success = s.handleCopyOut(frontend, session, targets, copyPlan, state)
 		return success
 	case *pgproto3.CopyBothResponse:
@@ -932,12 +935,12 @@ func (s *Server) copyTargets(sql string) ([]string, error) {
 	return burrows, nil
 }
 
-func (s *Server) markParticipants(state *extendedState, targets []string) {
+func (s *Server) markWriteParticipants(state *extendedState, targets []string) {
 	if !state.transaction {
 		return
 	}
 	for _, name := range targets {
-		state.participants[name] = struct{}{}
+		state.writeParticipants[name] = struct{}{}
 	}
 }
 
@@ -1137,7 +1140,7 @@ func (s *Server) handleSync(frontend *pgproto3.Backend, session *backend.Session
 		return false
 	}
 	if !state.transaction {
-		session.UnlockWrites()
+		session.UnlockFleetWrites()
 	}
 	return true
 }
@@ -1158,7 +1161,7 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 		messages = append(messages, pending.describe)
 	}
 	if pending.execute != nil {
-		if requiresGlobalWriteOrder(pending.portal.sql) && !session.LockWritesContext(session.Context()) {
+		if requiresFleetWriteOrder(pending.portal.sql, len(pending.targets)) && !session.LockFleetWritesContext(session.Context()) {
 			s.sendExtendedError(frontend, "57014", "frontend session ended while waiting to execute a write")
 			return false
 		}
@@ -1296,12 +1299,7 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 	if pending.execute != nil && pending.portal.sql != "" {
 		s.backends.RecordQueryTargetsCategory(pending.portal.sql, success, time.Since(started), pending.targets, errorCategory)
 		if success {
-			if state.transaction && !isTransactionControl(pending.portal.sql) {
-				for _, target := range pending.targets {
-					state.participants[target] = struct{}{}
-				}
-				state.mutated = state.mutated || requiresRoutedWrite(pending.portal.sql)
-			}
+			recordWriteParticipants(state, pending.portal.sql, pending.targets)
 			if pending.portal.schema {
 				state.schemaDirty = true
 			}
@@ -1323,7 +1321,7 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 	}
 	state.failed = backendFailed && !emitReady
 	if !state.transaction {
-		session.UnlockWrites()
+		session.UnlockFleetWrites()
 	}
 	return true
 }
@@ -1335,7 +1333,6 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 	started := time.Now()
 	success := false
 	errorCategory := "query_execution"
-	correlationID := fmt.Sprintf("query-%08x", randomUint32())
 	traceContext, querySpan := otel.Tracer("github.com/jruszo/hamstergres/proxy").Start(context.Background(), "proxy.query",
 		trace.WithAttributes(attribute.String("db.operation.name", firstSQLKeyword(portal.sql)), attribute.String("hamstergres.route", "scatter")))
 	defer func() {
@@ -1346,7 +1343,7 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 		}
 		querySpan.End()
 		if !success && portal.sql != "" {
-			s.logger.Error("frontend query failed", "event", "query_failed", "component", "hamstergres-proxy", "correlation_id", correlationID, "error_category", errorCategory)
+			s.logger.Error("frontend query failed", "event", "query_failed", "component", "hamstergres-proxy", "correlation_id", fmt.Sprintf("query-%08x", randomUint32()), "error_category", errorCategory)
 		}
 	}()
 	targets := s.backends.ShardNames()
@@ -1355,24 +1352,18 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 			s.backends.RecordQueryTargetsCategory(portal.sql, success, time.Since(started), targets, errorCategory)
 		}
 	}()
-	if state.transaction && state.mutated && len(state.participants) > 1 && s.twoPhaseCommit && (firstSQLKeyword(portal.sql) == "COMMIT" || firstSQLKeyword(portal.sql) == "END") {
-		if response := s.commitTwoPhase(traceContext, session, participantNames(state.participants)); response != nil {
+	if state.transaction && state.mutated && len(state.writeParticipants) > 1 && s.twoPhaseCommit && (firstSQLKeyword(portal.sql) == "COMMIT" || firstSQLKeyword(portal.sql) == "END") {
+		if response := s.commitTwoPhase(traceContext, session, participantNames(state.writeParticipants)); response != nil {
 			frontend.Send(response)
 			return false
 		}
 		frontend.Send(&pgproto3.CommandComplete{CommandTag: []byte("COMMIT")})
 		state.transaction = false
 		state.mutated = false
-		clear(state.participants)
+		clear(state.writeParticipants)
 		success = true
 		return true
 	}
-	if requiresGlobalWriteOrder(portal.sql) && !session.LockWritesContext(session.Context()) {
-		errorCategory = "client_disconnect"
-		s.sendExtendedError(frontend, "57014", "frontend session ended while waiting to execute a write")
-		return false
-	}
-
 	target, routed := portal.target, portal.routed
 	if portal.keyedWrite && !routed {
 		errorCategory = "unsafe_routing"
@@ -1386,6 +1377,11 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 		querySpan.SetAttributes(attribute.String("hamstergres.route", "single_burrow"))
 	} else {
 		querySpan.SetAttributes(attribute.String("hamstergres.route", "scatter"))
+	}
+	if requiresFleetWriteOrder(portal.sql, len(targets)) && !session.LockFleetWritesContext(session.Context()) {
+		errorCategory = "client_disconnect"
+		s.sendExtendedError(frontend, "57014", "frontend session ended while waiting to execute a write")
+		return false
 	}
 	tunnelSpans := startTunnelSpans(traceContext, targets)
 	if len(targets) == 1 {
@@ -1459,12 +1455,7 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 	if portal.schema {
 		state.schemaDirty = true
 	}
-	if state.transaction && !isTransactionControl(portal.sql) {
-		for _, name := range targets {
-			state.participants[name] = struct{}{}
-		}
-		state.mutated = state.mutated || requiresRoutedWrite(portal.sql)
-	}
+	recordWriteParticipants(state, portal.sql, targets)
 	updateTransactionState(state, portal.sql)
 	return true
 }
@@ -1713,7 +1704,7 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 		frontend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 		return true
 	}
-	if state.transaction && !state.transactionFailed && state.mutated && s.twoPhaseCommit && (firstSQLKeyword(sql) == "COMMIT" || firstSQLKeyword(sql) == "END") && len(state.participants) > 1 {
+	if state.transaction && !state.transactionFailed && state.mutated && s.twoPhaseCommit && (firstSQLKeyword(sql) == "COMMIT" || firstSQLKeyword(sql) == "END") && len(state.writeParticipants) > 1 {
 		return s.handleTwoPhaseCommit(frontend, session, state)
 	}
 	normalized, err := normalizeDDL(sql)
@@ -1723,13 +1714,27 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 	}
 	sql = normalized.sql
 	var generationErr error
-	if rewritten, generated := router.RewriteGeneratedInsert(sql, s.backends.Schema(), "0"); generated {
-		id, err := s.backends.NextGlobalID(context.Background())
-		if err != nil {
-			generationErr = err
-		} else {
-			rewritten, _ = router.RewriteGeneratedInsert(sql, s.backends.Schema(), strconv.FormatInt(id, 10))
-			sql = rewritten.SQL
+	registry := s.backends.Schema()
+	routing, err := router.Prepare(sql)
+	if err != nil {
+		s.sendSessionError(frontend, state.txStatus(), "42601", err.Error())
+		return false
+	}
+	if firstSQLKeyword(sql) == "INSERT" {
+		if _, ok := registry.GeneratedPrimaryKey(routing.Table()); ok {
+			if rewritten, generated := router.RewriteGeneratedInsert(sql, registry, "0"); generated {
+				id, err := s.backends.NextGlobalID(context.Background())
+				if err != nil {
+					generationErr = err
+				} else {
+					rewritten, _ = router.RewriteGeneratedInsert(sql, registry, strconv.FormatInt(id, 10))
+					sql = rewritten.SQL
+					routing, err = router.Prepare(sql)
+					if err != nil {
+						generationErr = err
+					}
+				}
+			}
 		}
 	}
 	if generationErr != nil {
@@ -1740,7 +1745,6 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 	started := time.Now()
 	success := false
 	errorCategory := "query_execution"
-	correlationID := fmt.Sprintf("query-%08x", randomUint32())
 	traceContext, querySpan := otel.Tracer("github.com/jruszo/hamstergres/proxy").Start(context.Background(), "proxy.query",
 		trace.WithAttributes(attribute.String("db.operation.name", firstSQLKeyword(sql))))
 	defer func() {
@@ -1751,7 +1755,7 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 		}
 		querySpan.End()
 		if !success {
-			s.logger.Error("frontend query failed", "event", "query_failed", "component", "hamstergres-proxy", "correlation_id", correlationID, "error_category", errorCategory)
+			s.logger.Error("frontend query failed", "event", "query_failed", "component", "hamstergres-proxy", "correlation_id", fmt.Sprintf("query-%08x", randomUint32()), "error_category", errorCategory)
 		}
 	}()
 	targets := s.backends.ShardNames()
@@ -1761,7 +1765,7 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 
 	var responses [][]pgproto3.BackendMessage
 	var tunnelSpans []trace.Span
-	decision, err := s.routeSQL(sql, targets)
+	decision, err := s.routePortal(routing, nil, targets)
 	if err != nil {
 		errorCategory = "sql_error"
 		s.sendSessionError(frontend, state.txStatus(), "42601", err.Error())
@@ -1773,19 +1777,21 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 		s.sendSessionError(frontend, state.txStatus(), "0A000", "write to a sharded table must include its annotated shard key")
 		return false
 	}
-	if requiresGlobalWriteOrder(sql) && !session.LockWritesContext(session.Context()) {
+	if routed && !isTransactionControl(sql) {
+		targets = []string{target}
+		querySpan.SetAttributes(attribute.String("hamstergres.route", "single_burrow"))
+	} else {
+		querySpan.SetAttributes(attribute.String("hamstergres.route", "scatter"))
+	}
+	if requiresFleetWriteOrder(sql, len(targets)) && !session.LockFleetWritesContext(session.Context()) {
 		errorCategory = "client_disconnect"
 		s.sendSessionError(frontend, state.txStatus(), "57014", "frontend session ended while waiting to execute a write")
 		return false
 	}
-	if routed && !isTransactionControl(sql) {
-		targets = []string{target}
-		querySpan.SetAttributes(attribute.String("hamstergres.route", "single_burrow"))
-		tunnelSpans = startTunnelSpans(traceContext, targets)
-		responses, err = exchangeOne(session, target, &pgproto3.Query{String: sql}, isQueryDone)
+	tunnelSpans = startTunnelSpans(traceContext, targets)
+	if len(targets) == 1 {
+		responses, err = exchangeOne(session, targets[0], &pgproto3.Query{String: sql}, isQueryDone)
 	} else {
-		querySpan.SetAttributes(attribute.String("hamstergres.route", "scatter"))
-		tunnelSpans = startTunnelSpans(traceContext, targets)
 		responses, err = exchange(session, targets, &pgproto3.Query{String: sql}, isQueryDone)
 	}
 	if err != nil {
@@ -1801,7 +1807,7 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 		frontend.Send(response)
 		frontend.Send(&pgproto3.ReadyForQuery{TxStatus: status})
 		if status == 'I' {
-			session.UnlockWrites()
+			session.UnlockFleetWrites()
 		}
 		return false
 	}
@@ -1852,15 +1858,10 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 	} else {
 		frontend.Send(&pgproto3.EmptyQueryResponse{})
 	}
-	if state.transaction && !isTransactionControl(sql) {
-		if routed {
-			state.participants[target] = struct{}{}
-		} else {
-			for _, name := range targets {
-				state.participants[name] = struct{}{}
-			}
-		}
-		state.mutated = state.mutated || requiresRoutedWrite(sql)
+	if routed {
+		recordWriteParticipants(state, sql, []string{target})
+	} else {
+		recordWriteParticipants(state, sql, targets)
 	}
 	updateTransactionState(state, sql)
 	if invalidatesPreparedStatements(sql) {
@@ -1868,7 +1869,7 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 	}
 	frontend.Send(&pgproto3.ReadyForQuery{TxStatus: state.txStatus()})
 	if !state.transaction {
-		session.UnlockWrites()
+		session.UnlockFleetWrites()
 	}
 	success = true
 	return true
@@ -1921,21 +1922,21 @@ func (s *Server) handleTwoPhaseCommit(frontend *pgproto3.Backend, session *backe
 	ctx, span := otel.Tracer("github.com/jruszo/hamstergres/proxy").Start(context.Background(), "proxy.query", trace.WithAttributes(
 		attribute.String("db.operation.name", "COMMIT"), attribute.String("hamstergres.route", "scatter")))
 	defer span.End()
-	if response := s.commitTwoPhase(ctx, session, participantNames(state.participants)); response != nil {
+	if response := s.commitTwoPhase(ctx, session, participantNames(state.writeParticipants)); response != nil {
 		span.SetStatus(codes.Error, "two-phase commit failed")
 		frontend.Send(response)
 		frontend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 		state.transaction = false
-		clear(state.participants)
-		session.UnlockWrites()
+		clear(state.writeParticipants)
+		session.UnlockFleetWrites()
 		return false
 	}
 	span.SetStatus(codes.Ok, "")
 	state.transaction = false
 	state.mutated = false
 	state.target = ""
-	clear(state.participants)
-	session.UnlockWrites()
+	clear(state.writeParticipants)
+	session.UnlockFleetWrites()
 	frontend.Send(&pgproto3.CommandComplete{CommandTag: []byte("COMMIT")})
 	frontend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 	return true
@@ -2059,6 +2060,16 @@ func requiresRoutedWrite(sql string) bool {
 	}
 }
 
+func recordWriteParticipants(state *extendedState, sql string, targets []string) {
+	if !state.transaction || !requiresRoutedWrite(sql) {
+		return
+	}
+	for _, target := range targets {
+		state.writeParticipants[target] = struct{}{}
+	}
+	state.mutated = true
+}
+
 func invalidatesPreparedStatements(sql string) bool {
 	switch firstSQLKeyword(sql) {
 	case "DEALLOCATE", "DISCARD":
@@ -2075,13 +2086,13 @@ func updateTransactionState(state *extendedState, sql string) {
 		state.transactionFailed = false
 		state.target = ""
 		state.mutated = false
-		clear(state.participants)
+		clear(state.writeParticipants)
 	case "COMMIT", "END", "ROLLBACK", "ABORT":
 		state.transaction = false
 		state.transactionFailed = false
 		state.target = ""
 		state.mutated = false
-		clear(state.participants)
+		clear(state.writeParticipants)
 	}
 }
 
@@ -2122,9 +2133,12 @@ func isTransactionControl(sql string) bool {
 	return keyword == "BEGIN" || keyword == "START" || keyword == "COMMIT" || keyword == "END" || keyword == "ROLLBACK" || keyword == "ABORT"
 }
 
-func requiresGlobalWriteOrder(sql string) bool {
+func requiresFleetWriteOrder(sql string, targetCount int) bool {
+	if targetCount < 2 {
+		return false
+	}
 	switch firstSQLKeyword(sql) {
-	case "INSERT", "UPDATE", "DELETE", "MERGE", "CREATE", "ALTER", "DROP", "TRUNCATE":
+	case "CREATE", "ALTER", "COMMENT", "DROP", "TRUNCATE":
 		return true
 	default:
 		return false
@@ -2167,7 +2181,6 @@ func (s *Server) handleQuery(frontend *pgproto3.Backend, sql string) {
 	}
 	success := false
 	errorCategory := "query_execution"
-	correlationID := fmt.Sprintf("query-%08x", randomUint32())
 	traceContext, querySpan := otel.Tracer("github.com/jruszo/hamstergres/proxy").Start(context.Background(), "proxy.query",
 		trace.WithAttributes(attribute.String("db.operation.name", firstSQLKeyword(sql))))
 	defer func() {
@@ -2178,7 +2191,7 @@ func (s *Server) handleQuery(frontend *pgproto3.Backend, sql string) {
 		}
 		querySpan.End()
 		if !success {
-			s.logger.Error("frontend query failed", "event", "query_failed", "component", "hamstergres-proxy", "correlation_id", correlationID, "error_category", errorCategory)
+			s.logger.Error("frontend query failed", "event", "query_failed", "component", "hamstergres-proxy", "correlation_id", fmt.Sprintf("query-%08x", randomUint32()), "error_category", errorCategory)
 		}
 	}()
 	normalized, err := normalizeDDL(sql)
@@ -2188,22 +2201,39 @@ func (s *Server) handleQuery(frontend *pgproto3.Backend, sql string) {
 		return
 	}
 	sql = normalized.sql
-	if _, generated := router.RewriteGeneratedInsert(sql, s.backends.Schema(), "0"); generated {
-		id, err := s.backends.NextGlobalID(context.Background())
-		if err != nil {
-			errorCategory = "nest_unavailable"
-			s.sendError(frontend, "55000", fmt.Sprintf("allocate globally unique primary key: %v", err))
-			return
-		}
-		rewritten, _ := router.RewriteGeneratedInsert(sql, s.backends.Schema(), strconv.FormatInt(id, 10))
-		sql = rewritten.SQL
+	registry := s.backends.Schema()
+	routing, err := router.Prepare(sql)
+	if err != nil {
+		errorCategory = "sql_error"
+		s.sendError(frontend, "42601", err.Error())
+		return
 	}
-	if requiresGlobalWriteOrder(sql) && !requiresRoutedWrite(sql) {
-		unlock := s.backends.LockWrites()
+	if firstSQLKeyword(sql) == "INSERT" {
+		if _, ok := registry.GeneratedPrimaryKey(routing.Table()); ok {
+			if _, generated := router.RewriteGeneratedInsert(sql, registry, "0"); generated {
+				id, err := s.backends.NextGlobalID(context.Background())
+				if err != nil {
+					errorCategory = "nest_unavailable"
+					s.sendError(frontend, "55000", fmt.Sprintf("allocate globally unique primary key: %v", err))
+					return
+				}
+				rewritten, _ := router.RewriteGeneratedInsert(sql, registry, strconv.FormatInt(id, 10))
+				sql = rewritten.SQL
+				routing, err = router.Prepare(sql)
+				if err != nil {
+					errorCategory = "sql_error"
+					s.sendError(frontend, "42601", err.Error())
+					return
+				}
+			}
+		}
+	}
+	if requiresFleetWriteOrder(sql, len(s.backends.ShardNames())) {
+		unlock := s.backends.LockFleetWrites()
 		defer unlock()
 	}
 	var result backend.Result
-	decision, err := s.routeSQL(sql, s.backends.ShardNames())
+	decision, err := s.routePortal(routing, nil, s.backends.ShardNames())
 	if err != nil {
 		errorCategory = "sql_error"
 		s.sendError(frontend, "42601", err.Error())

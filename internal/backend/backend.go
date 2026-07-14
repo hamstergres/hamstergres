@@ -43,19 +43,19 @@ type shardHealth struct {
 
 // Manager owns one connection pool per physical shard.
 type Manager struct {
-	shards        []*shard
-	names         []string
-	mu            sync.RWMutex
-	writeGate     chan struct{}
-	metrics       *statistics.Collector
-	schemaMu      sync.RWMutex
-	schema        schema.Registry
-	globalIDs     *nest.SequenceStore
-	registryStore *nest.RegistryStore
-	preparedMu    sync.Mutex
-	prepared      map[string]map[string]struct{}
-	unshardedMode string
-	primaryBurrow string
+	shards         []*shard
+	names          []string
+	mu             sync.RWMutex
+	fleetWriteGate chan struct{}
+	metrics        *statistics.Collector
+	schemaMu       sync.RWMutex
+	schema         schema.Registry
+	globalIDs      *nest.SequenceStore
+	registryStore  *nest.RegistryStore
+	preparedMu     sync.Mutex
+	prepared       map[string]map[string]struct{}
+	unshardedMode  string
+	primaryBurrow  string
 }
 
 func New(ctx context.Context, cfg config.Config) (*Manager, error) {
@@ -67,7 +67,7 @@ func New(ctx context.Context, cfg config.Config) (*Manager, error) {
 	if primary == "" && len(cfg.ShardNames()) > 0 {
 		primary = cfg.ShardNames()[0]
 	}
-	m := &Manager{metrics: statistics.NewCollector(), writeGate: newWriteGate(), prepared: make(map[string]map[string]struct{}), unshardedMode: mode, primaryBurrow: primary}
+	m := &Manager{metrics: statistics.NewCollector(), fleetWriteGate: newFleetWriteGate(), prepared: make(map[string]map[string]struct{}), unshardedMode: mode, primaryBurrow: primary}
 	for _, name := range cfg.ShardNames() {
 		poolConfig, err := pgxpool.ParseConfig(cfg.Sharding.PhysicalShards[name].DSN)
 		if err != nil {
@@ -261,11 +261,11 @@ func appendShardKey(keys, types map[string][]string, namespace, table, column, d
 // backend connection, so a Burrow is acquired only when that Burrow first
 // participates and is then kept stable until the session is released.
 type Session struct {
-	shards      map[string]*sessionShard
-	writeGate   chan struct{}
-	writeLocked bool
-	ctx         context.Context
-	manager     *Manager
+	shards           map[string]*sessionShard
+	fleetWriteGate   chan struct{}
+	fleetWriteLocked bool
+	ctx              context.Context
+	manager          *Manager
 }
 
 type sessionShard struct {
@@ -278,7 +278,7 @@ type sessionShard struct {
 // first use by SendTo or SendBatchTo, so parsing, validation, and routed work do
 // not contact unrelated Burrows. The caller must close the returned session.
 func (m *Manager) NewSession(ctx context.Context) (*Session, error) {
-	return &Session{shards: make(map[string]*sessionShard), writeGate: m.writeGate, ctx: ctx, manager: m}, nil
+	return &Session{shards: make(map[string]*sessionShard), fleetWriteGate: m.fleetWriteGate, ctx: ctx, manager: m}, nil
 }
 
 func (s *Session) acquire(name string) (*sessionShard, error) {
@@ -425,37 +425,34 @@ func (m *Manager) InvalidatePreparedStatements(burrows []string) {
 	}
 }
 
-// LockWrites serializes scattered writes so every Burrow observes them in the
-// same process-wide order. The returned function must be called when the write
-// is complete.
-func (m *Manager) LockWrites() func() {
-	<-m.writeGate
-	return func() { m.writeGate <- struct{}{} }
+// LockFleetWrites serializes fleet-wide schema writes so every Burrow observes
+// them in the same process-wide order. Routed DML transactions remain concurrent.
+func (m *Manager) LockFleetWrites() func() {
+	<-m.fleetWriteGate
+	return func() { m.fleetWriteGate <- struct{}{} }
 }
 
-// LockWrites holds the process-wide write lock for this affinity session until
-// UnlockWrites or Close. Repeated calls while already locked are no-ops.
-func (s *Session) LockWrites() {
-	_ = s.LockWritesContext(context.Background())
+// LockFleetWrites holds the process-wide fleet-write lock for this affinity
+// session until UnlockFleetWrites or Close. Repeated calls are no-ops.
+func (s *Session) LockFleetWrites() {
+	_ = s.LockFleetWritesContext(context.Background())
 }
 
-// LockWritesContext acquires the process-wide write gate for this affinity
-// session. A frontend disconnect cancels a session waiting behind another
-// transaction instead of leaking its goroutine.
-func (s *Session) LockWritesContext(ctx context.Context) bool {
-	if s.writeLocked || s.writeGate == nil {
+// LockFleetWritesContext acquires the process-wide fleet-write gate.
+func (s *Session) LockFleetWritesContext(ctx context.Context) bool {
+	if s.fleetWriteLocked || s.fleetWriteGate == nil {
 		return true
 	}
 	select {
-	case <-s.writeGate:
-		s.writeLocked = true
+	case <-s.fleetWriteGate:
+		s.fleetWriteLocked = true
 		return true
 	case <-ctx.Done():
 		return false
 	}
 }
 
-func newWriteGate() chan struct{} {
+func newFleetWriteGate() chan struct{} {
 	gate := make(chan struct{}, 1)
 	gate <- struct{}{}
 	return gate
@@ -468,12 +465,12 @@ func (s *Session) Context() context.Context {
 	return context.Background()
 }
 
-func (s *Session) UnlockWrites() {
-	if !s.writeLocked || s.writeGate == nil {
+func (s *Session) UnlockFleetWrites() {
+	if !s.fleetWriteLocked || s.fleetWriteGate == nil {
 		return
 	}
-	s.writeLocked = false
-	s.writeGate <- struct{}{}
+	s.fleetWriteLocked = false
+	s.fleetWriteGate <- struct{}{}
 }
 
 // Send broadcasts one frontend protocol message to the currently connected
@@ -705,7 +702,7 @@ func cloneBackendMessage(message pgproto3.BackendMessage) pgproto3.BackendMessag
 
 // Close releases every acquired affinity connection.
 func (s *Session) Close(ctx context.Context, reusable ...bool) {
-	s.UnlockWrites()
+	s.UnlockFleetWrites()
 	release := len(reusable) > 0 && reusable[0]
 	success := true
 	for _, shard := range s.connectedShards() {

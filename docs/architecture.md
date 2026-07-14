@@ -54,12 +54,22 @@ a usable shard key and schema commands that must
 reach every Burrow. A simple-query write without one unambiguous primary key is
 rejected; it is never broadcast as a substitute for distributed transactions.
 Within a simple-query transaction, statements may route to different Burrows.
-If a write touches more than one Burrow, Hamstergres Proxy prepares the transaction
-on the fleet and then issues `COMMIT PREPARED` to each Burrow. A preparation
+Transactions execute DML concurrently with other frontend transactions and do
+not take a Proxy-wide write lock. If a write touches more than one Burrow,
+Hamstergres Proxy prepares the transaction on the participating Burrows and
+then issues `COMMIT PREPARED` to each Burrow. A preparation
 failure is rolled back. A commit-phase failure is reported with SQLSTATE
 `40003` and the generated transaction ID because manual reconciliation may be
 required. The current coordinator does not yet persist commit decisions, so an
 operator must inspect `pg_prepared_xacts` after a Proxy crash during commit.
+
+Two-phase commit makes the commit decision atomic, but it does not create
+global isolation between Burrows. Concurrent transactions can observe changes
+at different times and PostgreSQL can report deadlock or serialization errors
+when their participant operations conflict. Applications must retry the
+complete transaction for retryable SQLSTATEs and should keep cross-Burrow
+transactions short. Fleet-wide schema statements remain serialized so every
+Burrow observes them in one order.
 
 Extended-query statements are parsed on every affinity connection, but a portal
 whose bound parameters contain a complete primary key uses one Tunnel for its
@@ -94,6 +104,12 @@ Two-phase commit is enabled by default. Setting
 for operators who knowingly accept partial cross-Burrow commits. A failure in
 that mode is not atomic: earlier Burrows may already be committed, and the
 operator must reconcile application data.
+
+The Proxy is an I/O-bound Go process and defaults to one scheduler execution
+thread to avoid excess wakeups and context switching. Set `runtime.max_procs`
+to a positive integer when measurements show that more Proxy CPU parallelism
+improves the deployment. When that setting is omitted, an explicit
+`GOMAXPROCS` environment value takes precedence over the default.
 
 ## COPY protocol
 

@@ -9,21 +9,6 @@ import (
 	"github.com/jruszo/hamstergres/internal/schema"
 )
 
-func TestMergedCopyFromTagUsesLogicalRowCounts(t *testing.T) {
-	if tag, err := mergedCopyFromTag([]string{"COPY 2", "COPY 3"}, true, false, 5); err != nil || tag != "COPY 5" {
-		t.Fatalf("sharded tag = %q, %v", tag, err)
-	}
-	if tag, err := mergedCopyFromTag([]string{"COPY 5", "COPY 5"}, false, true, -1); err != nil || tag != "COPY 5" {
-		t.Fatalf("replicated tag = %q, %v", tag, err)
-	}
-	if _, err := mergedCopyFromTag([]string{"COPY 5", "COPY 4"}, false, true, -1); err == nil {
-		t.Fatal("mismatched replicated COPY counts were accepted")
-	}
-	if _, err := mergedCopyFromTag([]string{"COPY 2", "COPY 2"}, true, false, 5); err == nil {
-		t.Fatal("mismatched sharded COPY count was accepted")
-	}
-}
-
 func TestCloneFrontendMessageOwnsCopyAndBindBuffers(t *testing.T) {
 	copyData := &pgproto3.CopyData{Data: []byte("first frame")}
 	clonedCopy := cloneFrontendMessage(copyData).(*pgproto3.CopyData)
@@ -43,6 +28,21 @@ func TestCloneFrontendMessageOwnsCopyAndBindBuffers(t *testing.T) {
 	bind.ResultFormatCodes[0] = 0
 	if !bytes.Equal(clonedBind.Parameters[0], []byte("42")) || clonedBind.ParameterFormatCodes[0] != 1 || clonedBind.ResultFormatCodes[0] != 1 {
 		t.Fatalf("cloned Bind reused receive buffers: %#v", clonedBind)
+	}
+}
+
+func TestMergedCopyFromTagUsesLogicalRowCounts(t *testing.T) {
+	if tag, err := mergedCopyFromTag([]string{"COPY 2", "COPY 3"}, true, false, 5); err != nil || tag != "COPY 5" {
+		t.Fatalf("sharded tag = %q, %v", tag, err)
+	}
+	if tag, err := mergedCopyFromTag([]string{"COPY 5", "COPY 5"}, false, true, -1); err != nil || tag != "COPY 5" {
+		t.Fatalf("replicated tag = %q, %v", tag, err)
+	}
+	if _, err := mergedCopyFromTag([]string{"COPY 5", "COPY 4"}, false, true, -1); err == nil {
+		t.Fatal("mismatched replicated COPY counts were accepted")
+	}
+	if _, err := mergedCopyFromTag([]string{"COPY 2", "COPY 2"}, true, false, 5); err == nil {
+		t.Fatal("mismatched sharded COPY count was accepted")
 	}
 }
 
@@ -117,34 +117,54 @@ func TestMergedCommandTagKeepsUniformCommands(t *testing.T) {
 	}
 }
 
-func TestRequiresGlobalWriteOrderForMutatingStatements(t *testing.T) {
+func TestRequiresFleetWriteOrderForSchemaStatements(t *testing.T) {
+	for _, sql := range []string{
+		"CREATE TABLE sbtest1 (id int primary key)",
+		"ALTER TABLE sbtest1 ADD COLUMN extra int",
+		"COMMENT ON COLUMN sbtest1.id IS 'hamstergres.shard_key'",
+		"DROP TABLE sbtest1",
+		"TRUNCATE sbtest1",
+	} {
+		if !requiresFleetWriteOrder(sql, 2) {
+			t.Fatalf("requiresFleetWriteOrder(%q) = false, want true", sql)
+		}
+		if requiresFleetWriteOrder(sql, 1) {
+			t.Fatalf("requiresFleetWriteOrder(%q) = true for one target, want false", sql)
+		}
+	}
+}
+
+func TestRequiresFleetWriteOrderLeavesDMLReadsAndTransactionsUnlocked(t *testing.T) {
 	for _, sql := range []string{
 		"INSERT INTO sbtest1 (id, k) VALUES ($1, $2)",
 		" /* sysbench */ update sbtest1 set k = k + 1 where id = $1",
 		"-- generated\ndelete from sbtest1 where id = $1",
 		"MERGE INTO accounts USING incoming ON accounts.id = incoming.id WHEN MATCHED THEN UPDATE SET balance = incoming.balance",
-		"CREATE TABLE sbtest1 (id int primary key)",
-		"ALTER TABLE sbtest1 ADD COLUMN extra int",
-		"DROP TABLE sbtest1",
-		"TRUNCATE sbtest1",
-	} {
-		if !requiresGlobalWriteOrder(sql) {
-			t.Fatalf("requiresGlobalWriteOrder(%q) = false, want true", sql)
-		}
-	}
-}
-
-func TestRequiresGlobalWriteOrderLeavesReadsAndTransactionsUnlocked(t *testing.T) {
-	for _, sql := range []string{
 		"SELECT * FROM sbtest1 WHERE id = $1",
 		"BEGIN",
 		"COMMIT",
 		"ROLLBACK",
 		"SHOW server_version",
 	} {
-		if requiresGlobalWriteOrder(sql) {
-			t.Fatalf("requiresGlobalWriteOrder(%q) = true, want false", sql)
+		if requiresFleetWriteOrder(sql, 2) {
+			t.Fatalf("requiresFleetWriteOrder(%q) = true, want false", sql)
 		}
+	}
+}
+
+func TestRecordWriteParticipantsExcludesReadOnlyBurrows(t *testing.T) {
+	state := extendedState{transaction: true, writeParticipants: make(map[string]struct{})}
+	recordWriteParticipants(&state, "SELECT * FROM accounts", []string{"burrow-01", "burrow-02"})
+	if len(state.writeParticipants) != 0 || state.mutated {
+		t.Fatalf("read-only participants = %#v, mutated = %t", state.writeParticipants, state.mutated)
+	}
+
+	recordWriteParticipants(&state, "UPDATE accounts SET balance = 1 WHERE id = 42", []string{"burrow-02"})
+	if len(state.writeParticipants) != 1 {
+		t.Fatalf("write participants = %#v, want only burrow-02", state.writeParticipants)
+	}
+	if _, ok := state.writeParticipants["burrow-02"]; !ok || !state.mutated {
+		t.Fatalf("write participants = %#v, mutated = %t", state.writeParticipants, state.mutated)
 	}
 }
 

@@ -2,6 +2,9 @@
 listen:
   address: "127.0.0.1:6432"
 
+runtime:
+  max_procs: 4
+
 status:
   address: "127.0.0.1:8080"
 
