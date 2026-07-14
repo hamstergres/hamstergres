@@ -1169,6 +1169,7 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 	}
 	messages = append(messages, &pgproto3.Sync{})
 	preparedMisses := make([]string, 0, len(pending.targets))
+	preparedMissing := make(map[string]struct{}, len(pending.targets))
 	for _, target := range pending.targets {
 		if err := session.Ensure(target); err != nil {
 			s.sendExtendedError(frontend, "08006", err.Error())
@@ -1178,121 +1179,114 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 		if pending.statement.backendName != "" && !session.Prepared(target, pending.statement.backendName) {
 			targetMessages = append([]pgproto3.FrontendMessage{pending.statement.message}, messages...)
 			preparedMisses = append(preparedMisses, target)
+			preparedMissing[target] = struct{}{}
 		}
 		if err := session.SendBatchTo(target, targetMessages...); err != nil {
 			s.sendExtendedError(frontend, "08006", err.Error())
 			return false
 		}
 	}
-	var responses [][]pgproto3.BackendMessage
-	var err error
-	if len(pending.targets) == 1 {
-		responses, err = session.ReceiveUntilFrom(context.Background(), pending.targets[0], isSyncDone)
-	} else {
-		responses, err = session.ReceiveUntilFromMany(context.Background(), pending.targets, isSyncDone)
-	}
-	if err != nil {
-		s.sendExtendedError(frontend, "08006", err.Error())
-		return false
-	}
-
 	success := pending.execute != nil
 	errorCategory := "query_execution"
 	backendFailed := false
 	var description *pgproto3.RowDescription
 	var parameterDescription *pgproto3.ParameterDescription
-	var rows []*pgproto3.DataRow
 	var tags []string
 	bindComplete := false
-	empty := false
+	noData := false
+	emptyQuery := false
 	portalSuspended := false
-	for _, response := range responses {
-		for _, wireMessage := range response {
+	rowCount := 0
+	preparedMaterialized := false
+	for _, target := range pending.targets {
+		err := session.ReceiveEachFrom(context.Background(), target, isSyncDone, func(wireMessage pgproto3.BackendMessage) error {
+			if _, parsed := wireMessage.(*pgproto3.ParseComplete); parsed {
+				if _, expected := preparedMissing[target]; expected {
+					session.MarkPrepared([]string{target}, pending.statement.backendName)
+					delete(preparedMissing, target)
+					preparedMaterialized = true
+				}
+				return nil
+			}
+			if backendFailed {
+				return nil
+			}
 			switch wireMessage := wireMessage.(type) {
 			case *pgproto3.BindComplete:
-				bindComplete = true
-			case *pgproto3.ParseComplete:
-				// Parse was injected by the Proxy to materialize a canonical
-				// statement on this physical connection.
+				if !bindComplete {
+					bindComplete = true
+					frontend.Send(wireMessage)
+				}
 			case *pgproto3.RowDescription:
 				if description == nil {
-					description = wireMessage
+					description = ownedRowDescription(wireMessage)
+					frontend.Send(wireMessage)
 				} else if !sameRowDescription(description, wireMessage) {
+					backendFailed = true
+					success = false
+					errorCategory = "protocol"
 					s.sendExtendedError(frontend, "XX000", "incompatible row descriptions from Burrows")
-					return false
 				}
 			case *pgproto3.ParameterDescription:
 				if parameterDescription == nil {
-					parameterDescription = wireMessage
+					parameterDescription = &pgproto3.ParameterDescription{ParameterOIDs: append([]uint32(nil), wireMessage.ParameterOIDs...)}
+					frontend.Send(wireMessage)
 				} else if !reflect.DeepEqual(parameterDescription.ParameterOIDs, wireMessage.ParameterOIDs) {
+					backendFailed = true
+					success = false
+					errorCategory = "protocol"
 					s.sendExtendedError(frontend, "XX000", "incompatible parameter descriptions from Burrows")
-					return false
 				}
 			case *pgproto3.NoData:
-				// A single NoData below represents uniform Burrow responses.
-				empty = true
+				if !noData {
+					noData = true
+					frontend.Send(wireMessage)
+				}
 			case *pgproto3.DataRow:
-				rows = append(rows, wireMessage)
+				rowCount++
+				frontend.Send(wireMessage)
 			case *pgproto3.CommandComplete:
 				tags = append(tags, string(wireMessage.CommandTag))
 			case *pgproto3.EmptyQueryResponse:
-				empty = true
+				if !emptyQuery {
+					emptyQuery = true
+					frontend.Send(wireMessage)
+				}
 			case *pgproto3.PortalSuspended:
 				portalSuspended = true
 			case *pgproto3.ErrorResponse:
-				if !backendFailed {
-					backendFailed = true
-					success = false
-					errorCategory = postgresErrorCategory(wireMessage.Code)
-					if bindComplete {
-						frontend.Send(&pgproto3.BindComplete{})
-					}
-					frontend.Send(wireMessage)
-				}
+				backendFailed = true
+				success = false
+				errorCategory = postgresErrorCategory(wireMessage.Code)
+				frontend.Send(wireMessage)
 			case *pgproto3.ReadyForQuery:
 				// The internally forwarded Sync is exposed only when the frontend
 				// reaches its own Sync boundary.
 			case *pgproto3.NoticeResponse, *pgproto3.ParameterStatus, *pgproto3.NotificationResponse:
 				// Burrow-local asynchronous messages are not duplicated.
 			default:
-				s.sendExtendedError(frontend, "08P01", fmt.Sprintf("unexpected batched response %T", wireMessage))
-				return false
+				return fmt.Errorf("unexpected batched response %T", wireMessage)
 			}
+			return nil
+		})
+		if err != nil {
+			s.sendExtendedError(frontend, "08006", err.Error())
+			return false
 		}
 	}
+	if preparedMaterialized {
+		s.backends.RecordOperation("prepared_statement_cache", "miss")
+	} else if len(preparedMisses) == 0 && pending.statement.backendName != "" {
+		s.backends.RecordOperation("prepared_statement_cache", "hit")
+	}
 	if !backendFailed {
-		if len(preparedMisses) > 0 {
-			session.MarkPrepared(preparedMisses, pending.statement.backendName)
-			s.backends.RecordOperation("prepared_statement_cache", "miss")
-		} else if pending.statement.backendName != "" {
-			s.backends.RecordOperation("prepared_statement_cache", "hit")
-		}
 		if invalidatesPreparedStatements(pending.portal.sql) {
 			s.backends.InvalidatePreparedStatements(pending.targets)
-		}
-		if bindComplete {
-			frontend.Send(&pgproto3.BindComplete{})
-		}
-		if description != nil {
-			if parameterDescription != nil {
-				frontend.Send(parameterDescription)
-			}
-			frontend.Send(description)
-		} else if parameterDescription != nil {
-			frontend.Send(parameterDescription)
-			frontend.Send(&pgproto3.NoData{})
-		} else if pending.describe != nil && empty {
-			frontend.Send(&pgproto3.NoData{})
-		}
-		for _, row := range rows {
-			frontend.Send(row)
 		}
 		if portalSuspended {
 			frontend.Send(&pgproto3.PortalSuspended{})
 		} else if len(tags) > 0 {
-			frontend.Send(&pgproto3.CommandComplete{CommandTag: []byte(mergedCommandTag(tags, len(rows)))})
-		} else if pending.execute != nil && empty {
-			frontend.Send(&pgproto3.EmptyQueryResponse{})
+			frontend.Send(&pgproto3.CommandComplete{CommandTag: []byte(mergedCommandTag(tags, rowCount))})
 		}
 	}
 
@@ -1562,6 +1556,15 @@ func sameRowDescription(left, right *pgproto3.RowDescription) bool {
 		}
 	}
 	return true
+}
+
+func ownedRowDescription(message *pgproto3.RowDescription) *pgproto3.RowDescription {
+	owned := &pgproto3.RowDescription{Fields: make([]pgproto3.FieldDescription, len(message.Fields))}
+	for index, field := range message.Fields {
+		owned.Fields[index] = field
+		owned.Fields[index].Name = append([]byte(nil), field.Name...)
+	}
+	return owned
 }
 
 func sameOIDs(left, right []uint32) bool {

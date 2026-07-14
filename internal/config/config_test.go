@@ -23,6 +23,9 @@ func TestLoadAppliesDefaultStatusAddress(t *testing.T) {
 	if config.BackendPoolMaxConnections() != DefaultBackendPoolMaxConnections {
 		t.Fatalf("backend pool maximum = %d, want %d", config.BackendPoolMaxConnections(), DefaultBackendPoolMaxConnections)
 	}
+	if config.TransactionLockTimeout() != DefaultTransactionLockTimeout {
+		t.Fatalf("transaction lock timeout = %q, want %q", config.TransactionLockTimeout(), DefaultTransactionLockTimeout)
+	}
 	if config.Nest.RegistryKey != "/hamstergres/schema-registry/v3" {
 		t.Fatalf("registry key = %q", config.Nest.RegistryKey)
 	}
@@ -31,6 +34,17 @@ func TestLoadAppliesDefaultStatusAddress(t *testing.T) {
 	}
 	if config.Sharding.Unsharded.Mode != UnshardedPrimary || config.Sharding.Unsharded.PrimaryBurrow != "burrow-01" {
 		t.Fatalf("unsharded defaults = %#v", config.Sharding.Unsharded)
+	}
+}
+
+func TestLoadValidatesTransactionLockTimeout(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hamstergres.yaml")
+	contents := []byte("listen:\n  address: 127.0.0.1:6432\ntransactions:\n  lock_timeout: eventually\nsharding:\n  physical_shards:\n    burrow-01:\n      dsn: postgres://example\n")
+	if err := os.WriteFile(path, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("Load accepted an invalid transaction lock timeout")
 	}
 }
 

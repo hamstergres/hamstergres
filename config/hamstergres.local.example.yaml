@@ -10,6 +10,7 @@ status:
 
 transactions:
   two_phase_commit: true
+  lock_timeout: "1s"
 
 nest:
   endpoint: "http://127.0.0.1:2379"

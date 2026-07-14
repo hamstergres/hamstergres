@@ -75,6 +75,10 @@ func New(ctx context.Context, cfg config.Config) (*Manager, error) {
 			return nil, fmt.Errorf("parse dsn for shard %q: %w", name, err)
 		}
 		poolConfig.MaxConns = cfg.BackendPoolMaxConnections()
+		if poolConfig.ConnConfig.RuntimeParams == nil {
+			poolConfig.ConnConfig.RuntimeParams = make(map[string]string)
+		}
+		poolConfig.ConnConfig.RuntimeParams["lock_timeout"] = cfg.TransactionLockTimeout()
 		pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 		if err != nil {
 			m.Close()
@@ -269,9 +273,11 @@ type Session struct {
 }
 
 type sessionShard struct {
-	name   string
-	conn   *pgconn.PgConn
-	pooled *pgxpool.Conn
+	name            string
+	conn            *pgconn.PgConn
+	pooled          *pgxpool.Conn
+	stopCancelWatch chan struct{}
+	cancelWatchDone chan struct{}
 }
 
 // NewSession creates an empty affinity session. Connections are acquired on
@@ -310,6 +316,7 @@ func (s *Session) acquire(name string) (*sessionShard, error) {
 		return nil, fmt.Errorf("synchronize prepared statements on Burrow %s: %w", target.name, err)
 	}
 	connection := &sessionShard{name: target.name, conn: pooled.Conn().PgConn(), pooled: pooled}
+	connection.watchCancellation(s.Context())
 	s.shards[target.name] = connection
 	s.manager.RecordOperation("backend_connection", "success")
 	return connection, nil
@@ -616,9 +623,37 @@ func (s *Session) ReceiveEachFrom(ctx context.Context, name string, done func(pg
 
 func (s *Session) receiveContext(fallback context.Context) context.Context {
 	if s.ctx != nil {
-		return s.ctx
+		// Each checked-out connection watches the session context once. Avoid
+		// pgconn installing a new context.AfterFunc for every wire message.
+		return context.Background()
 	}
 	return fallback
+}
+
+func (s *sessionShard) watchCancellation(ctx context.Context) {
+	if ctx == nil || ctx.Done() == nil {
+		return
+	}
+	s.stopCancelWatch = make(chan struct{})
+	s.cancelWatchDone = make(chan struct{})
+	go func() {
+		defer close(s.cancelWatchDone)
+		select {
+		case <-ctx.Done():
+			_ = s.conn.Conn().SetDeadline(time.Now())
+		case <-s.stopCancelWatch:
+		}
+	}()
+}
+
+func (s *sessionShard) stopCancellationWatch() {
+	if s.stopCancelWatch == nil {
+		return
+	}
+	close(s.stopCancelWatch)
+	<-s.cancelWatchDone
+	s.stopCancelWatch = nil
+	s.cancelWatchDone = nil
 }
 
 func (s *Session) shardByName(name string) *sessionShard {
@@ -706,6 +741,10 @@ func (s *Session) Close(ctx context.Context, reusable ...bool) {
 	release := len(reusable) > 0 && reusable[0]
 	success := true
 	for _, shard := range s.connectedShards() {
+		shard.stopCancellationWatch()
+		if s.ctx != nil && s.ctx.Err() != nil {
+			release = false
+		}
 		if release {
 			shard.pooled.Release()
 			continue

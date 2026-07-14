@@ -71,6 +71,11 @@ complete transaction for retryable SQLSTATEs and should keep cross-Burrow
 transactions short. Fleet-wide schema statements remain serialized so every
 Burrow observes them in one order.
 
+Independent Burrows cannot detect a lock cycle that crosses their transaction
+managers. Every Tunnel therefore sets PostgreSQL `lock_timeout` from
+`transactions.lock_timeout`, which defaults to one second. A bounded lock wait
+fails with SQLSTATE `55P03`; applications must retry the complete transaction.
+
 Extended-query statements are parsed on every affinity connection, but a portal
 whose bound parameters contain a complete primary key uses one Tunnel for its
 Bind, Describe, Execute, and Close lifecycle. Unkeyed reads scatter in stable
@@ -105,11 +110,11 @@ for operators who knowingly accept partial cross-Burrow commits. A failure in
 that mode is not atomic: earlier Burrows may already be committed, and the
 operator must reconcile application data.
 
-The Proxy is an I/O-bound Go process and defaults to one scheduler execution
-thread to avoid excess wakeups and context switching. Set `runtime.max_procs`
-to a positive integer when measurements show that more Proxy CPU parallelism
-improves the deployment. When that setting is omitted, an explicit
-`GOMAXPROCS` environment value takes precedence over the default.
+The Proxy defaults to four Go scheduler execution threads, preserving routing
+concurrency without scaling scheduler width to every host CPU. Set
+`runtime.max_procs` to a positive integer after measuring the deployment. When
+that setting is omitted, an explicit `GOMAXPROCS` environment value takes
+precedence over the default.
 
 ## COPY protocol
 
