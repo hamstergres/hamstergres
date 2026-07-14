@@ -21,6 +21,11 @@ type RegistryStore struct {
 	client   *http.Client
 }
 
+type VerifiedRegistry struct {
+	Registry           schema.Registry
+	LegacyVShardOwners []string
+}
+
 func NewRegistryStore(endpoint, key string) *RegistryStore {
 	return &RegistryStore{endpoint: strings.TrimRight(endpoint, "/"), key: key, client: http.DefaultClient}
 }
@@ -28,24 +33,62 @@ func NewRegistryStore(endpoint, key string) *RegistryStore {
 // VerifyOrSeed fails closed when the live Burrow registry differs from the
 // Nest snapshot. The first healthy Proxy seeds an empty Nest.
 func (s *RegistryStore) VerifyOrSeed(ctx context.Context, live schema.Registry) error {
+	_, err := s.VerifyOrSeedVersioned(ctx, live)
+	return err
+}
+
+// VerifyOrSeedVersioned returns the accepted schema revision and any v3
+// placement that must be imported into the independent topology catalog.
+func (s *RegistryStore) VerifyOrSeedVersioned(ctx context.Context, live schema.Registry) (VerifiedRegistry, error) {
 	stored, found, err := s.get(ctx)
 	if err != nil {
-		return err
+		return VerifiedRegistry{}, err
 	}
 	if !found {
-		return s.put(ctx, live)
+		live = live.WithRevision(1)
+		if err := s.put(ctx, live); err != nil {
+			return VerifiedRegistry{}, err
+		}
+		return VerifiedRegistry{Registry: live}, nil
 	}
-	if err := stored.Equal(live); err != nil {
-		return fmt.Errorf("live Burrow schema differs from Nest registry: %w", err)
+	if err := stored.EqualSchema(live); err != nil {
+		return VerifiedRegistry{}, fmt.Errorf("live Burrow schema differs from Nest registry: %w", err)
 	}
-	return nil
+	return VerifiedRegistry{
+		Registry:           live.WithRevision(stored.Revision()),
+		LegacyVShardOwners: stored.VShardOwners(),
+	}, nil
 }
 
 // Replace records an intentional schema transition after the same DDL has
 // succeeded on every Burrow.
 func (s *RegistryStore) Replace(ctx context.Context, live schema.Registry) error {
+	_, err := s.ReplaceVersioned(ctx, live)
+	return err
+}
+
+func (s *RegistryStore) ReplaceVersioned(ctx context.Context, live schema.Registry) (schema.Registry, error) {
+	stored, found, err := s.get(ctx)
+	if err != nil {
+		return schema.Registry{}, err
+	}
+	revision := uint64(1)
+	if found {
+		revision = stored.Revision() + 1
+	}
+	live = live.WithRevision(revision)
 	if err := s.put(ctx, live); err != nil {
-		return fmt.Errorf("update Hamstergres Nest schema registry: %w", err)
+		return schema.Registry{}, fmt.Errorf("update Hamstergres Nest schema registry: %w", err)
+	}
+	return live, nil
+}
+
+// PersistVerified upgrades an accepted v3 snapshot to schema-only v4 metadata
+// without advancing the logical schema revision. Callers invoke it only after
+// the legacy placement has been durably imported into topology.
+func (s *RegistryStore) PersistVerified(ctx context.Context, live schema.Registry) error {
+	if err := s.put(ctx, live); err != nil {
+		return fmt.Errorf("upgrade Hamstergres Nest schema registry: %w", err)
 	}
 	return nil
 }

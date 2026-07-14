@@ -609,7 +609,7 @@ func (s *Stream) targetForRecord(record []byte) (string, error) {
 		}
 		values[index] = string(field.value)
 	}
-	target, ok := router.TargetForShardKey(values, s.plan.keyTypes, s.registry, s.burrows)
+	target, ok := router.TargetForTableShardKey(s.plan.Table, values, s.plan.keyTypes, s.registry, s.burrows)
 	if !ok || target == "" {
 		return "", fmt.Errorf("COPY row has an invalid or unsupported shard-key value")
 	}
@@ -843,7 +843,7 @@ func (s *Stream) consumeBinary() ([]Chunk, error) {
 			}
 			values[index] = value
 		}
-		target, ok := router.TargetForShardKey(values, s.plan.keyTypes, s.registry, s.burrows)
+		target, ok := router.TargetForTableShardKey(s.plan.Table, values, s.plan.keyTypes, s.registry, s.burrows)
 		if !ok || target == "" {
 			return nil, fmt.Errorf("binary COPY row has an invalid shard-key value")
 		}
