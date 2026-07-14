@@ -432,6 +432,63 @@ func TestPgbenchInitializationThroughProxy(t *testing.T) {
 			t.Fatalf("pgbench table remained in live inventory after cleanup: %#v", table)
 		}
 	}
+
+	if output, err := runPgbenchWorkload(repoRoot, frontendAddress, "sharded", "prepare", "--scale=1"); err != nil {
+		t.Fatalf("prepare sharded pgbench dataset: %v\n%s\ngateway logs:\n%s", err, output, logs.String())
+	}
+	accountRows := make([]int, 0, 2)
+	for index, port := range []string{"5541", "5542"} {
+		direct, err := pgx.Connect(context.Background(), "postgres://hamster:hamster@localhost:"+port+"/hamstergres?sslmode=disable")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var accounts, branches, tellers int
+		if err := direct.QueryRow(context.Background(), `SELECT
+			(SELECT count(*) FROM pgbench_accounts),
+			(SELECT count(*) FROM pgbench_branches),
+			(SELECT count(*) FROM pgbench_tellers)`).Scan(&accounts, &branches, &tellers); err != nil {
+			direct.Close(context.Background())
+			t.Fatal(err)
+		}
+		accountRows = append(accountRows, accounts)
+		wantBranches, wantTellers := 0, 0
+		if index == 0 {
+			wantBranches, wantTellers = 1, 10
+		}
+		if branches != wantBranches || tellers != wantTellers {
+			direct.Close(context.Background())
+			t.Fatalf("Burrow %s sharded pgbench dimensions = %d/%d, want %d/%d", port, branches, tellers, wantBranches, wantTellers)
+		}
+		direct.Close(context.Background())
+	}
+	if accountRows[0] == 0 || accountRows[1] == 0 || accountRows[0]+accountRows[1] != 100000 {
+		t.Fatalf("sharded pgbench account rows = %v, want 100000 distributed across both Burrows", accountRows)
+	}
+	snapshot = gatewaySnapshot(t, statusURL+"/api/v1/status")
+	foundShardedAccounts := false
+	for _, table := range snapshot.Sharding.Tables {
+		if table.Table == "public.pgbench_accounts" && table.Sharded && len(table.ShardKeys) == 1 && table.ShardKeys[0] == "aid" {
+			foundShardedAccounts = true
+		}
+		if table.Table != "public.pgbench_accounts" && strings.HasPrefix(table.Table, "public.pgbench_") && table.Sharded {
+			t.Fatalf("pgbench dimension table should remain unsharded: %#v", table)
+		}
+	}
+	if !foundShardedAccounts {
+		t.Fatalf("sharded pgbench accounts missing from inventory: %#v", snapshot.Sharding.Tables)
+	}
+	for _, mode := range []string{"simple", "extended", "prepared"} {
+		output, err := runPgbench(pgbench, frontendAddress, "-S", "-M", mode, "-c", "1", "-j", "1", "-t", "10")
+		if err != nil {
+			t.Fatalf("sharded read-only pgbench %s protocol: %v\n%s\ngateway logs:\n%s", mode, err, output, logs.String())
+		}
+		if !strings.Contains(output, "number of failed transactions: 0") {
+			t.Fatalf("sharded read-only pgbench %s did not report zero failures:\n%s", mode, output)
+		}
+	}
+	if output, err := runPgbenchWorkload(repoRoot, frontendAddress, "sharded", "cleanup"); err != nil {
+		t.Fatalf("cleanup sharded pgbench dataset: %v\n%s", err, output)
+	}
 }
 
 func TestTracingAndObservabilityFailureEndToEnd(t *testing.T) {
@@ -1374,6 +1431,24 @@ func runPgbench(path, address string, options ...string) (string, error) {
 	return string(output), err
 }
 
+func runPgbenchWorkload(repositoryRoot, address, mode, action string, options ...string) (string, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return "", err
+	}
+	arguments := append([]string{mode, action}, options...)
+	command := exec.Command(filepath.Join(repositoryRoot, "scripts", "pgbench-workload.sh"), arguments...)
+	command.Env = append(os.Environ(),
+		"HAMSTERGRES_BENCHMARK_HOST="+host,
+		"HAMSTERGRES_BENCHMARK_PORT="+port,
+		"HAMSTERGRES_BENCHMARK_USER=hamster",
+		"HAMSTERGRES_BENCHMARK_PASSWORD=hamster",
+		"HAMSTERGRES_BENCHMARK_DATABASE=hamstergres",
+	)
+	output, err := command.CombinedOutput()
+	return string(output), err
+}
+
 func execGateway(address, sql string) error {
 	config, err := pgx.ParseConfig("postgres://any-user@" + address + "/any-database?sslmode=disable")
 	if err != nil {
@@ -1456,32 +1531,36 @@ func TestSysbenchReadWriteEndToEnd(t *testing.T) {
 	statusURL := "http://" + statusAddress
 	waitForHealthyGateway(t, statusURL, logs)
 
-	cleanupNeeded := true
-	cleanup := func() error {
-		output, err := runSysbench(sysbench, frontendAddress, "cleanup")
-		if err != nil {
-			return fmt.Errorf("sysbench cleanup: %w\n%s", err, output)
-		}
-		cleanupNeeded = false
-		return nil
-	}
-	t.Cleanup(func() {
-		if cleanupNeeded {
-			if err := cleanup(); err != nil {
-				t.Log(err)
+	for _, mode := range []string{"unsharded", "sharded"} {
+		t.Run(mode, func(t *testing.T) {
+			cleanupNeeded := true
+			cleanup := func() error {
+				output, err := runSysbench(sysbench, repoRoot, frontendAddress, mode, "cleanup")
+				if err != nil {
+					return fmt.Errorf("sysbench %s cleanup: %w\n%s", mode, err, output)
+				}
+				cleanupNeeded = false
+				return nil
 			}
-		}
-	})
+			t.Cleanup(func() {
+				if cleanupNeeded {
+					if err := cleanup(); err != nil {
+						t.Log(err)
+					}
+				}
+			})
 
-	if output, err := runSysbench(sysbench, frontendAddress, "prepare"); err != nil {
-		t.Fatalf("sysbench prepare: %v\n%s", err, output)
-	}
-	queryGateway(t, frontendAddress, "COMMENT ON COLUMN sbtest1.id IS 'hamstergres.shard_key'", func(rows pgx.Rows) {})
-	if output, err := runSysbench(sysbench, frontendAddress, "run"); err != nil {
-		t.Fatalf("sysbench oltp_read_write workload: %v\n%s", err, output)
-	}
-	if err := cleanup(); err != nil {
-		t.Fatal(err)
+			if output, err := runSysbench(sysbench, repoRoot, frontendAddress, mode, "prepare"); err != nil {
+				t.Fatalf("sysbench %s prepare: %v\n%s", mode, err, output)
+			}
+			assertSysbenchDistribution(t, mode)
+			if output, err := runSysbench(sysbench, repoRoot, frontendAddress, mode, "run"); err != nil {
+				t.Fatalf("sysbench %s oltp_read_write workload: %v\n%s", mode, err, output)
+			}
+			if err := cleanup(); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 
 	snapshot := gatewaySnapshot(t, statusURL+"/api/v1/status")
@@ -1822,18 +1901,21 @@ func ensureSysbench(t *testing.T) string {
 	return sysbench
 }
 
-func runSysbench(sysbench, frontendAddress, action string) (string, error) {
+func runSysbench(sysbench, repositoryRoot, frontendAddress, mode, action string) (string, error) {
 	_, port, err := net.SplitHostPort(frontendAddress)
 	if err != nil {
 		return "", err
 	}
 	context, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
+	sharding := "off"
+	if mode == "sharded" {
+		sharding = "on"
+	}
 	command := exec.CommandContext(context, sysbench,
 		"--db-driver=pgsql",
-		// Hamstergres requires explicit keys for multi-row INSERTs. This keeps
-		// sysbench's bulk prepare phase routable while its run phase exercises
-		// the PostgreSQL extended-query protocol.
+		// Hamstergres requires explicit client-generated keys. The custom
+		// workload also makes sharded preparation use one keyed INSERT per row.
 		"--auto_inc=off",
 		"--pgsql-host=127.0.0.1",
 		"--pgsql-port="+port,
@@ -1847,9 +1929,49 @@ func runSysbench(sysbench, frontendAddress, action string) (string, error) {
 		"--events=0",
 		"--report-interval=0",
 		"--rand-seed=1",
-		"oltp_read_write",
+		"--hamstergres-sharding="+sharding,
+		filepath.Join(repositoryRoot, "scripts", "sysbench-oltp-read-write.lua"),
 		action,
 	)
 	output, err := command.CombinedOutput()
 	return string(output), err
+}
+
+func assertSysbenchDistribution(t *testing.T, mode string) {
+	t.Helper()
+	for table := 1; table <= 2; table++ {
+		counts := make([]int, 0, 2)
+		comments := make([]string, 0, 2)
+		for _, port := range []string{"5541", "5542"} {
+			connection, err := pgx.Connect(context.Background(), "postgres://hamster:hamster@localhost:"+port+"/hamstergres?sslmode=disable")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var count int
+			var comment *string
+			name := fmt.Sprintf("sbtest%d", table)
+			if err := connection.QueryRow(context.Background(), fmt.Sprintf(
+				"SELECT count(*), col_description('%s'::regclass, 1) FROM %s", name, name)).Scan(&count, &comment); err != nil {
+				connection.Close(context.Background())
+				t.Fatal(err)
+			}
+			connection.Close(context.Background())
+			counts = append(counts, count)
+			if comment == nil {
+				comments = append(comments, "")
+			} else {
+				comments = append(comments, *comment)
+			}
+		}
+		if mode == "sharded" {
+			if counts[0] == 0 || counts[1] == 0 || counts[0]+counts[1] != 1000 {
+				t.Fatalf("%s sharded row counts = %v, want 1000 distributed across both Burrows", fmt.Sprintf("sbtest%d", table), counts)
+			}
+			if comments[0] != "hamstergres.shard_key" || comments[1] != "hamstergres.shard_key" {
+				t.Fatalf("sbtest%d shard-key comments = %v", table, comments)
+			}
+		} else if counts[0] != 1000 || counts[1] != 0 || comments[0] != "" || comments[1] != "" {
+			t.Fatalf("sbtest%d unsharded distribution/comments = %v/%v", table, counts, comments)
+		}
+	}
 }

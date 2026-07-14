@@ -124,17 +124,72 @@ The test validates the installed sysbench version, then checks the Proxy's
 process-owned status data for both single-Burrow and scattered routes, with
 both `SELECT` and `UPDATE` statements present.
 
-For an identical direct-versus-Proxy comparison, start the local Proxy and run:
+## Sharded and unsharded benchmark datasets
+
+Stock pgbench and sysbench create their tables and immediately load data. That
+leaves no point for Hamstergres' explicit `hamstergres.shard_key` column comment
+before the first row is routed. Use the repository workload targets to select a
+dataset mode during preparation:
+
+```bash
+# Sharded is the default.
+make pgbench-prepare BENCHMARK_MODE=sharded
+make pgbench-run BENCHMARK_MODE=sharded
+make pgbench-cleanup BENCHMARK_MODE=sharded
+
+make sysbench-prepare BENCHMARK_MODE=sharded
+make sysbench-run BENCHMARK_MODE=sharded
+make sysbench-cleanup BENCHMARK_MODE=sharded
+
+# The same workloads with no shard-key annotations.
+make pgbench-prepare BENCHMARK_MODE=unsharded
+make pgbench-run BENCHMARK_MODE=unsharded
+make pgbench-cleanup BENCHMARK_MODE=unsharded
+
+make sysbench-prepare BENCHMARK_MODE=unsharded
+make sysbench-run BENCHMARK_MODE=unsharded
+make sysbench-cleanup BENCHMARK_MODE=unsharded
+```
+
+The pgbench sharded setup marks `pgbench_accounts.aid` before loading the
+100,000 accounts per scale unit. Accounts are distributed by vshard; the small
+branches and tellers tables and append-only history table remain unsharded and
+follow the configured unsharded-table policy. This preserves pgbench's scale
+discovery and models the common fact-table/dimension-table shape. The wrapper
+uses explicit-column COPY streams because shard-aware COPY deliberately
+rejects an implicit column order. Set `PGBENCH_SCALE` on the make command line
+to change the default scale of 1. Direct script use can pass `--scale` or set
+`HAMSTERGRES_PGBENCH_SCALE`. Partitioned and foreign-key pgbench setup is not
+supported in sharded mode because those layouts require a separate colocation
+design.
+
+The sysbench sharded setup wraps the standard `oltp_read_write` workload. It
+marks every `sbtest<N>.id` immediately after `CREATE TABLE`, then loads explicit
+single-row inserts so each write contains exactly one shard key. Unsharded mode
+uses sysbench's stock bulk loader. Override `PGBENCH_OPTIONS` or
+`SYSBENCH_OPTIONS` on the make command line to change run duration, clients,
+table count, or table size. The connection defaults match `make run-proxy` and
+can be changed with `HAMSTERGRES_BENCHMARK_HOST`,
+`HAMSTERGRES_BENCHMARK_PORT`, `HAMSTERGRES_BENCHMARK_USER`,
+`HAMSTERGRES_BENCHMARK_PASSWORD`, and `HAMSTERGRES_BENCHMARK_DATABASE`.
+
+For a direct-versus-Proxy comparison in either dataset mode, start the local
+Proxy and run:
 
 ```bash
 make benchmark-sysbench
+make benchmark-sysbench BENCHMARK_MODE=unsharded
 ```
 
-The benchmark runs 15-second, four-thread `oltp_read_only` and
+The default comparison is sharded. The benchmark runs 15-second, four-thread
+`oltp_read_only` and
 `oltp_read_write` workloads through Hamstergres Proxy and directly against
 `burrow-01`, prints the normal sysbench reports, and finishes with a JSON ratio
 record. It mutates and cleans up the two local `sbtest` tables and is therefore
-an explicit benchmark target rather than part of ordinary tests.
+an explicit benchmark target rather than part of ordinary tests. Shorten or
+resize an exploratory run with `HAMSTERGRES_BENCHMARK_SECONDS`,
+`HAMSTERGRES_BENCHMARK_THREADS`, `HAMSTERGRES_BENCHMARK_TABLES`, and
+`HAMSTERGRES_BENCHMARK_TABLE_SIZE`.
 
 ### One-CPU sharding experiment
 
