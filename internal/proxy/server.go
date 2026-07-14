@@ -102,7 +102,10 @@ func (s *Server) sendStartup(frontend *pgproto3.Backend) error {
 	frontend.Send(&pgproto3.ParameterStatus{Name: "integer_datetimes", Value: "on"})
 	frontend.Send(&pgproto3.ParameterStatus{Name: "server_version", Value: "17.0"})
 	frontend.Send(&pgproto3.ParameterStatus{Name: "standard_conforming_strings", Value: "on"})
-	frontend.Send(&pgproto3.BackendKeyData{ProcessID: randomUint32(), SecretKey: randomUint32()})
+	frontend.Send(&pgproto3.BackendKeyData{
+		ProcessID: randomUint32(),
+		SecretKey: binary.BigEndian.AppendUint32(nil, randomUint32()),
+	})
 	frontend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 	return frontend.Flush()
 }

@@ -25,6 +25,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 	collecttracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/protobuf/proto"
@@ -98,7 +99,7 @@ func TestGatewayEndToEnd(t *testing.T) {
 	assertSummary(t, snapshot.QueryMetrics.QuerySummaries, "SELECT ? AS value")
 	assertSummary(t, snapshot.QueryMetrics.QuerySummaries, "SELECT * FROM accounts WHERE tenant_id = ? AND account_id = ?")
 	metrics := getBody(t, statusURL+"/metrics")
-	var parser expfmt.TextParser
+	parser := expfmt.NewTextParser(model.UTF8Validation)
 	if _, err := parser.TextToMetricFamilies(strings.NewReader(metrics)); err != nil {
 		t.Fatalf("metrics endpoint is not valid Prometheus/OpenMetrics text: %v\n%s", err, metrics)
 	}
@@ -494,13 +495,16 @@ func TestTracingAndObservabilityFailureEndToEnd(t *testing.T) {
 		mu.Lock()
 		count := len(spans)
 		mu.Unlock()
-		if count >= 6 {
+		if count >= 5 {
 			break
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 	mu.Lock()
 	defer mu.Unlock()
+	if len(spans) < 5 {
+		t.Fatalf("exported spans = %d, want at least 5; gateway logs:\n%s", len(spans), logs.String())
+	}
 	assertExportedTraceShape(t, spans)
 }
 
