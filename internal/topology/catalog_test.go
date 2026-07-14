@@ -97,6 +97,19 @@ func TestValidateRejectsIncompleteAndUnknownPlacement(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsDuplicateBurrowIdentity(t *testing.T) {
+	catalog, err := Bootstrap(testRegistry(), []BootstrapBurrow{{Name: "burrow-01", DSN: "postgres://one"}}, []string{"burrow-01"}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicate := catalog.Burrows[0]
+	duplicate.Name = "burrow-copy"
+	catalog.Burrows = append(catalog.Burrows, duplicate)
+	if err := catalog.Validate(); err == nil {
+		t.Fatal("duplicate immutable Burrow ID was accepted")
+	}
+}
+
 func TestAddingBurrowDoesNotChangePlacement(t *testing.T) {
 	current, err := Bootstrap(testRegistry(), []BootstrapBurrow{{Name: "burrow-01", DSN: "postgres://one"}}, []string{"burrow-01", "burrow-01"}, time.Now())
 	if err != nil {

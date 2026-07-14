@@ -220,9 +220,19 @@ func (c Catalog) Validate() error {
 		if burrow.State != BurrowRemoved && len(burrow.Tunnels) == 0 {
 			return fmt.Errorf("Burrow %s has no Tunnel endpoint", burrow.Name)
 		}
+		tunnelNames := make(map[string]struct{}, len(burrow.Tunnels))
 		for _, tunnel := range burrow.Tunnels {
 			if tunnel.Name == "" || tunnel.Address == "" || tunnel.ConfigurationFingerprint == "" {
 				return fmt.Errorf("Burrow %s has an incomplete Tunnel endpoint", burrow.Name)
+			}
+			if _, duplicate := tunnelNames[tunnel.Name]; duplicate {
+				return fmt.Errorf("Burrow %s repeats Tunnel endpoint %q", burrow.Name, tunnel.Name)
+			}
+			tunnelNames[tunnel.Name] = struct{}{}
+		}
+		for key := range burrow.Labels {
+			if strings.TrimSpace(key) == "" {
+				return fmt.Errorf("Burrow %s has an empty placement label key", burrow.Name)
 			}
 		}
 		burrows[burrow.ID] = burrow
@@ -369,6 +379,9 @@ func ValidateTransition(previous, next Catalog) error {
 	}
 	if next.Revision != previous.Revision+1 {
 		return fmt.Errorf("topology revision must advance from %d to %d", previous.Revision, previous.Revision+1)
+	}
+	if !next.Change.Timestamp.After(previous.Change.Timestamp) {
+		return fmt.Errorf("topology change timestamp must advance")
 	}
 	previousBurrows := make(map[string]Burrow, len(previous.Burrows))
 	for _, burrow := range previous.Burrows {
