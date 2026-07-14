@@ -80,6 +80,10 @@ func TestGatewayEndToEnd(t *testing.T) {
 	if snapshot.Sharding.Source != "hamstergres-nest" || snapshot.Sharding.VirtualShards != router.VirtualShards {
 		t.Fatalf("sharding inventory metadata = %#v", snapshot.Sharding)
 	}
+	if snapshot.Sharding.SchemaRevision != 1 || snapshot.Sharding.TopologyRevision != 1 {
+		t.Fatalf("versioned sharding inventory = %#v", snapshot.Sharding)
+	}
+	assertNestTopologyPlacement(t, "/hamstergres/tests/"+gatewayTestKey(frontendAddress)+"/topology", "public.accounts")
 	accountsFound := false
 	for _, table := range snapshot.Sharding.Tables {
 		if table.Table == "public.accounts" && table.Sharded && strings.Join(table.ShardKeys, ",") == "tenant_id" {
@@ -110,6 +114,8 @@ func TestGatewayEndToEnd(t *testing.T) {
 		`hamstergres_proxy_query_routes_total{route="single_burrow"} 2`,
 		`hamstergres_proxy_query_routes_total{route="scatter"} 1`,
 		`hamstergres_proxy_burrow_executions_total{burrow="burrow-01"}`,
+		`hamstergres_proxy_schema_revision 1`,
+		`hamstergres_proxy_topology_revision 1`,
 		`hamstergres_proxy_query_duration_seconds_count 3`,
 		`hamstergres_proxy_table_sharded{table="public.accounts"} 1`,
 		"# EOF",
@@ -139,6 +145,121 @@ func TestGatewayEndToEnd(t *testing.T) {
 		t.Fatalf("status CLI output did not contain routing and fingerprint data:\n%s", output)
 	}
 	assertConcurrentQueriesAndMetricScrapes(t, frontendAddress, statusURL+"/metrics")
+}
+
+func TestTopologyControlsConfiguredBurrowMembership(t *testing.T) {
+	repoRoot := repositoryRoot(t)
+	ensureDockerBurrows(t, repoRoot)
+	binary := buildGateway(t, repoRoot)
+	testKey := "topology-membership-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+
+	seedFrontend := availableAddress(t)
+	seedStatus := availableAddress(t)
+	seedConfig := writeGatewayConfigWithKey(t, seedFrontend, seedStatus, testKey)
+	seedLogs := startGateway(t, binary, seedConfig)
+	waitForHealthyGateway(t, "http://"+seedStatus, seedLogs)
+
+	extraFrontend := availableAddress(t)
+	extraStatus := availableAddress(t)
+	extraConfig := writeGatewayConfigWithKey(t, extraFrontend, extraStatus, testKey)
+	addConfiguredBurrow(t, extraConfig, "burrow-03", "postgres://hamster:hamster@localhost:5541/hamstergres?sslmode=disable")
+	extraLogs := startGateway(t, binary, extraConfig)
+	waitForHealthyGateway(t, "http://"+extraStatus, extraLogs)
+	queryGateway(t, extraFrontend, "SELECT 1", func(rows pgx.Rows) {
+		count := 0
+		for rows.Next() {
+			count++
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		if count != 2 {
+			t.Fatalf("configured Burrow absent from topology produced %d rows, want 2", count)
+		}
+	})
+	snapshot := gatewaySnapshot(t, "http://"+extraStatus+"/api/v1/status")
+	if len(snapshot.Burrows) != 2 {
+		t.Fatalf("configured Burrow absent from topology became routable: %#v", snapshot.Burrows)
+	}
+
+	missingFrontend := availableAddress(t)
+	missingStatus := availableAddress(t)
+	missingConfig := writeGatewayConfigWithKey(t, missingFrontend, missingStatus, testKey)
+	removeConfiguredBurrow(t, missingConfig, "burrow-02")
+	command := exec.Command(binary, "--config", missingConfig)
+	output, err := command.CombinedOutput()
+	if err == nil {
+		t.Fatal("Proxy started after a topology owner was removed from YAML")
+	}
+	if !strings.Contains(string(output), "topology Burrow burrow-02 is not configured") {
+		t.Fatalf("missing topology owner error was not actionable: %v\n%s", err, output)
+	}
+}
+
+func TestLegacyV3TopologyUpgradePreservesOwners(t *testing.T) {
+	repoRoot := repositoryRoot(t)
+	ensureDockerBurrows(t, repoRoot)
+	binary := buildGateway(t, repoRoot)
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 10)
+
+	sourceKey := "topology-v4-source-" + suffix
+	sourceFrontend := availableAddress(t)
+	sourceStatus := availableAddress(t)
+	sourceConfig := writeGatewayConfigWithKey(t, sourceFrontend, sourceStatus, sourceKey)
+	sourceLogs := startGateway(t, binary, sourceConfig)
+	waitForHealthyGateway(t, "http://"+sourceStatus, sourceLogs)
+
+	sourceRegistryKey := "/hamstergres/tests/" + sourceKey + "/schema-registry"
+	encoded := readNestValue(t, sourceRegistryKey)
+	registry, err := schema.FromJSON(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := registry.Snapshot()
+	legacy.FormatVersion = 0
+	legacy.Revision = 0
+	legacy.VShards = make([]string, router.VirtualShards)
+	for index := range legacy.VShards {
+		legacy.VShards[index] = "burrow-01"
+	}
+	legacyData, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	targetKey := "topology-v3-target-" + suffix
+	targetRegistryKey := "/hamstergres/tests/" + targetKey + "/schema-registry"
+	putNestValue(t, targetRegistryKey, legacyData)
+	targetFrontend := availableAddress(t)
+	targetStatus := availableAddress(t)
+	targetConfig := writeGatewayConfigWithKey(t, targetFrontend, targetStatus, targetKey)
+	targetLogs := startGateway(t, binary, targetConfig)
+	waitForHealthyGateway(t, "http://"+targetStatus, targetLogs)
+
+	topologyKey := "/hamstergres/tests/" + targetKey + "/topology"
+	stored, found, err := nest.NewTopologyStore("http://127.0.0.1:2379", topologyKey).Get(t.Context())
+	if err != nil || !found {
+		t.Fatalf("read upgraded topology: found=%v err=%v", found, err)
+	}
+	placements, err := stored.Catalog.TablePlacements()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(placements) == 0 {
+		t.Fatal("legacy topology upgrade produced no table distributions")
+	}
+	for table, owners := range placements {
+		if len(owners) != router.VirtualShards || owners[0] != "burrow-01" || owners[len(owners)-1] != "burrow-01" {
+			t.Fatalf("legacy placement for %s was not preserved", table)
+		}
+	}
+	migrated, err := schema.FromJSON(readNestValue(t, targetRegistryKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if migrated.VShardCount() != 0 || migrated.Revision() != 1 {
+		t.Fatalf("migrated schema still owns topology: revision=%d vshards=%d", migrated.Revision(), migrated.VShardCount())
+	}
 }
 
 func TestASTRoutingPlacesRowsOnOnlyTheOwningBurrow(t *testing.T) {
@@ -1511,6 +1632,77 @@ func assertNestInventoryMatches(t *testing.T, key string, live []schema.TableInv
 	}
 }
 
+func assertNestTopologyPlacement(t *testing.T, key, table string) {
+	t.Helper()
+	stored, found, err := nest.NewTopologyStore("http://127.0.0.1:2379", key).Get(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatalf("Nest topology %q is missing", key)
+	}
+	placements, err := stored.Catalog.TablePlacements()
+	if err != nil {
+		t.Fatal(err)
+	}
+	owners := placements[table]
+	if len(owners) != router.VirtualShards {
+		t.Fatalf("topology table %s has %d owners, want %d", table, len(owners), router.VirtualShards)
+	}
+	if owners[0] != "burrow-02" || owners[1] != "burrow-01" {
+		t.Fatalf("topology did not preserve v3 modulo placement: %#v", owners[:2])
+	}
+}
+
+func readNestValue(t *testing.T, key string) []byte {
+	t.Helper()
+	body, err := json.Marshal(map[string]string{"key": base64.StdEncoding.EncodeToString([]byte(key))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.Post("http://127.0.0.1:2379/v3/kv/range", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var result struct {
+		KVs []struct {
+			Value string `json:"value"`
+		} `json:"kvs"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || len(result.KVs) != 1 {
+		t.Fatalf("read Nest key %q: status=%s values=%d", key, response.Status, len(result.KVs))
+	}
+	value, err := base64.StdEncoding.DecodeString(result.KVs[0].Value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return value
+}
+
+func putNestValue(t *testing.T, key string, value []byte) {
+	t.Helper()
+	body, err := json.Marshal(map[string]string{
+		"key":   base64.StdEncoding.EncodeToString([]byte(key)),
+		"value": base64.StdEncoding.EncodeToString(value),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.Post("http://127.0.0.1:2379/v3/kv/put", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		contents, _ := io.ReadAll(response.Body)
+		t.Fatalf("write Nest key %q: %s: %s", key, response.Status, contents)
+	}
+}
+
 // TestSysbenchReadWriteEndToEnd is an opt-in compatibility test. It exercises
 // sysbench's PostgreSQL extended-query workload against the Docker Burrows;
 // the default Go test suite stays read-only and fast for everyday development.
@@ -1621,8 +1813,54 @@ func buildGateway(t *testing.T, repositoryRoot string) string {
 
 func writeGatewayConfig(t *testing.T, frontendAddress, statusAddress string) string {
 	t.Helper()
-	testKey := strings.NewReplacer(":", "-", ".", "-").Replace(frontendAddress)
+	testKey := gatewayTestKey(frontendAddress)
 	return writeGatewayConfigWithKey(t, frontendAddress, statusAddress, testKey)
+}
+
+func gatewayTestKey(frontendAddress string) string {
+	return strings.NewReplacer(":", "-", ".", "-").Replace(frontendAddress)
+}
+
+func addConfiguredBurrow(t *testing.T, configPath, name, dsn string) {
+	t.Helper()
+	contents, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := "  physical_shards:\n"
+	replacement := marker + fmt.Sprintf("    %s:\n      dsn: %q\n", name, dsn)
+	updated := strings.Replace(string(contents), marker, replacement, 1)
+	if updated == string(contents) {
+		t.Fatal("physical_shards marker is missing")
+	}
+	if err := os.WriteFile(configPath, []byte(updated), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func removeConfiguredBurrow(t *testing.T, configPath, name string) {
+	t.Helper()
+	contents, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(string(contents), "\n")
+	filtered := make([]string, 0, len(lines))
+	skip := false
+	for _, line := range lines {
+		if line == "    "+name+":" {
+			skip = true
+			continue
+		}
+		if skip && strings.HasPrefix(line, "      ") {
+			continue
+		}
+		skip = false
+		filtered = append(filtered, line)
+	}
+	if err := os.WriteFile(configPath, []byte(strings.Join(filtered, "\n")), 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func writeGatewayConfigWithKey(t *testing.T, frontendAddress, statusAddress, testKey string) string {
@@ -1635,6 +1873,7 @@ status:
 nest:
   endpoint: "http://127.0.0.1:2379"
   registry_key: "/hamstergres/tests/%s/schema-registry"
+  topology_key: "/hamstergres/tests/%s/topology"
   sequence_key: "/hamstergres/tests/%s/global-id"
 sharding:
   physical_shards:
@@ -1642,7 +1881,7 @@ sharding:
       dsn: "postgres://hamster:hamster@localhost:5541/hamstergres?sslmode=disable"
     burrow-02:
       dsn: "postgres://hamster:hamster@localhost:5542/hamstergres?sslmode=disable"
-`, frontendAddress, statusAddress, testKey, testKey)
+`, frontendAddress, statusAddress, testKey, testKey, testKey)
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
 	}

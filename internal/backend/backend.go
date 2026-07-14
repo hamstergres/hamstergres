@@ -20,6 +20,7 @@ import (
 	"github.com/jruszo/hamstergres/internal/nest"
 	"github.com/jruszo/hamstergres/internal/schema"
 	"github.com/jruszo/hamstergres/internal/statistics"
+	"github.com/jruszo/hamstergres/internal/topology"
 )
 
 // Result is a PostgreSQL result set in the wire format used by the frontend.
@@ -43,19 +44,21 @@ type shardHealth struct {
 
 // Manager owns one connection pool per physical shard.
 type Manager struct {
-	shards         []*shard
-	names          []string
-	mu             sync.RWMutex
-	fleetWriteGate chan struct{}
-	metrics        *statistics.Collector
-	schemaMu       sync.RWMutex
-	schema         schema.Registry
-	globalIDs      *nest.SequenceStore
-	registryStore  *nest.RegistryStore
-	preparedMu     sync.Mutex
-	prepared       map[string]map[string]struct{}
-	unshardedMode  string
-	primaryBurrow  string
+	shards           []*shard
+	names            []string
+	mu               sync.RWMutex
+	fleetWriteGate   chan struct{}
+	metrics          *statistics.Collector
+	schemaMu         sync.RWMutex
+	schema           schema.Registry
+	globalIDs        *nest.SequenceStore
+	registryStore    *nest.RegistryStore
+	topologyStore    *nest.TopologyStore
+	topologyRevision uint64
+	preparedMu       sync.Mutex
+	prepared         map[string]map[string]struct{}
+	unshardedMode    string
+	primaryBurrow    string
 }
 
 func New(ctx context.Context, cfg config.Config) (*Manager, error) {
@@ -87,21 +90,139 @@ func New(ctx context.Context, cfg config.Config) (*Manager, error) {
 		m.shards = append(m.shards, &shard{name: name, dsn: cfg.Sharding.PhysicalShards[name].DSN, pool: pool})
 		m.names = append(m.names, name)
 	}
+	var storedTopology nest.StoredTopology
+	topologyFound := false
+	var err error
+	if cfg.Nest.Endpoint != "" {
+		topologyKey := cfg.Nest.TopologyKey
+		if topologyKey == "" {
+			topologyKey = config.DefaultTopologyKey
+		}
+		m.topologyStore = nest.NewTopologyStore(cfg.Nest.Endpoint, topologyKey)
+		storedTopology, topologyFound, err = m.topologyStore.Get(ctx)
+		if err != nil {
+			m.Close()
+			return nil, err
+		}
+		if topologyFound {
+			if err := storedTopology.Catalog.ValidateConfigured(configuredDSNs(cfg)); err != nil {
+				m.Close()
+				return nil, err
+			}
+			if err := m.retainActiveBurrows(storedTopology.Catalog.RoutableBurrowNames()); err != nil {
+				m.Close()
+				return nil, err
+			}
+		}
+	}
 	registry, err := m.loadSchema(ctx)
 	if err != nil {
 		m.Close()
 		return nil, err
 	}
-	m.schema = registry
 	if cfg.Nest.Endpoint != "" {
 		m.registryStore = nest.NewRegistryStore(cfg.Nest.Endpoint, cfg.Nest.RegistryKey)
-		if err := m.registryStore.VerifyOrSeed(ctx, registry); err != nil {
+		verified, err := m.registryStore.VerifyOrSeedVersioned(ctx, registry)
+		if err != nil {
 			m.Close()
 			return nil, err
 		}
+		registry = verified.Registry
+		if !topologyFound {
+			bootstrapBurrows := make([]topology.BootstrapBurrow, 0, len(cfg.Sharding.PhysicalShards))
+			for _, name := range cfg.ShardNames() {
+				bootstrapBurrows = append(bootstrapBurrows, topology.BootstrapBurrow{Name: name, DSN: cfg.Sharding.PhysicalShards[name].DSN})
+			}
+			bootstrap, err := topology.Bootstrap(registry, bootstrapBurrows, verified.LegacyVShardOwners, time.Now())
+			if err != nil {
+				m.Close()
+				return nil, err
+			}
+			storedTopology, err = m.topologyStore.VerifyOrBootstrap(ctx, bootstrap)
+			if err != nil {
+				m.Close()
+				return nil, err
+			}
+		}
+		if err := storedTopology.Catalog.ValidateSchema(registry); err != nil {
+			m.Close()
+			return nil, err
+		}
+		if err := storedTopology.Catalog.ValidateConfigured(configuredDSNs(cfg)); err != nil {
+			m.Close()
+			return nil, err
+		}
+		if err := m.retainActiveBurrows(storedTopology.Catalog.RoutableBurrowNames()); err != nil {
+			m.Close()
+			return nil, err
+		}
+		placements, err := storedTopology.Catalog.TablePlacements()
+		if err != nil {
+			m.Close()
+			return nil, err
+		}
+		registry = registry.WithTableVShards(placements)
+		m.topologyRevision = storedTopology.Catalog.Revision
+		if len(verified.LegacyVShardOwners) != 0 {
+			if err := m.registryStore.PersistVerified(ctx, registry); err != nil {
+				m.Close()
+				return nil, err
+			}
+		}
 		m.globalIDs = nest.NewSequenceStore(cfg.Nest.Endpoint, cfg.Nest.SequenceKey)
+	} else {
+		registry = registry.WithVShards(topology.LegacyModuloOwners(m.names, topology.DefaultVShardCount))
+	}
+	m.schema = registry
+	if m.unshardedMode == config.UnshardedPrimary && !containsName(m.names, m.primaryBurrow) {
+		m.Close()
+		return nil, fmt.Errorf("unsharded primary Burrow %q is not routable in topology revision %d", m.primaryBurrow, m.topologyRevision)
 	}
 	return m, nil
+}
+
+func configuredDSNs(cfg config.Config) map[string]string {
+	configured := make(map[string]string, len(cfg.Sharding.PhysicalShards))
+	for name, burrow := range cfg.Sharding.PhysicalShards {
+		configured[name] = burrow.DSN
+	}
+	return configured
+}
+
+func containsName(names []string, want string) bool {
+	for _, name := range names {
+		if name == want {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) retainActiveBurrows(names []string) error {
+	active := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		active[name] = struct{}{}
+	}
+	kept := make([]*shard, 0, len(names))
+	for _, burrow := range m.shards {
+		if _, ok := active[burrow.name]; ok {
+			kept = append(kept, burrow)
+			delete(active, burrow.name)
+			continue
+		}
+		burrow.pool.Close()
+	}
+	if len(active) != 0 {
+		missing := make([]string, 0, len(active))
+		for name := range active {
+			missing = append(missing, name)
+		}
+		sort.Strings(missing)
+		return fmt.Errorf("topology references unconfigured routable Burrows: %s", strings.Join(missing, ", "))
+	}
+	m.shards = kept
+	m.names = append([]string(nil), names...)
+	return nil
 }
 
 const primaryKeyQuery = `
@@ -228,17 +349,7 @@ func (m *Manager) loadSchema(ctx context.Context) (schema.Registry, error) {
 				delete(generated, table)
 			}
 		}
-		owners := make([]string, 65536)
-		for vshard := range owners {
-			names := m.shardNames()
-			remainder := vshard % len(names)
-			if remainder == 0 {
-				owners[vshard] = names[len(names)-1]
-			} else {
-				owners[vshard] = names[remainder-1]
-			}
-		}
-		registry := schema.NewWithGeneratedAndTypes(shardKeys, generated, shardKeyTypes).WithVShards(owners).WithAllTables(allTables)
+		registry := schema.NewWithGeneratedAndTypes(shardKeys, generated, shardKeyTypes).WithAllTables(allTables)
 		if index == 0 {
 			expected = registry
 			continue
@@ -896,11 +1007,13 @@ func (m *Manager) UnshardedMode() string { return m.unshardedMode }
 func (m *Manager) PrimaryBurrow() string { return m.primaryBurrow }
 
 type ShardingInventory struct {
-	Source        string                  `json:"source"`
-	UnshardedMode string                  `json:"unsharded_mode"`
-	PrimaryBurrow string                  `json:"primary_burrow,omitempty"`
-	VirtualShards int                     `json:"virtual_shards"`
-	Tables        []schema.TableInventory `json:"tables"`
+	Source           string                  `json:"source"`
+	SchemaRevision   uint64                  `json:"schema_revision"`
+	TopologyRevision uint64                  `json:"topology_revision"`
+	UnshardedMode    string                  `json:"unsharded_mode"`
+	PrimaryBurrow    string                  `json:"primary_burrow,omitempty"`
+	VirtualShards    int                     `json:"virtual_shards"`
+	Tables           []schema.TableInventory `json:"tables"`
 }
 
 // ShardingInventory returns the process-owned copy of the Nest-validated
@@ -908,7 +1021,7 @@ type ShardingInventory struct {
 func (m *Manager) ShardingInventory() ShardingInventory {
 	m.schemaMu.RLock()
 	defer m.schemaMu.RUnlock()
-	return ShardingInventory{Source: "hamstergres-nest", UnshardedMode: m.unshardedMode, PrimaryBurrow: m.primaryBurrow, VirtualShards: m.schema.VShardCount(), Tables: m.schema.Inventory()}
+	return ShardingInventory{Source: "hamstergres-nest", SchemaRevision: m.schema.Revision(), TopologyRevision: m.topologyRevision, UnshardedMode: m.unshardedMode, PrimaryBurrow: m.primaryBurrow, VirtualShards: m.schema.MaximumVShardCount(), Tables: m.schema.Inventory()}
 }
 
 // Schema returns the shard-key registry validated across all Burrows at
@@ -928,13 +1041,33 @@ func (m *Manager) RefreshSchema(ctx context.Context) error {
 		return err
 	}
 	if m.registryStore != nil {
-		if err := m.registryStore.Replace(ctx, registry); err != nil {
+		registry, err = m.registryStore.ReplaceVersioned(ctx, registry)
+		if err != nil {
 			m.RecordOperation("nest_registry_write", "failure")
 			m.RecordOperation("schema_registry_refresh", "failure")
 			slog.Error("Nest schema registry write failed", "event", "nest_request_failed", "component", "hamstergres-proxy", "error_category", "nest_unavailable", "operation", "schema_registry_write", "error", err)
 			return err
 		}
 		m.RecordOperation("nest_registry_write", "success")
+		updatedTopology, err := m.topologyStore.ReconcileSchema(ctx, registry)
+		if err != nil {
+			m.RecordOperation("topology_reconcile", "failure")
+			return err
+		}
+		if err := updatedTopology.Catalog.ValidateSchema(registry); err != nil {
+			m.RecordOperation("topology_reconcile", "failure")
+			return err
+		}
+		placements, err := updatedTopology.Catalog.TablePlacements()
+		if err != nil {
+			m.RecordOperation("topology_reconcile", "failure")
+			return err
+		}
+		registry = registry.WithTableVShards(placements)
+		m.topologyRevision = updatedTopology.Catalog.Revision
+		m.RecordOperation("topology_reconcile", "success")
+	} else {
+		registry = registry.WithVShards(topology.LegacyModuloOwners(m.names, topology.DefaultVShardCount))
 	}
 	m.schemaMu.Lock()
 	m.schema = registry

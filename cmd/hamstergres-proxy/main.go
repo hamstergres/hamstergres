@@ -154,7 +154,7 @@ func statusCommand(args []string) {
 	fmt.Printf("Frontend: %d active / %d total connections\n", snapshot.Frontend.ActiveConnections, snapshot.Frontend.Connections)
 	fmt.Printf("Queries: %d total / %d failed (average %dms)\n", snapshot.Queries.Queries, snapshot.Queries.FailedQueries, snapshot.Queries.AverageDurationMillis)
 	fmt.Printf("Routing: %d scattered / %d single-shard\n", snapshot.QueryMetrics.Total.ScatteredQueries, snapshot.QueryMetrics.Total.SingleShardQueries)
-	fmt.Printf("Sharding inventory: %s (%d vshards, unsharded mode %s)\n", snapshot.Sharding.Source, snapshot.Sharding.VirtualShards, snapshot.Sharding.UnshardedMode)
+	fmt.Printf("Sharding inventory: %s (schema revision %d, topology revision %d, %d vshards, unsharded mode %s)\n", snapshot.Sharding.Source, snapshot.Sharding.SchemaRevision, snapshot.Sharding.TopologyRevision, snapshot.Sharding.VirtualShards, snapshot.Sharding.UnshardedMode)
 	for _, table := range snapshot.Sharding.Tables {
 		if table.Sharded {
 			fmt.Printf("  %s: sharded by (%s)\n", table.Table, strings.Join(table.ShardKeys, ", "))

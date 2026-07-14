@@ -29,6 +29,9 @@ func TestLoadAppliesDefaultStatusAddress(t *testing.T) {
 	if config.Nest.RegistryKey != "/hamstergres/schema-registry/v3" {
 		t.Fatalf("registry key = %q", config.Nest.RegistryKey)
 	}
+	if config.Nest.TopologyKey != DefaultTopologyKey {
+		t.Fatalf("topology key = %q", config.Nest.TopologyKey)
+	}
 	if got := config.ShardNames(); len(got) != 1 || got[0] != "burrow-01" {
 		t.Fatalf("ShardNames() = %#v, want burrow-01", got)
 	}

@@ -161,7 +161,7 @@ func (p *Prepared) Analyze(parameters [][]byte, registry schema.Registry, burrow
 		return plan
 	}
 
-	plan.Target, plan.Routed = TargetForShardKey(values, types, registry, burrows)
+	plan.Target, plan.Routed = TargetForTableShardKey(plan.Table, values, types, registry, burrows)
 	return plan
 }
 
@@ -169,6 +169,12 @@ func (p *Prepared) Analyze(parameters [][]byte, registry schema.Registry, burrow
 // routing does and resolves its vshard owner. COPY uses this entry point after
 // decoding text, CSV, or binary fields from one input row.
 func TargetForShardKey(values, types []string, registry schema.Registry, burrows []string) (string, bool) {
+	return TargetForTableShardKey("", values, types, registry, burrows)
+}
+
+// TargetForTableShardKey resolves the table-specific distribution selected by
+// the versioned Nest topology catalog.
+func TargetForTableShardKey(table string, values, types []string, registry schema.Registry, burrows []string) (string, bool) {
 	if len(values) == 0 || len(types) != 0 && len(values) != len(types) || len(burrows) == 0 {
 		return "", false
 	}
@@ -186,8 +192,11 @@ func TargetForShardKey(values, types []string, registry schema.Registry, burrows
 	}
 	key := strings.Join(canonical, "\x00")
 	vshard := int(HashKey(key) % VirtualShards)
-	if registry.VShardCount() == VirtualShards {
-		return registry.VShardOwner(vshard)
+	if registry.VShardCountFor(table) == VirtualShards {
+		return registry.VShardOwnerFor(table, vshard)
+	}
+	if registry.HasTopologyPlacement() {
+		return "", false
 	}
 	return BurrowForKey(key, burrows), true
 }

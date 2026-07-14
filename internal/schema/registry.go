@@ -2,19 +2,26 @@
 package schema
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
 )
 
+const CurrentFormatVersion = 4
+
 // Snapshot is the durable, portable representation kept in Hamstergres Nest.
 type Snapshot struct {
+	FormatVersion int                         `json:"format_version,omitempty"`
+	Revision      uint64                      `json:"revision,omitempty"`
 	Tables        map[string][]string         `json:"tables"`
 	ShardKeyTypes map[string][]string         `json:"shard_key_types,omitempty"`
 	Generated     map[string]GeneratedPrimary `json:"generated,omitempty"`
-	VShards       []string                    `json:"vshards,omitempty"`
-	AllTables     []string                    `json:"all_tables,omitempty"`
+	// VShards is read only while upgrading schema-registry v3. New snapshots
+	// keep placement in the independent Nest topology catalog.
+	VShards   []string `json:"vshards,omitempty"`
+	AllTables []string `json:"all_tables,omitempty"`
 }
 
 // GeneratedPrimary describes the only generated-key shape the initial Proxy
@@ -28,10 +35,13 @@ type GeneratedPrimary struct {
 // Keys are normalized as schema.table; unqualified public tables are also
 // available by their table name.
 type Registry struct {
+	formatVersion int
+	revision      uint64
 	tables        map[string][]string
 	shardKeyTypes map[string][]string
 	generated     map[string]GeneratedPrimary
 	vshards       []string
+	tableVShards  map[string][]string
 	allTables     []string
 }
 
@@ -63,14 +73,34 @@ func NewWithGeneratedAndTypes(tables map[string][]string, generated map[string]G
 	for table, value := range generated {
 		generatedCopy[table] = value
 	}
-	return Registry{tables: copy, shardKeyTypes: typesCopy, generated: generatedCopy}
+	return Registry{formatVersion: CurrentFormatVersion, tables: copy, shardKeyTypes: typesCopy, generated: generatedCopy}
 }
+
+func (r Registry) WithRevision(revision uint64) Registry {
+	r.revision = revision
+	return r
+}
+
+func (r Registry) Revision() uint64 { return r.revision }
 
 // WithVShards records the Burrow owner of each vshard in Nest metadata.
 func (r Registry) WithVShards(owners []string) Registry {
 	r.vshards = append([]string(nil), owners...)
 	return r
 }
+
+// WithTableVShards attaches the process-owned routing projection loaded from
+// the independent Nest topology catalog. It is intentionally excluded from
+// schema serialization.
+func (r Registry) WithTableVShards(placements map[string][]string) Registry {
+	r.tableVShards = make(map[string][]string, len(placements))
+	for table, owners := range placements {
+		r.tableVShards[table] = append([]string(nil), owners...)
+	}
+	return r
+}
+
+func (r Registry) HasTopologyPlacement() bool { return r.tableVShards != nil }
 
 func (r Registry) WithAllTables(tables []string) Registry {
 	r.allTables = append([]string(nil), tables...)
@@ -112,10 +142,40 @@ func (r Registry) IsSharded(table string) bool {
 
 func (r Registry) VShardOwners() []string { return append([]string(nil), r.vshards...) }
 
+// TableVShardOwners returns the topology-backed placement for one table.
+func (r Registry) TableVShardOwners(table string) ([]string, bool) {
+	owners, ok := r.tableVShards[r.CanonicalTable(table)]
+	if !ok {
+		return nil, false
+	}
+	return append([]string(nil), owners...), true
+}
+
 // VShardCount returns the size of the validated ownership map without copying
 // it. Routing uses this together with VShardOwner on every query; full copies
 // are reserved for snapshots and serialization boundaries.
 func (r Registry) VShardCount() int { return len(r.vshards) }
+
+// VShardCountFor returns the placement size for one table. Legacy v3 and
+// Nest-less development registries fall back to the fleet-wide map.
+func (r Registry) VShardCountFor(table string) int {
+	if owners, ok := r.tableVShards[r.CanonicalTable(table)]; ok {
+		return len(owners)
+	}
+	return len(r.vshards)
+}
+
+// MaximumVShardCount supports process-owned status reporting when placement is
+// represented per table.
+func (r Registry) MaximumVShardCount() int {
+	maximum := len(r.vshards)
+	for _, owners := range r.tableVShards {
+		if len(owners) > maximum {
+			maximum = len(owners)
+		}
+	}
+	return maximum
+}
 
 // VShardOwner returns one vshard owner without exposing the mutable backing
 // slice. The registry is immutable after construction and swapped atomically by
@@ -125,6 +185,40 @@ func (r Registry) VShardOwner(vshard int) (string, bool) {
 		return "", false
 	}
 	return r.vshards[vshard], true
+}
+
+func (r Registry) VShardOwnerFor(table string, vshard int) (string, bool) {
+	if owners, ok := r.tableVShards[r.CanonicalTable(table)]; ok {
+		if vshard < 0 || vshard >= len(owners) {
+			return "", false
+		}
+		return owners[vshard], true
+	}
+	return r.VShardOwner(vshard)
+}
+
+// CanonicalTable maps the public unqualified alias used by PostgreSQL clients
+// to the qualified inventory name stored in topology metadata.
+func (r Registry) CanonicalTable(table string) string {
+	if strings.Contains(table, ".") {
+		return table
+	}
+	qualified := "public." + table
+	index := sort.SearchStrings(r.allTables, qualified)
+	if index < len(r.allTables) && r.allTables[index] == qualified {
+		return qualified
+	}
+	return table
+}
+
+func (r Registry) CanonicalShardedTables() []string {
+	tables := make([]string, 0)
+	for _, table := range r.allTables {
+		if r.IsSharded(table) {
+			tables = append(tables, table)
+		}
+	}
+	return tables
 }
 
 type TableInventory struct {
@@ -143,6 +237,18 @@ func (r Registry) Inventory() []TableInventory {
 }
 
 func (r Registry) Equal(other Registry) error {
+	if err := r.EqualSchema(other); err != nil {
+		return err
+	}
+	if strings.Join(r.vshards, "\x00") != strings.Join(other.vshards, "\x00") {
+		return fmt.Errorf("vshard placement differs")
+	}
+	return nil
+}
+
+// EqualSchema compares only the schema contract. Topology is independently
+// versioned and must not make an otherwise identical schema appear divergent.
+func (r Registry) EqualSchema(other Registry) error {
 	if len(r.tables) != len(other.tables) {
 		return fmt.Errorf("shard-key table count differs: %d and %d", len(r.tables), len(other.tables))
 	}
@@ -169,13 +275,23 @@ func (r Registry) Equal(other Registry) error {
 			return fmt.Errorf("generated primary key for %s differs across Burrows", table)
 		}
 	}
-	if strings.Join(r.vshards, "\x00") != strings.Join(other.vshards, "\x00") {
-		return fmt.Errorf("vshard placement differs")
-	}
 	if strings.Join(r.allTables, "\x00") != strings.Join(other.allTables, "\x00") {
 		return fmt.Errorf("table inventory differs")
 	}
 	return nil
+}
+
+// Fingerprint is a stable topology compatibility token for schema fields that
+// affect table placement and routing. Schema and topology revisions can move
+// independently while still proving they describe the same routing contract.
+func (r Registry) Fingerprint() string {
+	payload := struct {
+		Tables        map[string][]string `json:"tables"`
+		ShardKeyTypes map[string][]string `json:"shard_key_types"`
+	}{r.tables, r.shardKeyTypes}
+	data, _ := json.Marshal(payload)
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("sha256:%x", sum[:])
 }
 
 func (r Registry) Tables() []string {
@@ -200,7 +316,7 @@ func (r Registry) Snapshot() Snapshot {
 	for table, value := range r.generated {
 		generated[table] = value
 	}
-	return Snapshot{Tables: tables, ShardKeyTypes: types, Generated: generated, VShards: append([]string(nil), r.vshards...), AllTables: append([]string(nil), r.allTables...)}
+	return Snapshot{FormatVersion: CurrentFormatVersion, Revision: r.revision, Tables: tables, ShardKeyTypes: types, Generated: generated, AllTables: append([]string(nil), r.allTables...)}
 }
 
 func (r Registry) MarshalJSON() ([]byte, error) { return json.Marshal(r.Snapshot()) }
@@ -210,5 +326,16 @@ func FromJSON(data []byte) (Registry, error) {
 	if err := json.Unmarshal(data, &snapshot); err != nil {
 		return Registry{}, err
 	}
-	return NewWithGeneratedAndTypes(snapshot.Tables, snapshot.Generated, snapshot.ShardKeyTypes).WithVShards(snapshot.VShards).WithAllTables(snapshot.AllTables), nil
+	if snapshot.FormatVersion == 0 {
+		snapshot.FormatVersion = 3
+	}
+	if snapshot.Revision == 0 {
+		snapshot.Revision = 1
+	}
+	registry := NewWithGeneratedAndTypes(snapshot.Tables, snapshot.Generated, snapshot.ShardKeyTypes).
+		WithRevision(snapshot.Revision).
+		WithVShards(snapshot.VShards).
+		WithAllTables(snapshot.AllTables)
+	registry.formatVersion = snapshot.FormatVersion
+	return registry, nil
 }

@@ -6,8 +6,9 @@ gateway that speaks the PostgreSQL frontend protocol and routes single-key
 queries to their owning **Burrow**. Reads without a usable shard key are
 scattered and compatible result rows are appended. It supports simple queries
 and the core extended-query lifecycle used by prepared, parameterized
-PostgreSQL clients. Nest-backed metadata management comes next. See [the architecture and naming
-reference](docs/architecture.md) for the component model.
+PostgreSQL clients. Hamstergres Nest durably stores the versioned schema and
+per-table vshard topology consumed by the Proxy. See [the architecture and
+naming reference](docs/architecture.md) for the component model.
 
 ## Layout
 
@@ -18,7 +19,10 @@ internal/config/        Gateway configuration loading
 internal/proxy/         PostgreSQL frontend session handling
 internal/status/        Process-owned status snapshot and HTTP views
 internal/statistics/    Bounded rolling query and routing telemetry
-internal/router/        Future shard-key, vshard, and Burrow routing
+internal/router/        PostgreSQL AST shard-key and vshard routing
+internal/schema/        Versioned schema contract and routing projection
+internal/topology/      Versioned Burrow membership and table distributions
+internal/nest/          etcd-backed schema, topology, and sequence stores
 config/                 Static routing configuration for the first PoC
 db/init/                 SQL installed into every new Burrow
 docker-compose.yml       Local PostgreSQL Burrow fleet
@@ -67,22 +71,22 @@ docker compose down -v
 make up
 ```
 
-## PoC routing configuration
+## Routing bootstrap configuration
 
-[`config/hamstergres.example.yaml`](config/hamstergres.example.yaml) records
-the initial routing contract for the future Go proxy:
+[`config/hamstergres.example.yaml`](config/hamstergres.example.yaml) provides
+the Proxy's initial Tunnel endpoints:
 
 - `accounts` is distributed by its PostgreSQL primary key: `(tenant_id, account_id)`.
 - `hash(primary_key_tuple) % 65536` selects a vshard.
-- Vshards are placed by one-indexed modulo over Burrows. In the two-Burrow
-  fixture, odd vshards belong to `burrow-01` and even vshards belong to
-  `burrow-02`.
+- On the first upgrade, the exact v3 owner map is imported. A fresh Nest uses
+  the old one-indexed modulo layout once: odd vshards belong to `burrow-01`
+  and even vshards belong to `burrow-02` in the two-Burrow fixture.
 
-The DSNs in that file use Docker service names so a future Proxy container can
+The DSNs in that file use Docker service names so a Proxy container can
 connect to the Burrows. When running a Go process directly on the host, use
-`localhost:5541` and `localhost:5542` instead. The configuration is a static
-development fixture, not a design for the later dynamic metadata/control
-plane.
+`localhost:5541` and `localhost:5542` instead. After bootstrap, Nest topology—not
+YAML order—is the placement source of truth. The current Proxy still requires
+the matching static endpoints at startup; dynamic Tunnel changes are issue #13.
 
 ## Checks
 
@@ -325,20 +329,34 @@ concurrency without scaling to every host CPU. Set `runtime.max_procs` in the
 configuration, or set `GOMAXPROCS` when `runtime.max_procs` is omitted, after
 benchmarking the deployment.
 
-### Schema registry in Hamstergres Nest
+### Versioned schema and topology in Hamstergres Nest
 
 The development Compose environment includes an etcd-backed **Hamstergres
-Nest** on port 2379. On the first successful Proxy startup, it stores the
-catalog-derived table inventory, shard-key, and vshard registry in Nest. Later Proxy startups compare the
-live Burrows with that snapshot and fail closed if either has drifted. DDL sent
-through the Proxy is an intentional transition and refreshes the registry after
-all Burrows agree. Out-of-band schema changes still require an explicit
-Hamstergres Migrations workflow.
+Nest** on port 2379. On the first successful Proxy startup, it stores two
+independent records: the versioned schema contract at
+`/hamstergres/schema-registry/v3` and the versioned routing topology at
+`/hamstergres/topology/v1`. The topology owns immutable Burrow identities,
+lifecycle state, Tunnel endpoint fingerprints, and complete per-table vshard
+placement. It is published with etcd compare-and-swap, so concurrent writers
+cannot replace one another or expose a partial map.
+
+An upgrade imports schema-registry v3's existing owner map exactly. If there is
+no legacy owner map, the Proxy commits the old modulo placement once. Later YAML
+reordering or an extra configured Burrow cannot silently remap rows. A missing
+configured owner, incomplete distribution, unknown owner, incompatible schema,
+or stale topology update fails closed. The current Proxy loads topology at
+startup; live watches and dynamic Tunnel reconfiguration are the next phase.
+
+Later Proxy startups compare the live Burrows with the schema snapshot and fail
+closed if either has drifted. DDL sent through the Proxy is an intentional
+transition and advances compatible schema and topology revisions after all
+Burrows agree. Out-of-band schema changes still require an explicit Hamstergres
+Migrations workflow.
 
 ### Nest storage maintenance
 
-Docker-backed tests keep their isolated schema registry and generated-ID
-sequence below `/hamstergres/tests/<test-key>/`. Each test deletes that exact
+Docker-backed tests keep their isolated schema registry, topology, and
+generated-ID sequence below `/hamstergres/tests/<test-key>/`. Each test deletes that exact
 namespace during `t.Cleanup` and logically compacts through its cleanup
 revision, keeping repeated suites from retaining the large prior values. The
 default schema registry, sequence, benchmark, and experiment namespaces are
@@ -426,6 +444,8 @@ fingerprints, credentials, and bound values are deliberately never labels.
 | `hamstergres_proxy_query_duration_seconds` | seconds | histogram bucket `le` only |
 | `hamstergres_proxy_burrow_executions_total` | executions | configured `burrow` |
 | `hamstergres_proxy_burrow_up` | boolean | configured `burrow` |
+| `hamstergres_proxy_schema_revision` | revision | process-applied Nest schema revision |
+| `hamstergres_proxy_topology_revision` | revision | process-applied Nest topology revision |
 | `hamstergres_proxy_backend_pool_connections` | connections | configured `burrow`; `state`: `capacity`, `in_use`, `idle` |
 | `hamstergres_proxy_backend_pool_acquire_total` | acquisitions | configured `burrow`; `outcome`: `success`, `canceled` |
 | `hamstergres_proxy_backend_pool_wait_total` | waits | configured `burrow` |

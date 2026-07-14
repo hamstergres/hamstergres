@@ -14,6 +14,7 @@ const (
 	DefaultBackendPoolMaxConnections = 8
 	DefaultRuntimeMaxProcs           = 4
 	DefaultTransactionLockTimeout    = "1s"
+	DefaultTopologyKey               = "/hamstergres/topology/v1"
 )
 
 const (
@@ -36,6 +37,7 @@ type Config struct {
 	Nest struct {
 		Endpoint    string `yaml:"endpoint"`
 		RegistryKey string `yaml:"registry_key"`
+		TopologyKey string `yaml:"topology_key"`
 		SequenceKey string `yaml:"sequence_key"`
 	} `yaml:"nest"`
 	Observability struct {
@@ -96,6 +98,9 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.Nest.RegistryKey == "" {
 		cfg.Nest.RegistryKey = "/hamstergres/schema-registry/v3"
+	}
+	if cfg.Nest.TopologyKey == "" {
+		cfg.Nest.TopologyKey = DefaultTopologyKey
 	}
 	if cfg.Nest.SequenceKey == "" {
 		cfg.Nest.SequenceKey = "/hamstergres/sequences/global-id/v1"

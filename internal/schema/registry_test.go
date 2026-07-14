@@ -2,7 +2,7 @@ package schema
 
 import "testing"
 
-func TestSnapshotPreservesShardKeysAndVShardOwners(t *testing.T) {
+func TestSnapshotPreservesSchemaAndExcludesTopologyPlacement(t *testing.T) {
 	want := NewWithTypes(
 		map[string][]string{"public.accounts": {"region", "tenant_id"}},
 		map[string][]string{"public.accounts": {"text", "bigint"}},
@@ -15,8 +15,11 @@ func TestSnapshotPreservesShardKeysAndVShardOwners(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := want.Equal(got); err != nil {
+	if err := want.EqualSchema(got); err != nil {
 		t.Fatal(err)
+	}
+	if got.VShardCount() != 0 {
+		t.Fatalf("schema v4 snapshot retained %d topology owners", got.VShardCount())
 	}
 	if !got.IsSharded("public.accounts") {
 		t.Fatal("annotated table is not sharded")
@@ -32,6 +35,31 @@ func TestSnapshotPreservesShardKeysAndVShardOwners(t *testing.T) {
 	inventory := got.Inventory()
 	if len(inventory) != 2 || !inventory[0].Sharded || inventory[1].Sharded {
 		t.Fatalf("inventory = %#v", inventory)
+	}
+}
+
+func TestFromJSONImportsLegacyV3VShardOwners(t *testing.T) {
+	got, err := FromJSON([]byte(`{"tables":{"public.accounts":["id"]},"vshards":["burrow-02","burrow-01"],"all_tables":["public.accounts"]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Revision() != 1 {
+		t.Fatalf("legacy revision = %d, want 1", got.Revision())
+	}
+	if owner, ok := got.VShardOwner(1); !ok || owner != "burrow-01" {
+		t.Fatalf("legacy owner = %q, %v", owner, ok)
+	}
+}
+
+func TestTableSpecificVShardOwnersCanonicalizePublicAlias(t *testing.T) {
+	registry := New(map[string][]string{"accounts": {"id"}, "public.accounts": {"id"}}).
+		WithAllTables([]string{"public.accounts"}).
+		WithTableVShards(map[string][]string{"public.accounts": {"burrow-01", "burrow-02"}})
+	if owner, ok := registry.VShardOwnerFor("accounts", 1); !ok || owner != "burrow-02" {
+		t.Fatalf("table owner = %q, %v", owner, ok)
+	}
+	if !registry.HasTopologyPlacement() {
+		t.Fatal("topology placement marker is missing")
 	}
 }
 
