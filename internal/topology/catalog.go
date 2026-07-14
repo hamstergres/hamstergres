@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Package topology defines the versioned routing catalog persisted in
 // Hamstergres Nest.
 package topology

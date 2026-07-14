@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Package schema records the database schema contract shared by all Burrows.
 package schema
 

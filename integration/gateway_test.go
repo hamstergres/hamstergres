@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Package integration tests the compiled gateway against the Docker Burrow environment.
 package integration
 

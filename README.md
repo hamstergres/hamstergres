@@ -559,3 +559,8 @@ make proxy-status
 The binary is intentionally structured as a CLI (`hamstergres-proxy status`)
 so `add-shard` and `remove-shard` commands can be added without changing the
 gateway process contract.
+
+## License
+
+Hamstergres is licensed under the [GNU Affero General Public License v3.0](LICENSE)
+only (`AGPL-3.0-only`).

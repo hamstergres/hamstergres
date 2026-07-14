@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Package copyrouter parses PostgreSQL COPY statements and routes streaming
 // COPY FROM rows without buffering the complete input.
 package copyrouter

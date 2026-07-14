@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Package status serves the human and machine readable gateway status views.
 package status
 

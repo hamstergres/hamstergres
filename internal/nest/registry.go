@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
 // Package nest provides the Proxy's narrow control-plane interface.
 package nest
 
