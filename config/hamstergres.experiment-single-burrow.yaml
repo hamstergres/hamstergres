@@ -12,6 +12,7 @@ transactions:
 nest:
   endpoint: "http://127.0.0.1:2379"
   registry_key: "/hamstergres/experiments/cpu-scaling/single/schema-registry/v3"
+  topology_key: "/hamstergres/experiments/cpu-scaling/single/topology/v1"
   sequence_key: "/hamstergres/experiments/cpu-scaling/single/global-id/v1"
 
 sharding:

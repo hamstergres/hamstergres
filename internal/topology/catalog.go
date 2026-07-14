@@ -5,6 +5,7 @@ package topology
 import (
 	"crypto/sha256"
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -34,8 +35,9 @@ type SchemaCompatibility struct {
 }
 
 type TunnelEndpoint struct {
-	Name string `json:"name"`
-	DSN  string `json:"dsn"`
+	Name                     string `json:"name"`
+	Address                  string `json:"address"`
+	ConfigurationFingerprint string `json:"configuration_fingerprint"`
 }
 
 type Burrow struct {
@@ -51,8 +53,11 @@ type Burrow struct {
 type Distribution struct {
 	ID          string `json:"id"`
 	VShardCount int    `json:"vshard_count"`
-	// Owners is a complete, zero-indexed vshard-to-Burrow-ID map.
-	Owners []string `json:"owners"`
+	// BurrowIDs is the immutable owner dictionary. OwnerIndexes is the complete,
+	// zero-indexed vshard map into that dictionary. The compact representation
+	// keeps a 65,536-vshard etcd transaction well below its request limit.
+	BurrowIDs    []string `json:"burrow_ids"`
+	OwnerIndexes []uint16 `json:"owner_indexes"`
 }
 
 type ChangeMetadata struct {
@@ -116,9 +121,10 @@ func Bootstrap(registry schema.Registry, configured []BootstrapBurrow, legacyOwn
 		}
 		id := StableBurrowID(configuredBurrow.Name)
 		byName[configuredBurrow.Name] = id
+		address, fingerprint := tunnelMetadata(configuredBurrow.DSN)
 		burrows = append(burrows, Burrow{
 			ID: id, Name: configuredBurrow.Name, State: BurrowReady,
-			Tunnels: []TunnelEndpoint{{Name: "primary", DSN: configuredBurrow.DSN}}, Weight: 1,
+			Tunnels: []TunnelEndpoint{{Name: "primary", Address: address, ConfigurationFingerprint: fingerprint}}, Weight: 1,
 		})
 	}
 	if len(legacyOwners) == 0 {
@@ -128,13 +134,24 @@ func Bootstrap(registry schema.Registry, configured []BootstrapBurrow, legacyOwn
 		}
 		legacyOwners = LegacyModuloOwners(names, DefaultVShardCount)
 	}
-	ownerIDs := make([]string, len(legacyOwners))
-	for index, owner := range legacyOwners {
+	ownerDictionary := make([]string, 0, len(configured))
+	ownerIndexesByID := make(map[string]uint16, len(configured))
+	ownerIndexes := make([]uint16, len(legacyOwners))
+	for vshard, owner := range legacyOwners {
 		id, ok := byName[owner]
 		if !ok {
-			return Catalog{}, fmt.Errorf("legacy vshard %d references unconfigured Burrow %q", index, owner)
+			return Catalog{}, fmt.Errorf("legacy vshard %d references unconfigured Burrow %q", vshard, owner)
 		}
-		ownerIDs[index] = id
+		ownerIndex, exists := ownerIndexesByID[id]
+		if !exists {
+			if len(ownerDictionary) >= 1<<16 {
+				return Catalog{}, fmt.Errorf("distribution has more than 65536 Burrow owners")
+			}
+			ownerIndex = uint16(len(ownerDictionary))
+			ownerIndexesByID[id] = ownerIndex
+			ownerDictionary = append(ownerDictionary, id)
+		}
+		ownerIndexes[vshard] = ownerIndex
 	}
 	tables := registry.CanonicalShardedTables()
 	tableDistributions := make(map[string]string, len(tables))
@@ -153,8 +170,10 @@ func Bootstrap(registry schema.Registry, configured []BootstrapBurrow, legacyOwn
 			Revision:       revision,
 			Fingerprint:    registry.Fingerprint(),
 		},
-		Burrows:            burrows,
-		Distributions:      []Distribution{{ID: BootstrapDistribution, VShardCount: len(ownerIDs), Owners: ownerIDs}},
+		Burrows: burrows,
+		Distributions: []Distribution{{
+			ID: BootstrapDistribution, VShardCount: len(ownerIndexes), BurrowIDs: ownerDictionary, OwnerIndexes: ownerIndexes,
+		}},
 		TableDistributions: tableDistributions,
 		Change:             ChangeMetadata{Actor: "hamstergres-proxy", Reason: "bootstrap schema-registry v3 placement", Timestamp: now.UTC()},
 	}
@@ -202,7 +221,7 @@ func (c Catalog) Validate() error {
 			return fmt.Errorf("Burrow %s has no Tunnel endpoint", burrow.Name)
 		}
 		for _, tunnel := range burrow.Tunnels {
-			if tunnel.Name == "" || tunnel.DSN == "" {
+			if tunnel.Name == "" || tunnel.Address == "" || tunnel.ConfigurationFingerprint == "" {
 				return fmt.Errorf("Burrow %s has an incomplete Tunnel endpoint", burrow.Name)
 			}
 		}
@@ -217,16 +236,29 @@ func (c Catalog) Validate() error {
 		if _, exists := distributions[distribution.ID]; exists {
 			return fmt.Errorf("duplicate distribution ID %q", distribution.ID)
 		}
-		if distribution.VShardCount <= 0 || len(distribution.Owners) != distribution.VShardCount {
-			return fmt.Errorf("distribution %s has incomplete vshard coverage: %d owners for %d vshards", distribution.ID, len(distribution.Owners), distribution.VShardCount)
+		if distribution.VShardCount <= 0 || len(distribution.OwnerIndexes) != distribution.VShardCount {
+			return fmt.Errorf("distribution %s has incomplete vshard coverage: %d owners for %d vshards", distribution.ID, len(distribution.OwnerIndexes), distribution.VShardCount)
 		}
-		for vshard, owner := range distribution.Owners {
+		if len(distribution.BurrowIDs) == 0 || len(distribution.BurrowIDs) > 1<<16 {
+			return fmt.Errorf("distribution %s has an invalid Burrow owner dictionary", distribution.ID)
+		}
+		seenOwner := make(map[string]struct{}, len(distribution.BurrowIDs))
+		for _, owner := range distribution.BurrowIDs {
+			if _, duplicate := seenOwner[owner]; duplicate {
+				return fmt.Errorf("distribution %s repeats Burrow owner %q", distribution.ID, owner)
+			}
 			burrow, ok := burrows[owner]
 			if !ok {
-				return fmt.Errorf("distribution %s vshard %d has unknown owner %q", distribution.ID, vshard, owner)
+				return fmt.Errorf("distribution %s has unknown owner %q", distribution.ID, owner)
 			}
 			if burrow.State != BurrowReady && burrow.State != BurrowDraining {
-				return fmt.Errorf("distribution %s vshard %d is owned by Burrow %s in state %s", distribution.ID, vshard, burrow.Name, burrow.State)
+				return fmt.Errorf("distribution %s is owned by Burrow %s in state %s", distribution.ID, burrow.Name, burrow.State)
+			}
+			seenOwner[owner] = struct{}{}
+		}
+		for vshard, ownerIndex := range distribution.OwnerIndexes {
+			if int(ownerIndex) >= len(distribution.BurrowIDs) {
+				return fmt.Errorf("distribution %s vshard %d has unknown owner index %d", distribution.ID, vshard, ownerIndex)
 			}
 		}
 		distributions[distribution.ID] = distribution
@@ -274,11 +306,23 @@ func (c Catalog) ValidateConfigured(configured map[string]string) error {
 		if !ok {
 			return fmt.Errorf("topology Burrow %s is not configured for this Proxy", burrow.Name)
 		}
-		if len(burrow.Tunnels) == 0 || burrow.Tunnels[0].DSN != dsn {
+		address, fingerprint := tunnelMetadata(dsn)
+		if len(burrow.Tunnels) == 0 || burrow.Tunnels[0].Address != address || burrow.Tunnels[0].ConfigurationFingerprint != fingerprint {
 			return fmt.Errorf("configured Tunnel for Burrow %s differs from topology revision %d", burrow.Name, c.Revision)
 		}
 	}
 	return nil
+}
+
+func tunnelMetadata(dsn string) (string, string) {
+	sum := sha256.Sum256([]byte(dsn))
+	fingerprint := fmt.Sprintf("sha256:%x", sum[:])
+	parsed, err := url.Parse(dsn)
+	if err != nil || parsed.Host == "" {
+		return "configured-endpoint", fingerprint
+	}
+	address := parsed.Host + strings.TrimSuffix(parsed.EscapedPath(), "/")
+	return address, fingerprint
 }
 
 func (c Catalog) TablePlacements() (map[string][]string, error) {
@@ -296,9 +340,9 @@ func (c Catalog) TablePlacements() (map[string][]string, error) {
 	placements := make(map[string][]string, len(c.TableDistributions))
 	for table, distributionID := range c.TableDistributions {
 		distribution := distributions[distributionID]
-		owners := make([]string, len(distribution.Owners))
-		for index, owner := range distribution.Owners {
-			owners[index] = burrowNames[owner]
+		owners := make([]string, len(distribution.OwnerIndexes))
+		for index, ownerIndex := range distribution.OwnerIndexes {
+			owners[index] = burrowNames[distribution.BurrowIDs[ownerIndex]]
 		}
 		placements[table] = owners
 	}

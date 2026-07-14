@@ -162,22 +162,55 @@ replicated input. COPY output does not promise global row ordering; applications
 that require it must use an explicitly ordered query-based alternative. Format
 metadata must agree across all participants.
 
-## Schema registry contract
+## Schema and topology contracts
 
-Hamstergres Nest persists the validated table inventory, shard-key, and vshard
-registry at `/hamstergres/schema-registry/v3` by default. On first startup, a Proxy seeds
-an empty registry from the live Burrow catalogs. Later startup compares the
-live registry with both every other Burrow and the Nest snapshot. Any mismatch
-is a startup error: the Proxy never guesses which schema is authoritative or
-applies DDL itself. Hamstergres Migrations is responsible for an intentional
-schema change and for updating the Nest snapshot as part of that workflow.
+Hamstergres Nest keeps schema and topology as separately versioned records. The
+schema registry remains at `/hamstergres/schema-registry/v3` during the in-place
+upgrade, but its version 4 payload contains only the validated table inventory,
+ordered shard keys and types, generated-key metadata, and a monotonic schema
+revision. On first startup, a Proxy seeds that schema contract from the live
+Burrow catalogs. Later startups compare every Burrow with the Nest snapshot and
+fail closed on drift. Hamstergres Migrations remains responsible for intentional
+schema transitions and registry publication.
 
-The snapshot is also Hamstergres' sharding catalog: it records each sharded
-table and ordered column list plus the owning Burrow for every vshard. Tables absent from the
-catalog are unsharded. The configuration-wide
-`sharding.unsharded_tables.mode` chooses `primary` (all traffic uses one
-configured Burrow) or `replicated` (writes reach all Burrows and reads choose
-one Burrow). This policy is deliberately not selectable per table.
+The independent topology catalog is stored at `/hamstergres/topology/v1`. One
+atomic catalog value contains a monotonic topology revision, schema compatibility
+revision and fingerprint, immutable Burrow IDs, operator-facing names, Tunnel
+addresses and configuration fingerprints, lifecycle states, capacity and
+placement labels, routing distributions, and the table-to-distribution map.
+Credentials remain in Proxy configuration; topology records do not expose
+Tunnel passwords. Each distribution has a fixed vshard count and a complete
+owner map encoded as a Burrow-ID dictionary plus one numeric owner index per
+vshard. Tables may share a distribution initially and later move to independent
+distributions without remapping unrelated tables.
+
+Topology publication uses one etcd compare-and-swap transaction. A writer must
+present the current etcd modification revision and publish the next logical
+revision as a complete value. Stale writers lose without replacing the winner;
+unknown owners, duplicate IDs or names, incomplete coverage, invalid lifecycle
+transitions, and removal of an owner with placements all fail validation before
+publication. Existing distributions cannot change their vshard count in place.
+
+The first upgraded Proxy imports the exact owner array from schema-registry v3.
+If no v3 owner array exists, it calculates the old sorted-Burrow modulo map once
+and commits that result as topology revision 1. It then rewrites the accepted
+schema snapshot without placement. Reordering YAML cannot affect routing after
+that point. A configured Burrow absent from the ready or draining topology set
+is not routable, and a topology owner missing from configuration makes startup
+fail closed. Adding a Burrow starts with no ownership; an explicit later
+placement transaction is required before any vshard moves.
+
+The current Proxy loads one immutable topology snapshot during startup. DDL that
+successfully creates a new sharded table advances the schema revision and uses a
+CAS topology revision to attach the empty table to the bootstrap distribution
+without changing any existing owners. Watching topology, preparing new pools,
+atomically switching live Proxies, and retiring old Tunnels belong to issue #13.
+
+Tables absent from the schema's sharded-table set are unsharded. The
+configuration-wide `sharding.unsharded_tables.mode` chooses `primary` (all
+traffic uses one configured Burrow) or `replicated` (writes reach all routable
+Burrows and reads choose one Burrow). This policy is deliberately not selectable
+per table yet.
 
 Hamstergres Proxy parses DML with PostgreSQL's AST before it makes a routing
 decision. Simple and extended-query execution use the same plan. Relation and

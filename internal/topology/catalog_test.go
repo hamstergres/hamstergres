@@ -68,6 +68,13 @@ func TestBootstrapReproducesFullModuloMap(t *testing.T) {
 	if owners[0] != "burrow-02" || owners[1] != "burrow-01" || owners[2] != "burrow-02" {
 		t.Fatalf("first modulo owners = %#v", owners[:3])
 	}
+	data, err := json.Marshal(catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) >= 1<<20 {
+		t.Fatalf("compact topology is %d bytes, want less than 1 MiB", len(data))
+	}
 }
 
 func TestValidateRejectsIncompleteAndUnknownPlacement(t *testing.T) {
@@ -77,14 +84,14 @@ func TestValidateRejectsIncompleteAndUnknownPlacement(t *testing.T) {
 	}
 	incomplete := catalog
 	incomplete.Distributions = append([]Distribution(nil), catalog.Distributions...)
-	incomplete.Distributions[0].Owners = []string{catalog.Burrows[0].ID}
+	incomplete.Distributions[0].OwnerIndexes = []uint16{0}
 	if err := incomplete.Validate(); err == nil {
 		t.Fatal("incomplete placement was accepted")
 	}
 	unknown := catalog
 	unknown.Distributions = append([]Distribution(nil), catalog.Distributions...)
-	unknown.Distributions[0].Owners = append([]string(nil), catalog.Distributions[0].Owners...)
-	unknown.Distributions[0].Owners[0] = "missing"
+	unknown.Distributions[0].BurrowIDs = append([]string(nil), catalog.Distributions[0].BurrowIDs...)
+	unknown.Distributions[0].BurrowIDs[0] = "missing"
 	if err := unknown.Validate(); err == nil {
 		t.Fatal("unknown owner was accepted")
 	}
@@ -101,7 +108,7 @@ func TestAddingBurrowDoesNotChangePlacement(t *testing.T) {
 	next.Change.Reason = "register capacity without routing"
 	next.Burrows = append(next.Burrows, Burrow{
 		ID: StableBurrowID("burrow-02"), Name: "burrow-02", State: BurrowAdding,
-		Tunnels: []TunnelEndpoint{{Name: "primary", DSN: "postgres://two"}}, Weight: 1,
+		Tunnels: []TunnelEndpoint{{Name: "primary", Address: "two", ConfigurationFingerprint: "sha256:test"}}, Weight: 1,
 	})
 	if err := ValidateTransition(current, next); err != nil {
 		t.Fatal(err)
@@ -122,7 +129,7 @@ func TestTransitionRejectsVShardCountChangeAndOwnedRemoval(t *testing.T) {
 	resized.Revision++
 	resized.Change.Timestamp = resized.Change.Timestamp.Add(time.Second)
 	resized.Distributions[0].VShardCount++
-	resized.Distributions[0].Owners = append(resized.Distributions[0].Owners, resized.Burrows[0].ID)
+	resized.Distributions[0].OwnerIndexes = append(resized.Distributions[0].OwnerIndexes, 0)
 	if err := ValidateTransition(current, resized); err == nil {
 		t.Fatal("vshard count change was accepted")
 	}

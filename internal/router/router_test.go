@@ -249,6 +249,34 @@ func TestPreparedAnalyzeReusesSyntaxWithCurrentBindingsAndRegistry(t *testing.T)
 	}
 }
 
+func TestTableSpecificTopologyCanPlaceSameKeyOnDifferentBurrows(t *testing.T) {
+	burrows := []string{"burrow-01", "burrow-02"}
+	ownersOne := make([]string, VirtualShards)
+	ownersTwo := make([]string, VirtualShards)
+	for vshard := 0; vshard < VirtualShards; vshard++ {
+		ownersOne[vshard] = "burrow-01"
+		ownersTwo[vshard] = "burrow-02"
+	}
+	registry := schema.NewWithTypes(
+		map[string][]string{"public.accounts": {"id"}, "public.orders": {"id"}},
+		map[string][]string{"public.accounts": {"bigint"}, "public.orders": {"bigint"}},
+	).WithAllTables([]string{"public.accounts", "public.orders"}).WithTableVShards(map[string][]string{
+		"public.accounts": ownersOne,
+		"public.orders":   ownersTwo,
+	})
+	accounts, err := Analyze("SELECT * FROM public.accounts WHERE id = 42", nil, registry, burrows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orders, err := Analyze("SELECT * FROM public.orders WHERE id = 42", nil, registry, burrows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accounts.Target != "burrow-01" || orders.Target != "burrow-02" || !accounts.Routed || !orders.Routed {
+		t.Fatalf("table placements = accounts %#v, orders %#v", accounts, orders)
+	}
+}
+
 func TestAnalyzeRejectsParserErrorsAndMultiStatementWrites(t *testing.T) {
 	registry := schema.New(map[string][]string{"accounts": {"tenant_id"}})
 	if _, err := Analyze("SELECT * FROM accounts WHERE (", nil, registry, []string{"burrow-01"}); err == nil {
