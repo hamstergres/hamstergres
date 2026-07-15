@@ -49,10 +49,20 @@ exact comment `hamstergres.shard_key`. Multiple marked columns form a compound
 key in PostgreSQL attribute order, so numeric, text, and mixed-type tuples are
 supported. For example, mark both `accounts.tenant_id` and
 `accounts.region`. It routes reads and writes using the complete tuple and the
-64k-vshard ownership catalog persisted in Nest. It scatters only reads without
-a usable shard key and schema commands that must
-reach every Burrow. A simple-query write without one unambiguous primary key is
-rejected; it is never broadcast as a substitute for distributed transactions.
+64k-vshard ownership catalog persisted in Nest. It scatters append-safe reads
+without a usable shard key and schema commands that must reach every Burrow. A
+simple-query write without one unambiguous primary key is rejected; it is never
+broadcast as a substitute for distributed transactions. Relation-free
+`SELECT`, PostgreSQL catalog reads, and session introspection execute once on a
+deterministic Burrow. In `primary` mode that is the configured primary Burrow;
+in `replicated` mode it is the lexicographically first routable Burrow. Reads
+whose referenced user tables are all unsharded also execute once, using the
+configured primary or one selected replica according to the fleet policy. This
+keeps physical catalog copies and Burrow count invisible to PostgreSQL clients.
+Aggregates, grouping, `DISTINCT`, ordering, limits, offsets, joins, CTEs,
+subqueries, set operations, windows, and row locking fail before a Tunnel is
+opened with SQLSTATE `0A000` unless a complete shard key first reduces the query
+to one Burrow. Simple and extended-query execution share this planner.
 Within a simple-query transaction, statements may route to different Burrows.
 Transactions execute DML concurrently with other frontend transactions and do
 not take a Proxy-wide write lock. If a write touches more than one Burrow,
@@ -76,12 +86,13 @@ managers. Every Tunnel therefore sets PostgreSQL `lock_timeout` from
 `transactions.lock_timeout`, which defaults to one second. A bounded lock wait
 fails with SQLSTATE `55P03`; applications must retry the complete transaction.
 
-Extended-query statements are parsed on every affinity connection, but a portal
-whose bound parameters contain a complete primary key uses one Tunnel for its
-Bind, Describe, Execute, and Close lifecycle. Unkeyed reads scatter in stable
-Burrow order, and unroutable writes fail closed. Read-only and single-Burrow
-transactions avoid prepared transactions. Multi-Burrow writes use the same
-two-phase commit path as simple queries.
+Extended-query statements are parsed on every selected affinity connection,
+but a portal whose bound parameters contain a complete primary key uses one
+Tunnel for its Bind, Describe, Execute, and Close lifecycle. Unkeyed reads
+scatter in stable Burrow order only when their results are append-safe;
+topology-independent reads use one Tunnel, and unroutable writes fail closed.
+Read-only and single-Burrow transactions avoid prepared transactions.
+Multi-Burrow writes use the same two-phase commit path as simple queries.
 
 The Proxy buffers an extended request through the frontend Flush or Sync
 boundary and forwards Bind, optional portal Describe, Execute, and Sync in one

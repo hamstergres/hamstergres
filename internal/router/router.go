@@ -20,11 +20,14 @@ const VirtualShards = 65536
 // extended-query execution. Routed is true only when the AST proves a complete,
 // constant shard-key tuple for one physical relation.
 type Plan struct {
-	Table   string
-	Write   bool
-	Sharded bool
-	Target  string
-	Routed  bool
+	Table         string
+	Write         bool
+	Sharded       bool
+	Target        string
+	Routed        bool
+	SingleBurrow  bool
+	Deterministic bool
+	ScatterError  string
 }
 
 // Prepared is the immutable, parser-derived portion of a routing plan. Extended
@@ -40,6 +43,9 @@ type Prepared struct {
 	update            *pg_query.UpdateStmt
 	physicalRelations int
 	maximumParameter  int
+	read              bool
+	relations         []string
+	scatterError      string
 }
 
 // Prepare parses exactly one PostgreSQL statement and caches its immutable
@@ -90,19 +96,25 @@ func Prepare(sql string) (*Prepared, error) {
 		prepared.relation = value.MergeStmt.Relation
 	case *pg_query.Node_SelectStmt:
 		selectStatement := value.SelectStmt
+		prepared.read = selectStatement.IntoClause == nil
 		if selectStatement.WithClause == nil && selectStatement.Op == pg_query.SetOperation_SETOP_NONE && len(selectStatement.FromClause) == 1 {
 			prepared.relation = selectStatement.FromClause[0].GetRangeVar()
 			prepared.predicate = selectStatement.WhereClause
 		}
+	case *pg_query.Node_VariableShowStmt:
+		prepared.read = true
 	default:
-		return prepared, nil
 	}
 
+	prepared.relations = physicalRelationNames(statement)
+	prepared.physicalRelations = len(prepared.relations)
+	if selectStatement := statement.GetSelectStmt(); selectStatement != nil {
+		prepared.scatterError = unsafeScatterReason(selectStatement, prepared.physicalRelations)
+	}
 	if prepared.relation == nil {
 		return prepared, nil
 	}
 	prepared.plan.Table = relationName(prepared.relation)
-	prepared.physicalRelations = countPhysicalRelations(statement)
 	return prepared, nil
 }
 
@@ -127,11 +139,36 @@ func (p *Prepared) Table() string {
 // Analyze resolves one execution of a prepared statement against bound values
 // and the current registry. The cached AST is read-only; schema and vshard
 // ownership changes therefore remain visible without reparsing SQL.
-func (p *Prepared) Analyze(parameters [][]byte, registry schema.Registry, burrows []string) Plan {
+func (p *Prepared) Analyze(parameters [][]byte, registry schema.Registry, burrows []string) (plan Plan) {
 	if p == nil {
 		return Plan{}
 	}
-	plan := p.plan
+	plan = p.plan
+	containsShardedRelation := false
+	if p.read {
+		for _, table := range p.relations {
+			if registry.IsSharded(table) || registry.IsSharded(registry.CanonicalTable(table)) {
+				containsShardedRelation = true
+				break
+			}
+		}
+		if !containsShardedRelation {
+			plan.SingleBurrow = true
+			plan.Deterministic = true
+			for _, table := range p.relations {
+				if registry.HasTable(table) {
+					plan.Deterministic = false
+					break
+				}
+			}
+			return plan
+		}
+		defer func() {
+			if !plan.Routed && p.scatterError != "" {
+				plan.ScatterError = p.scatterError
+			}
+		}()
+	}
 	relation, insert, update := p.relation, p.insert, p.update
 	if relation == nil {
 		return plan
@@ -744,14 +781,90 @@ func containsWrite(tree *pg_query.ParseResult) bool {
 	return found
 }
 
-func countPhysicalRelations(statement *pg_query.Node) int {
+func physicalRelationNames(statement *pg_query.Node) []string {
+	var names []string
+	walkMessage(statement.ProtoReflect(), func(message protoreflect.Message) {
+		if relation, ok := message.Interface().(*pg_query.RangeVar); ok {
+			names = append(names, relationName(relation))
+		}
+	})
+	return names
+}
+
+func unsafeScatterReason(statement *pg_query.SelectStmt, physicalRelations int) string {
+	if statement == nil {
+		return ""
+	}
+	if statement.Op != pg_query.SetOperation_SETOP_NONE {
+		return "set operations over sharded tables require a PostgreSQL-equivalent global result merge"
+	}
+	if statement.WithClause != nil || countSelectStatements(statement) > 1 {
+		return "CTEs and subqueries over sharded tables require a PostgreSQL-equivalent global result merge"
+	}
+	if physicalRelations > 1 {
+		return "joins over sharded tables require a PostgreSQL-equivalent global result merge"
+	}
+	if len(statement.DistinctClause) > 0 || statement.GroupDistinct {
+		return "DISTINCT over sharded tables requires a PostgreSQL-equivalent global result merge"
+	}
+	if hasAggregateOrWindow(statement) || len(statement.GroupClause) > 0 || statement.HavingClause != nil || len(statement.WindowClause) > 0 {
+		return "aggregates, grouping, and window functions over sharded tables require a PostgreSQL-equivalent global result merge"
+	}
+	if len(statement.SortClause) > 0 {
+		return "ORDER BY over sharded tables requires a PostgreSQL-equivalent global result merge"
+	}
+	if statement.LimitCount != nil || statement.LimitOffset != nil || statement.LimitOption != pg_query.LimitOption_LIMIT_OPTION_DEFAULT {
+		return "LIMIT and OFFSET over sharded tables require a PostgreSQL-equivalent global result merge"
+	}
+	if len(statement.LockingClause) > 0 {
+		return "row locking over sharded tables requires a PostgreSQL-equivalent global result merge"
+	}
+	return ""
+}
+
+func countSelectStatements(statement *pg_query.SelectStmt) int {
 	count := 0
 	walkMessage(statement.ProtoReflect(), func(message protoreflect.Message) {
-		if _, ok := message.Interface().(*pg_query.RangeVar); ok {
+		if _, ok := message.Interface().(*pg_query.SelectStmt); ok {
 			count++
 		}
 	})
 	return count
+}
+
+func hasAggregateOrWindow(statement *pg_query.SelectStmt) bool {
+	found := false
+	walkMessage(statement.ProtoReflect(), func(message protoreflect.Message) {
+		call, ok := message.Interface().(*pg_query.FuncCall)
+		if !ok || found {
+			return
+		}
+		if call.Over != nil || call.AggStar || call.AggDistinct || call.AggFilter != nil || len(call.AggOrder) > 0 || call.AggWithinGroup {
+			found = true
+			return
+		}
+		name := strings.ToLower(functionName(call.Funcname))
+		switch name {
+		case "avg", "count", "max", "min", "sum":
+			found = true
+		}
+	})
+	return found
+}
+
+func functionName(nodes []*pg_query.Node) string {
+	parts := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		value := node.GetString_()
+		if value == nil {
+			return ""
+		}
+		parts = append(parts, value.Sval)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return parts[len(parts)-1]
 }
 
 func walkMessage(message protoreflect.Message, visit func(protoreflect.Message)) {

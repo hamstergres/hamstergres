@@ -142,6 +142,16 @@ func (r Registry) IsSharded(table string) bool {
 	return ok
 }
 
+// HasTable reports whether a relation is part of the validated user-table
+// inventory. PostgreSQL catalogs and information_schema are deliberately
+// absent, allowing the query planner to distinguish topology-independent
+// introspection from ordinary unsharded-table reads.
+func (r Registry) HasTable(table string) bool {
+	canonical := r.CanonicalTable(table)
+	index := sort.SearchStrings(r.allTables, canonical)
+	return index < len(r.allTables) && r.allTables[index] == canonical
+}
+
 func (r Registry) VShardOwners() []string { return append([]string(nil), r.vshards...) }
 
 // TableVShardOwners returns the topology-backed placement for one table.

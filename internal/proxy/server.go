@@ -191,6 +191,11 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 					state.failed = true
 					break
 				}
+				if decision.scatterError != "" {
+					s.sendExtendedError(frontend, "0A000", decision.scatterError)
+					state.failed = true
+					break
+				}
 				if decision.keyedWrite && !decision.routed {
 					s.sendExtendedError(frontend, "0A000", "write to a sharded table must include one unambiguous annotated shard key")
 					state.failed = true
@@ -228,6 +233,11 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 				decision, err := s.routePortal(statement.routing, parameters, s.backends.ShardNames())
 				if err != nil {
 					s.sendExtendedError(frontend, "42601", err.Error())
+					state.failed = true
+					break
+				}
+				if decision.scatterError != "" {
+					s.sendExtendedError(frontend, "0A000", decision.scatterError)
 					state.failed = true
 					break
 				}
@@ -1777,6 +1787,11 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 		return false
 	}
 	target, routed := decision.target, decision.routed
+	if decision.scatterError != "" {
+		errorCategory = "unsupported_global_result"
+		s.sendSessionError(frontend, state.txStatus(), "0A000", decision.scatterError)
+		return false
+	}
 	if decision.keyedWrite && !routed {
 		errorCategory = "unsafe_routing"
 		s.sendSessionError(frontend, state.txStatus(), "0A000", "write to a sharded table must include its annotated shard key")
@@ -2009,9 +2024,10 @@ func runTransactionCommand(session *backend.Session, burrow, sql string) *pgprot
 }
 
 type routeDecision struct {
-	target     string
-	routed     bool
-	keyedWrite bool
+	target       string
+	routed       bool
+	keyedWrite   bool
+	scatterError string
 }
 
 func (s *Server) routeSQL(sql string, burrows []string) (routeDecision, error) {
@@ -2032,7 +2048,28 @@ func (s *Server) routePortal(prepared *router.Prepared, parameters [][]byte, bur
 }
 
 func (s *Server) routePlan(plan router.Plan, burrows []string) routeDecision {
-	decision := routeDecision{target: plan.Target, routed: plan.Routed, keyedWrite: plan.Write && (plan.Table == "" || plan.Sharded)}
+	decision := routeDecision{target: plan.Target, routed: plan.Routed, keyedWrite: plan.Write && (plan.Table == "" || plan.Sharded), scatterError: plan.ScatterError}
+	if plan.SingleBurrow {
+		if len(burrows) == 0 {
+			return decision
+		}
+		if s.backends.UnshardedMode() == "primary" {
+			decision.target = s.backends.PrimaryBurrow()
+		} else if plan.Deterministic {
+			ordered := append([]string(nil), burrows...)
+			sort.Strings(ordered)
+			decision.target = ordered[0]
+		} else {
+			var value [8]byte
+			if _, err := rand.Read(value[:]); err != nil {
+				decision.target = burrows[0]
+			} else {
+				decision.target = burrows[binary.LittleEndian.Uint64(value[:])%uint64(len(burrows))]
+			}
+		}
+		decision.routed = decision.target != ""
+		return decision
+	}
 	if plan.Routed || plan.Table == "" || plan.Sharded {
 		return decision
 	}
@@ -2245,6 +2282,11 @@ func (s *Server) handleQuery(frontend *pgproto3.Backend, sql string) {
 		return
 	}
 	target, routed := decision.target, decision.routed
+	if decision.scatterError != "" {
+		errorCategory = "unsupported_global_result"
+		s.sendError(frontend, "0A000", decision.scatterError)
+		return
+	}
 	if decision.keyedWrite && !routed {
 		errorCategory = "unsafe_routing"
 		s.sendError(frontend, "0A000", "write to a sharded table must include its annotated shard key")

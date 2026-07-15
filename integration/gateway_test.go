@@ -63,8 +63,8 @@ func TestGatewayEndToEnd(t *testing.T) {
 		if err := rows.Err(); err != nil {
 			t.Fatal(err)
 		}
-		if len(values) != 2 || values[0] != 1 || values[1] != 1 {
-			t.Fatalf("merged values = %#v, want [1 1] from both Burrows", values)
+		if len(values) != 1 || values[0] != 1 {
+			t.Fatalf("topology-independent values = %#v, want one logical row", values)
 		}
 	})
 	queryGateway(t, frontendAddress, "SELECT * FROM accounts WHERE tenant_id = 1 AND account_id = 1", func(rows pgx.Rows) {
@@ -98,10 +98,10 @@ func TestGatewayEndToEnd(t *testing.T) {
 	if snapshot.Queries.Queries != 3 || snapshot.Queries.FailedQueries != 1 {
 		t.Fatalf("query counters = %#v, want two successful and one failed query", snapshot.Queries)
 	}
-	if snapshot.QueryMetrics.Total.ScatteredQueries != 1 || snapshot.QueryMetrics.Total.SingleShardQueries != 2 {
-		t.Fatalf("routing counters = %#v, want one scattered and two single-Burrow queries", snapshot.QueryMetrics.Total)
+	if snapshot.QueryMetrics.Total.ScatteredQueries != 0 || snapshot.QueryMetrics.Total.SingleShardQueries != 3 {
+		t.Fatalf("routing counters = %#v, want three single-Burrow queries", snapshot.QueryMetrics.Total)
 	}
-	assertTotalShardExecutions(t, snapshot.QueryMetrics.ShardExecutions, 4)
+	assertTotalShardExecutions(t, snapshot.QueryMetrics.ShardExecutions, 3)
 	assertSummary(t, snapshot.QueryMetrics.QuerySummaries, "SELECT ? AS value")
 	assertSummary(t, snapshot.QueryMetrics.QuerySummaries, "SELECT * FROM accounts WHERE tenant_id = ? AND account_id = ?")
 	metrics := getBody(t, statusURL+"/metrics")
@@ -113,8 +113,8 @@ func TestGatewayEndToEnd(t *testing.T) {
 		`hamstergres_proxy_queries_total{outcome="success"} 2`,
 		`hamstergres_proxy_queries_total{outcome="failure"} 1`,
 		`hamstergres_proxy_query_failures_total{category="sql_error"} 1`,
-		`hamstergres_proxy_query_routes_total{route="single_burrow"} 2`,
-		`hamstergres_proxy_query_routes_total{route="scatter"} 1`,
+		`hamstergres_proxy_query_routes_total{route="single_burrow"} 3`,
+		`hamstergres_proxy_query_routes_total{route="scatter"} 0`,
 		`hamstergres_proxy_burrow_executions_total{burrow="burrow-01"}`,
 		`hamstergres_proxy_schema_revision 1`,
 		`hamstergres_proxy_topology_revision 1`,
@@ -143,10 +143,101 @@ func TestGatewayEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("status CLI failed: %v\n%s", err, output)
 	}
-	if !strings.Contains(string(output), "Routing: 1 scattered / 2 single-shard") || !strings.Contains(string(output), statistics.Fingerprint("SELECT * FROM accounts WHERE tenant_id = ? AND account_id = ?")) {
+	if !strings.Contains(string(output), "Routing: 0 scattered / 3 single-shard") || !strings.Contains(string(output), statistics.Fingerprint("SELECT * FROM accounts WHERE tenant_id = ? AND account_id = ?")) {
 		t.Fatalf("status CLI output did not contain routing and fingerprint data:\n%s", output)
 	}
 	assertConcurrentQueriesAndMetricScrapes(t, frontendAddress, statusURL+"/metrics")
+}
+
+func TestTopologyTransparentReadResultsEndToEnd(t *testing.T) {
+	repoRoot := repositoryRoot(t)
+	ensureDockerBurrows(t, repoRoot)
+	frontendAddress, statusAddress := availableAddress(t), availableAddress(t)
+	logs := startGateway(t, buildGateway(t, repoRoot), writeGatewayConfig(t, frontendAddress, statusAddress))
+	statusURL := "http://" + statusAddress
+	waitForHealthyGateway(t, statusURL, logs)
+
+	queryGateway(t, frontendAddress, "SELECT 1 AS value", func(rows pgx.Rows) {
+		count := 0
+		for rows.Next() {
+			var value int32
+			if err := rows.Scan(&value); err != nil {
+				t.Fatal(err)
+			}
+			if value != 1 {
+				t.Fatalf("relation-free value = %d, want 1", value)
+			}
+			count++
+		}
+		if count != 1 || rows.Err() != nil {
+			t.Fatalf("relation-free rows = %d, err = %v; want one logical row", count, rows.Err())
+		}
+	})
+
+	const catalogSQL = `SELECT c.relname
+		FROM pg_catalog.pg_class c
+		JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = 'public' AND c.relname = 'accounts'`
+	queryGateway(t, frontendAddress, catalogSQL, func(rows pgx.Rows) {
+		var names []string
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				t.Fatal(err)
+			}
+			names = append(names, name)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		if len(names) != 1 || names[0] != "accounts" {
+			t.Fatalf("catalog rows = %#v, want one logical accounts row", names)
+		}
+	})
+
+	config, err := pgx.ParseConfig("postgres://any-user@" + frontendAddress + "/any-database?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection, err := pgx.ConnectConfig(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close(context.Background())
+
+	var value int32
+	if err := connection.QueryRow(context.Background(), "SELECT $1::int4", int32(7)).Scan(&value); err != nil || value != 7 {
+		t.Fatalf("extended relation-free result = %d, err = %v", value, err)
+	}
+	var relation string
+	if err := connection.QueryRow(context.Background(), `SELECT c.relname
+		FROM pg_catalog.pg_class c
+		JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = 'public' AND c.relname = $1`, "accounts").Scan(&relation); err != nil || relation != "accounts" {
+		t.Fatalf("extended catalog result = %q, err = %v", relation, err)
+	}
+	var keyedCount int64
+	if err := connection.QueryRow(context.Background(), "SELECT count(*) FROM accounts WHERE tenant_id = $1", int64(1)).Scan(&keyedCount); err != nil {
+		t.Fatalf("keyed aggregate should execute on one Burrow: %v", err)
+	}
+
+	beforeFailures := gatewaySnapshot(t, statusURL+"/api/v1/status")
+	connectionsBefore := operationTotal(beforeFailures, "backend_connection")
+	queryGatewayError(t, frontendAddress, "SELECT count(*) FROM accounts", "0A000")
+	_, err = connection.Exec(context.Background(), "SELECT tenant_id FROM accounts ORDER BY tenant_id")
+	var postgresError *pgconn.PgError
+	if !errors.As(err, &postgresError) || postgresError.Code != "0A000" {
+		t.Fatalf("extended global-result error = %v, want SQLSTATE 0A000", err)
+	}
+
+	snapshot := gatewaySnapshot(t, statusURL+"/api/v1/status")
+	if snapshot.QueryMetrics.Total.ScatteredQueries != 0 || snapshot.QueryMetrics.Total.SingleShardQueries != 5 {
+		t.Fatalf("topology-transparent routing counters = %#v, want five single-Burrow executions", snapshot.QueryMetrics.Total)
+	}
+	if connectionsAfter := operationTotal(snapshot, "backend_connection"); connectionsAfter != connectionsBefore {
+		t.Fatalf("unsupported global results opened Tunnels: backend connections changed from %d to %d", connectionsBefore, connectionsAfter)
+	}
+	assertTotalShardExecutions(t, snapshot.QueryMetrics.ShardExecutions, 5)
 }
 
 func TestTopologyControlsConfiguredBurrowMembership(t *testing.T) {
@@ -175,8 +266,8 @@ func TestTopologyControlsConfiguredBurrowMembership(t *testing.T) {
 		if err := rows.Err(); err != nil {
 			t.Fatal(err)
 		}
-		if count != 2 {
-			t.Fatalf("configured Burrow absent from topology produced %d rows, want 2", count)
+		if count != 1 {
+			t.Fatalf("configured Burrow absent from topology produced %d rows, want one logical row", count)
 		}
 	})
 	snapshot := gatewaySnapshot(t, "http://"+extraStatus+"/api/v1/status")
@@ -675,15 +766,15 @@ func TestTracingAndObservabilityFailureEndToEnd(t *testing.T) {
 		mu.Lock()
 		count := len(spans)
 		mu.Unlock()
-		if count >= 5 {
+		if count >= 4 {
 			break
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(spans) < 5 {
-		t.Fatalf("exported spans = %d, want at least 5; gateway logs:\n%s", len(spans), logs.String())
+	if len(spans) < 4 {
+		t.Fatalf("exported spans = %d, want at least 4; gateway logs:\n%s", len(spans), logs.String())
 	}
 	assertExportedTraceShape(t, spans)
 }
@@ -792,8 +883,8 @@ func assertExportedTraceShape(t *testing.T, spans []*tracepb.Span) {
 			t.Fatalf("query %x selected no Tunnel", parent)
 		}
 	}
-	if scattered != 1 || single != 1 {
-		t.Fatalf("Tunnel routes = %d scattered and %d single-Burrow, want one of each", scattered, single)
+	if scattered != 0 || single != 2 {
+		t.Fatalf("Tunnel routes = %d scattered and %d single-Burrow, want two single-Burrow queries", scattered, single)
 	}
 }
 
@@ -837,15 +928,15 @@ func TestExtendedQueryEndToEnd(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
-	if len(values) != 2 || values[0] != 7 || values[1] != 7 {
-		t.Fatalf("extended-query values = %#v, want [7 7] from both Burrows", values)
+	if len(values) != 1 || values[0] != 7 {
+		t.Fatalf("extended-query values = %#v, want one logical row", values)
 	}
 
 	snapshot := gatewaySnapshot(t, statusURL+"/api/v1/status")
 	if snapshot.QueryMetrics.Total.Queries != 1 || snapshot.QueryMetrics.Total.FailedQueries != 0 {
 		t.Fatalf("extended-query counters = %#v, want one successful query", snapshot.QueryMetrics.Total)
 	}
-	assertShardExecutions(t, snapshot.QueryMetrics.Total, snapshot.QueryMetrics.ShardExecutions, 1)
+	assertTotalShardExecutions(t, snapshot.QueryMetrics.ShardExecutions, 1)
 	assertSummary(t, snapshot.QueryMetrics.QuerySummaries, "SELECT $?::int4 AS value")
 }
 
@@ -875,8 +966,8 @@ func TestExtendedPreparedStatementLifecycleEndToEnd(t *testing.T) {
 	if result.Err != nil {
 		t.Fatalf("Bind/Execute/Sync: %v\ngateway logs:\n%s", result.Err, logs.String())
 	}
-	if len(result.Rows) != 2 || string(result.Rows[0][0]) != "9" || string(result.Rows[1][0]) != "9" {
-		t.Fatalf("prepared rows = %#v, want [9 9] from both Burrows", result.Rows)
+	if len(result.Rows) != 1 || string(result.Rows[0][0]) != "9" {
+		t.Fatalf("prepared rows = %#v, want one logical row", result.Rows)
 	}
 	if err := connection.Deallocate(context.Background(), statement.Name); err != nil {
 		t.Fatalf("Close/Sync: %v\ngateway logs:\n%s", err, logs.String())
@@ -907,7 +998,7 @@ func TestExtendedPreparedStatementLifecycleEndToEnd(t *testing.T) {
 	if cache["hit"] < 1 || cache["miss"] < 1 {
 		t.Fatalf("prepared statement cache operations = %#v, want at least one hit and miss", cache)
 	}
-	assertShardExecutions(t, snapshot.QueryMetrics.Total, snapshot.QueryMetrics.ShardExecutions, 1)
+	assertTotalShardExecutions(t, snapshot.QueryMetrics.ShardExecutions, 1)
 }
 
 func TestCopyProtocolEndToEnd(t *testing.T) {
@@ -1033,7 +1124,7 @@ func TestShardAwareCopyProtocolEndToEnd(t *testing.T) {
 		t.Fatal("COPY with a NULL shard key succeeded")
 	}
 	resynchronized := connection.ExecParams(context.Background(), "SELECT $1::int", [][]byte{[]byte("1")}, []uint32{23}, []int16{0}, []int16{0}).Read()
-	if resynchronized.Err != nil || len(resynchronized.Rows) != 2 {
+	if resynchronized.Err != nil || len(resynchronized.Rows) != 1 {
 		t.Fatalf("extended protocol did not resynchronize after COPY failure: rows %d, err %v", len(resynchronized.Rows), resynchronized.Err)
 	}
 	assertCopiedRowAbsent(t, failureKey, "failure")
@@ -2077,23 +2168,8 @@ func getBody(t *testing.T, endpoint string) string {
 	return string(contents)
 }
 
-func assertShardExecutions(t *testing.T, totals statistics.Statistics, executions []statistics.ShardCount, want int64) {
-	t.Helper()
-	if totals.Queries != want || len(executions) != 2 {
-		t.Fatalf("shard execution totals = %#v, executions = %#v", totals, executions)
-	}
-	for _, execution := range executions {
-		if execution.Queries != want {
-			t.Fatalf("shard %s executions = %d, want %d", execution.Name, execution.Queries, want)
-		}
-	}
-}
-
 func assertTotalShardExecutions(t *testing.T, executions []statistics.ShardCount, want int64) {
 	t.Helper()
-	if len(executions) != 2 {
-		t.Fatalf("executions = %#v, want both Burrows represented", executions)
-	}
 	var got int64
 	for _, execution := range executions {
 		got += execution.Queries

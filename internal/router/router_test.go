@@ -209,6 +209,78 @@ func TestAnalyzeSimpleAndExtendedProduceEquivalentPlans(t *testing.T) {
 	}
 }
 
+func TestAnalyzeMarksTopologyIndependentReadsForOneBurrow(t *testing.T) {
+	registry := schema.New(map[string][]string{"public.accounts": {"tenant_id"}}).
+		WithAllTables([]string{"public.accounts", "public.settings"})
+	burrows := []string{"burrow-01", "burrow-02"}
+	tests := []string{
+		"SELECT 1",
+		"SHOW server_version",
+		"SELECT current_database(), current_schema()",
+		"SELECT c.relname FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace",
+		"SELECT table_name FROM information_schema.tables",
+		"SELECT count(*) FROM public.settings",
+	}
+	for _, query := range tests {
+		plan, err := Analyze(query, nil, registry, burrows)
+		if err != nil {
+			t.Fatalf("Analyze(%q): %v", query, err)
+		}
+		if !plan.SingleBurrow || plan.ScatterError != "" {
+			t.Errorf("Analyze(%q) = %#v, want topology-independent one-Burrow read", query, plan)
+		}
+	}
+
+	for _, query := range []string{
+		"SET application_name = 'compatibility-test'",
+		"SELECT tenant_id FROM public.accounts",
+	} {
+		plan, err := Analyze(query, nil, registry, burrows)
+		if err != nil {
+			t.Fatalf("Analyze(%q): %v", query, err)
+		}
+		if plan.SingleBurrow {
+			t.Errorf("Analyze(%q) = %#v, unexpectedly one-Burrow", query, plan)
+		}
+	}
+}
+
+func TestAnalyzeFailsClosedForUnsupportedGlobalShardedResults(t *testing.T) {
+	registry := schema.New(map[string][]string{"accounts": {"tenant_id"}})
+	burrows := []string{"burrow-01", "burrow-02"}
+	tests := []string{
+		"SELECT count(*) FROM accounts",
+		"SELECT sum(tenant_id), min(tenant_id), max(tenant_id), avg(tenant_id) FROM accounts",
+		"SELECT DISTINCT tenant_id FROM accounts",
+		"SELECT tenant_id FROM accounts ORDER BY tenant_id",
+		"SELECT tenant_id FROM accounts LIMIT 10",
+		"SELECT tenant_id FROM accounts OFFSET 10",
+		"SELECT tenant_id, count(*) FROM accounts GROUP BY tenant_id",
+		"SELECT tenant_id, row_number() OVER (ORDER BY tenant_id) FROM accounts",
+		"SELECT a.tenant_id FROM accounts a JOIN accounts b ON a.tenant_id = b.tenant_id",
+		"WITH selected AS (SELECT tenant_id FROM accounts) SELECT * FROM selected",
+		"SELECT (SELECT tenant_id FROM accounts LIMIT 1)",
+		"SELECT tenant_id FROM accounts UNION SELECT tenant_id FROM accounts",
+	}
+	for _, query := range tests {
+		plan, err := Analyze(query, nil, registry, burrows)
+		if err != nil {
+			t.Fatalf("Analyze(%q): %v", query, err)
+		}
+		if plan.Routed || plan.SingleBurrow || plan.ScatterError == "" {
+			t.Errorf("Analyze(%q) = %#v, want explicit unsupported global result", query, plan)
+		}
+	}
+
+	keyed, err := Analyze("SELECT count(*) FROM accounts WHERE tenant_id = 42", nil, registry, burrows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !keyed.Routed || keyed.ScatterError != "" {
+		t.Fatalf("keyed aggregate = %#v, want ordinary one-Burrow routing", keyed)
+	}
+}
+
 func TestAnalyzeCopyRecordsRelationAndDirection(t *testing.T) {
 	from, err := Analyze("COPY public.accounts (id, value) FROM STDIN", nil, schema.Registry{}, []string{"burrow-01", "burrow-02"})
 	if err != nil {

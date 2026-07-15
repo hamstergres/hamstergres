@@ -65,6 +65,20 @@ func TestTableSpecificVShardOwnersCanonicalizePublicAlias(t *testing.T) {
 	}
 }
 
+func TestHasTableUsesCanonicalInventoryAndExcludesCatalogs(t *testing.T) {
+	registry := New(nil).WithAllTables([]string{"public.accounts", "sales.orders"})
+	for _, table := range []string{"accounts", "public.accounts", "sales.orders"} {
+		if !registry.HasTable(table) {
+			t.Fatalf("HasTable(%q) = false, want inventory match", table)
+		}
+	}
+	for _, table := range []string{"pg_catalog.pg_class", "information_schema.tables", "missing"} {
+		if registry.HasTable(table) {
+			t.Fatalf("HasTable(%q) = true, want topology-independent relation", table)
+		}
+	}
+}
+
 func TestRegistryPreservesQuotedIdentifierCase(t *testing.T) {
 	registry := New(map[string][]string{
 		"public.Accounts": {"Tenant_ID"},

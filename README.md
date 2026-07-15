@@ -6,8 +6,11 @@ Hamstergres is an experimental PostgreSQL sharding system: **Tiny paws, many
 shards.** Its current component is the **Hamstergres Proxy**, a development
 gateway that speaks the PostgreSQL frontend protocol and routes single-key
 queries to their owning **Burrow**. Reads without a usable shard key are
-scattered and compatible result rows are appended. It supports simple queries
-and the core extended-query lifecycle used by prepared, parameterized
+scattered only when appending the physical rows preserves PostgreSQL semantics.
+Relation-free, catalog, and session-introspection reads execute once on a
+deterministic Burrow, while unsharded reads execute once according to their
+fleet policy, so the fleet looks like one PostgreSQL server. It supports simple
+queries and the core extended-query lifecycle used by prepared, parameterized
 PostgreSQL clients. Hamstergres Nest durably stores the versioned schema and
 per-table vshard topology consumed by the Proxy. See [the architecture and
 naming reference](docs/architecture.md) for the component model.
@@ -317,9 +320,15 @@ Ambiguous or partial-key writes to sharded tables are rejected
 instead of being duplicated across the fleet. DDL is still applied to every
 Burrow. The `sharding.unsharded_tables` configuration selects either one
 primary Burrow for all unsharded traffic or replicated writes with randomly
-load-balanced reads. Extended-protocol portals with a complete bound shard key use one
-Tunnel for Bind, Describe, Execute, and Close; unkeyed read portals retain
-deterministic scatter behavior. The Proxy preserves an extended request through
+load-balanced reads. Topology-independent reads use the primary Burrow in
+`primary` mode and the lexicographically first routable Burrow in `replicated`
+mode. Extended-protocol portals with a complete bound shard key use one Tunnel
+for Bind, Describe, Execute, and Close; append-safe unkeyed read portals retain
+deterministic scatter behavior. Global operations over scattered sharded rows,
+including aggregates, `DISTINCT`, `ORDER BY`, `LIMIT`, `OFFSET`, joins, CTEs,
+subqueries, set operations, and window functions, fail closed with SQLSTATE
+`0A000` until the Proxy has a PostgreSQL-equivalent global result operator. The
+Proxy preserves an extended request through
 Flush or Sync, so Bind, optional Describe, Execute, and Sync use one backend
 flush rather than one round trip per message. Equivalent Parse messages share
 a canonical backend name derived from SQL and parameter types; each Tunnel
