@@ -3,6 +3,8 @@
 package pgcompat
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -69,6 +71,48 @@ func TestCountProxyCrashes(t *testing.T) {
 	crashes, err := CountProxyCrashes(strings.NewReader("log line\npanic: first\nnot panic: ignored\npanic: second\n"))
 	if err != nil || crashes != 2 {
 		t.Fatalf("crashes = %d, err = %v", crashes, err)
+	}
+}
+
+func TestWriteAndReadResultsRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "results.json")
+	want := Results{
+		FormatVersion:     ResultsFormatVersion,
+		PostgreSQLVersion: "17.10",
+		GeneratedAt:       time.Date(2026, time.July, 15, 10, 30, 0, 0, time.UTC),
+		ExpectedTests:     2,
+		PassedTests:       1,
+		FailedTests:       1,
+		ProxyCrashes:      1,
+		Tests: []TestResult{
+			{Name: "boolean", Status: StatusPass, DurationMS: 10},
+			{Name: "char", Status: StatusFail, DurationMS: 20},
+		},
+	}
+	if err := WriteResults(path, want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadResults(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.FormatVersion != want.FormatVersion || got.PostgreSQLVersion != want.PostgreSQLVersion ||
+		!got.GeneratedAt.Equal(want.GeneratedAt) || got.ExpectedTests != want.ExpectedTests ||
+		got.PassedTests != want.PassedTests || got.FailedTests != want.FailedTests ||
+		got.ProxyCrashes != want.ProxyCrashes || len(got.Tests) != len(want.Tests) ||
+		got.Tests[0] != want.Tests[0] || got.Tests[1] != want.Tests[1] {
+		t.Fatalf("round trip = %#v, want %#v", got, want)
+	}
+}
+
+func TestReadResultsRejectsIncompatibleFormatVersion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "results.json")
+	if err := os.WriteFile(path, []byte(`{"format_version": 2}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := ReadResults(path)
+	if err == nil || !strings.Contains(err.Error(), "format version 2, want 1") {
+		t.Fatalf("error = %v, want incompatible format version", err)
 	}
 }
 

@@ -42,6 +42,7 @@ jobs:
             hamstergres-pgcompat-baseline-${{ github.event.repository.default_branch }}-
 
       - name: Run PostgreSQL compatibility suite
+        id: compatibility
         env:
           POSTGRES_COMPATIBILITY_BASELINE: /tmp/hamstergres-pgcompat-baseline/results.json
         run: make test-postgres-compatibility
@@ -69,13 +70,13 @@ jobs:
           retention-days: 30
 
       - name: Stage the new default-branch baseline
-        if: ${{ success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref_name == github.event.repository.default_branch }}
+        if: ${{ steps.compatibility.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref_name == github.event.repository.default_branch }}
         run: |
           mkdir -p /tmp/hamstergres-pgcompat-baseline
           cp build/postgres-compatibility/results.json /tmp/hamstergres-pgcompat-baseline/results.json
 
       - name: Save the new default-branch compatibility baseline
-        if: ${{ success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref_name == github.event.repository.default_branch }}
+        if: ${{ steps.compatibility.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref_name == github.event.repository.default_branch }}
         uses: actions/cache/save@v6
         with:
           path: /tmp/hamstergres-pgcompat-baseline/results.json

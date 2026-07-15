@@ -34,7 +34,6 @@ trap cleanup EXIT
 docker compose -f "${repo_root}/docker-compose.yml" down -v --remove-orphans >/dev/null 2>&1 || true
 rm -rf "${results_dir}"
 mkdir -p "${results_dir}"
-chmod 0777 "${results_dir}"
 
 echo "==> Building PostgreSQL ${postgres_version} compatibility image"
 docker build \
@@ -76,7 +75,7 @@ set +e
 docker run --rm \
   --add-host host.docker.internal:host-gateway \
   --entrypoint bash \
-  --user postgres \
+  --user "$(id -u):$(id -g)" \
   --volume "${results_dir}:/results" \
   --env PGHOST=host.docker.internal \
   --env PGPORT=7432 \
