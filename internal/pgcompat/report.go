@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -23,8 +24,9 @@ const ResultsFormatVersion = 1
 type TestStatus string
 
 const (
-	StatusPass TestStatus = "pass"
-	StatusFail TestStatus = "fail"
+	StatusPass    TestStatus = "pass"
+	StatusFail    TestStatus = "fail"
+	StatusMissing TestStatus = "missing"
 )
 
 type TestResult struct {
@@ -40,6 +42,7 @@ type Results struct {
 	ExpectedTests     int          `json:"expected_tests"`
 	PassedTests       int          `json:"passed_tests"`
 	FailedTests       int          `json:"failed_tests"`
+	MissingTests      []string     `json:"missing_tests,omitempty"`
 	ProxyCrashes      int          `json:"proxy_crashes"`
 	Tests             []TestResult `json:"tests"`
 }
@@ -50,7 +53,16 @@ type Regression struct {
 	Current  TestStatus `json:"current_status"`
 }
 
-var tapResultPattern = regexp.MustCompile(`^\s*(not )?ok\s+[0-9]+\s+[+-]\s+(\S+)\s+([0-9]+)\s+ms\s*$`)
+// BadgeEndpoint is the Shields.io endpoint schema published by the
+// compatibility workflow for the live README progress badge.
+type BadgeEndpoint struct {
+	SchemaVersion int    `json:"schemaVersion"`
+	Label         string `json:"label"`
+	Message       string `json:"message"`
+	Color         string `json:"color"`
+}
+
+var tapResultPattern = regexp.MustCompile(`^\s*(?:#\s*)?(not )?ok\s+[0-9]+\s+[+-]\s+(\S+)\s+([0-9]+)\s+ms\s*$`)
 
 func ParseTAP(reader io.Reader, postgresqlVersion string, generatedAt time.Time) (Results, error) {
 	scanner := bufio.NewScanner(reader)
@@ -118,6 +130,8 @@ func ParseSchedule(reader io.Reader) ([]string, error) {
 
 func ValidateCompleteness(results *Results, scheduled []string) error {
 	results.ExpectedTests = len(scheduled)
+	results.MissingTests = nil
+	completed := len(results.Tests)
 	actual := make(map[string]struct{}, len(results.Tests))
 	for _, test := range results.Tests {
 		actual[test.Name] = struct{}{}
@@ -126,10 +140,13 @@ func ValidateCompleteness(results *Results, scheduled []string) error {
 	for _, name := range scheduled {
 		if _, found := actual[name]; !found {
 			missing = append(missing, name)
+			results.Tests = append(results.Tests, TestResult{Name: name, Status: StatusMissing})
 		}
 	}
+	results.MissingTests = append(results.MissingTests, missing...)
+	results.recount()
 	if len(missing) > 0 {
-		return fmt.Errorf("pg_regress completed %d of %d scheduled tests; missing: %s", len(results.Tests), len(scheduled), strings.Join(missing, ", "))
+		return fmt.Errorf("pg_regress completed %d of %d scheduled tests; missing: %s", completed, len(scheduled), strings.Join(missing, ", "))
 	}
 	return nil
 }
@@ -197,12 +214,59 @@ func WriteResults(path string, results Results) error {
 	return os.WriteFile(path, contents, 0o644)
 }
 
+func WriteBadgeEndpoint(path string, results Results) error {
+	total := results.ExpectedTests
+	if total == 0 {
+		total = len(results.Tests)
+	}
+	message := fmt.Sprintf("%d/%d passing", results.PassedTests, total)
+	if len(results.MissingTests) > 0 {
+		message += " (incomplete)"
+	}
+	endpoint := BadgeEndpoint{
+		SchemaVersion: 1,
+		Label:         "PostgreSQL " + results.PostgreSQLVersion,
+		Message:       message,
+		Color:         badgeColor(results.PassedTests, total),
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	contents, err := json.MarshalIndent(endpoint, "", "  ")
+	if err != nil {
+		return err
+	}
+	contents = append(contents, '\n')
+	return os.WriteFile(path, contents, 0o644)
+}
+
+func badgeColor(passed, total int) string {
+	if total == 0 {
+		return "lightgrey"
+	}
+	if passed == total {
+		return "brightgreen"
+	}
+	percentage := passed * 100 / total
+	switch {
+	case percentage >= 80:
+		return "yellow"
+	case percentage >= 50:
+		return "orange"
+	default:
+		return "red"
+	}
+}
+
 func Markdown(results Results, regressions []Regression, baselineCompared bool) string {
 	var report strings.Builder
 	report.WriteString("## PostgreSQL Compatibility Report\n\n")
 	fmt.Fprintf(&report, "PostgreSQL `%s`: **%d/%d passing**, %d compatibility gaps.\n\n", results.PostgreSQLVersion, results.PassedTests, results.ExpectedTests, results.FailedTests)
 	if results.ProxyCrashes > 0 {
 		fmt.Fprintf(&report, "> **Hamstergres Proxy crashed %d time(s).** Results after the first crash can reflect connection loss as well as statement incompatibility. See `proxy.log`.\n\n", results.ProxyCrashes)
+	}
+	if len(results.MissingTests) > 0 {
+		fmt.Fprintf(&report, "> **Harness incomplete:** %d scheduled test(s) produced no result: `%s`. The partial inventory is shown below.\n\n", len(results.MissingTests), strings.Join(results.MissingTests, "`, `"))
 	}
 	if !baselineCompared {
 		report.WriteString("No compatible baseline was supplied. This run records the current inventory but cannot detect pass-to-fail regressions.\n\n")
@@ -220,6 +284,8 @@ func Markdown(results Results, regressions []Regression, baselineCompared bool) 
 		status := "PASS"
 		if test.Status == StatusFail {
 			status = "GAP"
+		} else if test.Status == StatusMissing {
+			status = "MISSING"
 		}
 		fmt.Fprintf(&report, "| `%s` | %s | %d ms |\n", test.Name, status, test.DurationMS)
 	}
@@ -233,7 +299,7 @@ func (results *Results) recount() {
 		switch test.Status {
 		case StatusPass:
 			results.PassedTests++
-		case StatusFail:
+		case StatusFail, StatusMissing:
 			results.FailedTests++
 		}
 	}

@@ -35,7 +35,7 @@ func main() {
 	defer scheduleFile.Close()
 	scheduled, err := pgcompat.ParseSchedule(scheduleFile)
 	fatalIf(err)
-	fatalIf(pgcompat.ValidateCompleteness(&results, scheduled))
+	completenessErr := pgcompat.ValidateCompleteness(&results, scheduled)
 	if *proxyLogPath != "" {
 		proxyLog, err := os.Open(*proxyLogPath)
 		fatalIf(err)
@@ -60,7 +60,12 @@ func main() {
 	fatalIf(os.MkdirAll(*outputDirectory, 0o755))
 	fatalIf(pgcompat.WriteResults(filepath.Join(*outputDirectory, "results.json"), results))
 	fatalIf(os.WriteFile(filepath.Join(*outputDirectory, "compatibility-report.md"), []byte(pgcompat.Markdown(results, regressions, baselineCompared)), 0o644))
+	fatalIf(pgcompat.WriteBadgeEndpoint(filepath.Join(*outputDirectory, "badges", "overall.json"), results))
 	fmt.Printf("PostgreSQL %s compatibility: %d/%d passed, %d gaps, %d regressions\n", results.PostgreSQLVersion, results.PassedTests, results.ExpectedTests, results.FailedTests, len(regressions))
+	if completenessErr != nil {
+		fmt.Fprintln(os.Stderr, completenessErr)
+		os.Exit(2)
+	}
 	if len(regressions) > 0 {
 		os.Exit(1)
 	}

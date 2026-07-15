@@ -5,10 +5,10 @@ on:
   push:
     branches: [main]
   pull_request:
-    types: [opened, reopened]
+    types: [opened, reopened, synchronize]
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: postgres-compatibility-${{ github.event.pull_request.number || github.ref }}
@@ -66,8 +66,37 @@ jobs:
             build/postgres-compatibility/regression.out
             build/postgres-compatibility/pg_regress.log
             build/postgres-compatibility/proxy.log
+            build/postgres-compatibility/badges/overall.json
           if-no-files-found: warn
           retention-days: 30
+
+      - name: Locate compatibility badge endpoint
+        id: badge
+        if: ${{ !cancelled() }}
+        run: |
+          if [[ -f build/postgres-compatibility/badges/overall.json ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Mirrors Multigres' live compatibility badges: the report generator
+      # writes Shields.io endpoint JSON, and default-branch runs publish it to
+      # one stable gh-pages branch URL without editing README.md on every run.
+      - name: Publish compatibility badge endpoint
+        if: >-
+          !cancelled() &&
+          steps.badge.outputs.available == 'true' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+          github.ref_name == github.event.repository.default_branch
+        uses: peaceiris/actions-gh-pages@4f9cc6602d3f66b9c108549d475ec49e8ef4d45e # v4.0.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: build/postgres-compatibility/badges
+          publish_branch: gh-pages
+          destination_dir: postgres-compatibility
+          keep_files: true
+          commit_message: "chore(pgcompat): update live badge endpoint"
 
       - name: Stage the new default-branch baseline
         if: ${{ steps.compatibility.outcome == 'success' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref_name == github.event.repository.default_branch }}
