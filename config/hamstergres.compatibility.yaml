@@ -1,0 +1,27 @@
+# Isolated host-run Proxy configuration for the PostgreSQL regression suite.
+# scripts/postgres-compatibility.sh owns these ports and the dedicated Nest keys.
+listen:
+  address: "0.0.0.0:7432"
+
+status:
+  address: "127.0.0.1:9080"
+
+transactions:
+  two_phase_commit: true
+  lock_timeout: "1s"
+
+nest:
+  endpoint: "http://127.0.0.1:3379"
+  registry_key: "/hamstergres/compatibility/schema-registry"
+  topology_key: "/hamstergres/compatibility/topology"
+  sequence_key: "/hamstergres/compatibility/global-id"
+
+sharding:
+  unsharded_tables:
+    mode: "primary"
+    primary_burrow: "burrow-01"
+  physical_shards:
+    burrow-01:
+      dsn: "postgres://hamster:hamster@127.0.0.1:6541/regression?sslmode=disable"
+    burrow-02:
+      dsn: "postgres://hamster:hamster@127.0.0.1:6542/regression?sslmode=disable"

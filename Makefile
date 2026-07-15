@@ -1,4 +1,4 @@
-.PHONY: up down logs ps test test-unit test-e2e test-sysbench pgbench-prepare pgbench-run pgbench-cleanup sysbench-prepare sysbench-run sysbench-cleanup benchmark-sysbench experiment-sharding-cpu test-observability run-proxy proxy-status nest-status clean-nest-tests
+.PHONY: up down logs ps test test-unit test-e2e test-sysbench test-postgres-compatibility pgbench-prepare pgbench-run pgbench-cleanup sysbench-prepare sysbench-run sysbench-cleanup benchmark-sysbench experiment-sharding-cpu test-observability run-proxy proxy-status nest-status clean-nest-tests
 
 BENCHMARK_MODE ?= sharded
 PGBENCH_SCALE ?= 1
@@ -28,6 +28,9 @@ test-e2e:
 
 test-sysbench:
 	HAMSTERGRES_SYSBENCH_E2E=1 go test ./integration -run '^TestSysbenchReadWriteEndToEnd$$' -count=1 -v
+
+test-postgres-compatibility:
+	./scripts/postgres-compatibility.sh
 
 pgbench-prepare:
 	./scripts/pgbench-workload.sh $(BENCHMARK_MODE) prepare --scale=$(PGBENCH_SCALE)
