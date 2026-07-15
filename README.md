@@ -1,5 +1,7 @@
 # Hamstergres
 
+[![PostgreSQL Compatibility](https://github.com/hamstergres/hamstergres/actions/workflows/postgres-compatibility.yml/badge.svg?branch=main)](https://github.com/hamstergres/hamstergres/actions/workflows/postgres-compatibility.yml)
+
 Hamstergres is an experimental PostgreSQL sharding system: **Tiny paws, many
 shards.** Its current component is the **Hamstergres Proxy**, a development
 gateway that speaks the PostgreSQL frontend protocol and routes single-key
@@ -105,6 +107,49 @@ leaves the Docker Burrow environment running. To run just one layer:
 make test-unit
 make test-e2e
 ```
+
+## PostgreSQL compatibility suite
+
+The repository can run PostgreSQL's complete core regression schedule through
+Hamstergres Proxy:
+
+```bash
+make test-postgres-compatibility
+```
+
+This is a long-running, Docker-backed compatibility inventory. It builds a
+pinned PostgreSQL 17.10 image from the official PostgreSQL source so the
+Burrows, `pg_regress`, its SQL and expected-output corpus, and the server-side
+`regress.so` test module all use the same release. It then starts an isolated
+Nest and the normal two-Burrow topology, runs the full upstream
+`parallel_schedule` through a
+host-run Proxy, and writes these files under `build/postgres-compatibility/`:
+
+- `compatibility-report.md` — pass count, current gaps, and regressions.
+- `results.json` — machine-readable per-test baseline data.
+- `regression.diffs` and `regression.out` — upstream expected-versus-actual
+  output for diagnosing unsupported statements and behavior.
+- `proxy.log` and `pg_regress.log` — harness and Proxy evidence.
+
+Known compatibility gaps do not make the command fail. A truncated or broken
+harness does fail, as does any test that passed in the supplied baseline but no
+longer passes. Compare a local run with an earlier result using:
+
+```bash
+POSTGRES_COMPATIBILITY_BASELINE=/path/to/results.json \
+  make test-postgres-compatibility
+```
+
+The `PostgreSQL Compatibility` GitHub Actions workflow runs when a pull request
+is opened or reopened, after changes are merged into the default branch, and
+when started manually. A successful default-branch push or manual run becomes
+the cached baseline used to detect regressions in later pull-request runs and
+updates the workflow status badge. Every run uploads the full report and raw
+diffs as an artifact. The approach is adapted to Hamstergres's two-Burrow
+architecture from
+[Multigres's PostgreSQL compatibility workflow](https://github.com/multigres/multigres/blob/main/.github/workflows/test-pgregress.yml)
+and uses PostgreSQL's documented
+[`pg_regress` suite](https://www.postgresql.org/docs/17/regress.html).
 
 ## Sysbench compatibility check
 

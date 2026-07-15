@@ -1,0 +1,69 @@
+# syntax=docker/dockerfile:1
+
+# Keep the PostgreSQL server, pg_regress client, SQL corpus, expected output,
+# and regress.so test module on the exact same release. This avoids reporting
+# PostgreSQL build or ABI drift as a Hamstergres compatibility gap.
+ARG POSTGRES_VERSION=17.10
+FROM postgres:${POSTGRES_VERSION}-bookworm
+
+ARG POSTGRES_GIT_REF=REL_17_10
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bison \
+        build-essential \
+        ca-certificates \
+        flex \
+        git \
+        libicu-dev \
+        liblz4-dev \
+        libreadline-dev \
+        libssl-dev \
+        libxml2-dev \
+        libxslt1-dev \
+        libzstd-dev \
+        locales \
+        pkg-config \
+        uuid-dev \
+        zlib1g-dev \
+    && sed -i -E \
+        -e 's/^# *(en_US.UTF-8 UTF-8)/\1/' \
+        -e 's/^# *(de_DE.UTF-8 UTF-8)/\1/' \
+        -e 's/^# *(fr_FR.UTF-8 UTF-8)/\1/' \
+        -e 's/^# *(sv_SE.UTF-8 UTF-8)/\1/' \
+        -e 's/^# *(tr_TR.UTF-8 UTF-8)/\1/' \
+        -e 's/^# *(ja_JP.EUC-JP EUC-JP)/\1/' \
+        /etc/locale.gen \
+    && locale-gen \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth=1 --branch "${POSTGRES_GIT_REF}" \
+    https://github.com/postgres/postgres.git /usr/src/postgresql
+
+WORKDIR /usr/src/postgresql
+
+RUN ./configure \
+        --prefix=/usr \
+        --bindir=/usr/lib/postgresql/17/bin \
+        --datadir=/usr/share/postgresql/17 \
+        --libdir=/usr/lib/postgresql/17/lib \
+        --with-icu \
+        --with-libxml \
+        --with-libxslt \
+        --with-lz4 \
+        --with-ssl=openssl \
+        --with-system-tzdata=/usr/share/zoneinfo \
+        --with-uuid=e2fs \
+        --with-zstd
+
+RUN make -j"$(nproc)" -C src/interfaces/libpq all \
+    && make -j"$(nproc)" -C src/test/regress all \
+    && make -C src/test/regress install \
+    && install -m 0755 \
+        src/test/regress/regress.so \
+        src/test/regress/autoinc.so \
+        src/test/regress/refint.so \
+        /usr/lib/postgresql/17/lib/
+
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8

@@ -1,0 +1,82 @@
+name: PostgreSQL Compatibility
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: postgres-compatibility-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pg-regress:
+    name: Full PostgreSQL regression suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out Hamstergres
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Restore the latest default-branch compatibility baseline
+        id: baseline
+        uses: actions/cache/restore@v6
+        with:
+          path: /tmp/hamstergres-pgcompat-baseline/results.json
+          key: hamstergres-pgcompat-baseline-unmatched
+          restore-keys: |
+            hamstergres-pgcompat-baseline-${{ github.event.repository.default_branch }}-
+
+      - name: Run PostgreSQL compatibility suite
+        env:
+          POSTGRES_COMPATIBILITY_BASELINE: /tmp/hamstergres-pgcompat-baseline/results.json
+        run: make test-postgres-compatibility
+
+      - name: Add report to the job summary
+        if: ${{ !cancelled() }}
+        run: |
+          if [[ -f build/postgres-compatibility/compatibility-report.md ]]; then
+            sed -n '1,320p' build/postgres-compatibility/compatibility-report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload compatibility report, raw diffs, and Proxy log
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: postgres-compatibility-${{ github.run_id }}
+          path: |
+            build/postgres-compatibility/compatibility-report.md
+            build/postgres-compatibility/results.json
+            build/postgres-compatibility/regression.diffs
+            build/postgres-compatibility/regression.out
+            build/postgres-compatibility/pg_regress.log
+            build/postgres-compatibility/proxy.log
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Stage the new default-branch baseline
+        if: ${{ success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref_name == github.event.repository.default_branch }}
+        run: |
+          mkdir -p /tmp/hamstergres-pgcompat-baseline
+          cp build/postgres-compatibility/results.json /tmp/hamstergres-pgcompat-baseline/results.json
+
+      - name: Save the new default-branch compatibility baseline
+        if: ${{ success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref_name == github.event.repository.default_branch }}
+        uses: actions/cache/save@v6
+        with:
+          path: /tmp/hamstergres-pgcompat-baseline/results.json
+          key: hamstergres-pgcompat-baseline-${{ github.event.repository.default_branch }}-${{ github.run_id }}
