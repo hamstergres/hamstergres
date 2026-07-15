@@ -156,6 +156,38 @@ func TestTopologyTransparentReadResultsEndToEnd(t *testing.T) {
 	logs := startGateway(t, buildGateway(t, repoRoot), writeGatewayConfig(t, frontendAddress, statusAddress))
 	statusURL := "http://" + statusAddress
 	waitForHealthyGateway(t, statusURL, logs)
+	noticeConfig, err := pgconn.ParseConfig("postgres://any-user@" + frontendAddress + "/any-database?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var notices []*pgconn.Notice
+	noticeConfig.OnNotice = func(_ *pgconn.PgConn, notice *pgconn.Notice) {
+		notices = append(notices, notice)
+	}
+	noticeConnection, err := pgconn.ConnectConfig(context.Background(), noticeConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	suffix := strings.ReplaceAll(gatewayTestKey(frontendAddress), "-", "_")
+	noticeSQL := fmt.Sprintf(`
+		CREATE TABLE notice_left_%[1]s (name text, age integer, location text);
+		CREATE TABLE notice_right_%[1]s (name text, age integer, location text);
+		CREATE TABLE notice_child_%[1]s () INHERITS (notice_left_%[1]s, notice_right_%[1]s)
+	`, suffix)
+	if _, err := noticeConnection.Exec(context.Background(), noticeSQL).ReadAll(); err != nil {
+		noticeConnection.Close(context.Background())
+		t.Fatalf("topology-transparent notice query: %v", err)
+	}
+	noticeConnection.Close(context.Background())
+	wantNotices := []string{"name", "age", "location"}
+	if len(notices) != len(wantNotices) {
+		t.Fatalf("representative notices = %#v, want one logical three-notice stream", notices)
+	}
+	for index, column := range wantNotices {
+		if !strings.Contains(notices[index].Message, fmt.Sprintf(`merging multiple inherited definitions of column %q`, column)) {
+			t.Fatalf("representative notice %d = %#v, want column %q", index, notices[index], column)
+		}
+	}
 
 	queryGateway(t, frontendAddress, "SELECT 1 AS value", func(rows pgx.Rows) {
 		count := 0
@@ -231,13 +263,13 @@ func TestTopologyTransparentReadResultsEndToEnd(t *testing.T) {
 	}
 
 	snapshot := gatewaySnapshot(t, statusURL+"/api/v1/status")
-	if snapshot.QueryMetrics.Total.ScatteredQueries != 0 || snapshot.QueryMetrics.Total.SingleShardQueries != 5 {
-		t.Fatalf("topology-transparent routing counters = %#v, want five single-Burrow executions", snapshot.QueryMetrics.Total)
+	if snapshot.QueryMetrics.Total.ScatteredQueries != 1 || snapshot.QueryMetrics.Total.SingleShardQueries != 5 {
+		t.Fatalf("topology-transparent routing counters = %#v, want one fleet-wide DDL and five single-Burrow executions", snapshot.QueryMetrics.Total)
 	}
 	if connectionsAfter := operationTotal(snapshot, "backend_connection"); connectionsAfter != connectionsBefore {
 		t.Fatalf("unsupported global results opened Tunnels: backend connections changed from %d to %d", connectionsBefore, connectionsAfter)
 	}
-	assertTotalShardExecutions(t, snapshot.QueryMetrics.ShardExecutions, 5)
+	assertTotalShardExecutions(t, snapshot.QueryMetrics.ShardExecutions, 7)
 }
 
 func TestTopologyControlsConfiguredBurrowMembership(t *testing.T) {
@@ -524,6 +556,15 @@ func TestReplicatedUnshardedTablesEndToEnd(t *testing.T) {
 		t.Fatalf("replicated COPY FROM STDIN: %v\ngateway logs:\n%s", err, logs.String())
 	}
 	copyConnection.Close(context.Background())
+	serverSideConnection, err := pgconn.Connect(context.Background(), "postgres://any-user@"+frontendAddress+"/any-database?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	replicatedServerSide := postgresExecError(t, serverSideConnection, `COPY replicated_e2e FROM '/tmp/replicated.data'`)
+	serverSideConnection.Close(context.Background())
+	if replicatedServerSide.Code != "0A000" || !strings.Contains(replicatedServerSide.Message, "replicated unsharded tables") || strings.Contains(replicatedServerSide.Message, "burrow-") {
+		t.Fatalf("replicated server-side COPY error = %#v", replicatedServerSide)
+	}
 	for _, port := range []string{"5541", "5542"} {
 		connection, err := pgx.Connect(context.Background(), "postgres://hamster:hamster@localhost:"+port+"/hamstergres?sslmode=disable")
 		if err != nil {
@@ -1031,6 +1072,50 @@ func TestCopyProtocolEndToEnd(t *testing.T) {
 	if got := strings.Count(copied.String(), "\n"); got != 2 {
 		t.Fatalf("COPY TO rows = %d, want two primary-Burrow rows: %q", got, copied.String())
 	}
+	serverPath := "/tmp/hamstergres-copy-" + gatewayTestKey(frontendAddress) + ".data"
+	results, err := connection.Exec(context.Background(), fmt.Sprintf("COPY copy_e2e TO %s", quoteSQLLiteral(serverPath))).ReadAll()
+	if err != nil || len(results) != 1 || results[0].CommandTag.String() != "COPY 2" {
+		t.Fatalf("server-side COPY TO = %#v, %v\ngateway logs:\n%s", results, err, logs.String())
+	}
+	if _, err := connection.Exec(context.Background(), "TRUNCATE copy_e2e").ReadAll(); err != nil {
+		t.Fatalf("truncate server-side COPY table: %v", err)
+	}
+	results, err = connection.Exec(context.Background(), fmt.Sprintf("COPY copy_e2e FROM %s", quoteSQLLiteral(serverPath))).ReadAll()
+	if err != nil || len(results) != 1 || results[0].CommandTag.String() != "COPY 2" {
+		t.Fatalf("server-side COPY FROM = %#v, %v\ngateway logs:\n%s", results, err, logs.String())
+	}
+
+	missingPath := serverPath + ".missing"
+	primary, err := pgconn.Connect(context.Background(), "postgres://hamster:hamster@localhost:5541/hamstergres?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	directMissing := postgresExecError(t, primary, fmt.Sprintf("COPY copy_e2e FROM %s", quoteSQLLiteral(missingPath)))
+	primary.Close(context.Background())
+	proxyMissing := postgresExecError(t, connection, fmt.Sprintf("COPY copy_e2e FROM %s", quoteSQLLiteral(missingPath)))
+	if *proxyMissing != *directMissing || proxyMissing.Code != "58P01" {
+		t.Fatalf("missing-file ErrorResponse changed through Proxy:\nproxy:  %#v\ndirect: %#v", proxyMissing, directMissing)
+	}
+	permission := postgresExecError(t, connection, `COPY copy_e2e TO '/root/hamstergres-copy.data'`)
+	if permission.Code != "42501" {
+		t.Fatalf("server-side permission error = %#v, want SQLSTATE 42501", permission)
+	}
+
+	if _, err := connection.Exec(context.Background(), `
+		DROP TABLE IF EXISTS server_copy_sharded;
+		CREATE TABLE server_copy_sharded (tenant_id bigint PRIMARY KEY, value text);
+		COMMENT ON COLUMN server_copy_sharded.tenant_id IS 'hamstergres.shard_key'
+	`).ReadAll(); err != nil {
+		t.Fatalf("prepare server-side sharded COPY table: %v", err)
+	}
+	sharded := postgresExecError(t, connection, fmt.Sprintf("COPY server_copy_sharded FROM %s", quoteSQLLiteral(missingPath)))
+	if sharded.Code != "0A000" || !strings.Contains(sharded.Message, "COPY FROM STDIN or COPY TO STDOUT") || strings.Contains(sharded.Message, "burrow-") {
+		t.Fatalf("sharded server-side COPY error = %#v", sharded)
+	}
+	program := postgresExecError(t, connection, `COPY copy_e2e FROM PROGRAM 'generate-copy-data'`)
+	if program.Code != "0A000" || !strings.Contains(program.Message, "COPY PROGRAM") || strings.Contains(program.Message, "burrow-") {
+		t.Fatalf("COPY PROGRAM error = %#v", program)
+	}
 	for index, port := range []string{"5541", "5542"} {
 		direct, err := pgx.Connect(context.Background(), "postgres://hamster:hamster@localhost:"+port+"/hamstergres?sslmode=disable")
 		if err != nil {
@@ -1047,6 +1132,20 @@ func TestCopyProtocolEndToEnd(t *testing.T) {
 			t.Fatalf("Burrow %s COPY row count = %d, want %d, err = %v", port, count, want, err)
 		}
 	}
+}
+
+func postgresExecError(t *testing.T, connection *pgconn.PgConn, sql string) *pgconn.PgError {
+	t.Helper()
+	_, err := connection.Exec(context.Background(), sql).ReadAll()
+	var postgresError *pgconn.PgError
+	if !errors.As(err, &postgresError) {
+		t.Fatalf("%s error = %v, want PostgreSQL ErrorResponse", sql, err)
+	}
+	return postgresError
+}
+
+func quoteSQLLiteral(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
 func TestShardAwareCopyProtocolEndToEnd(t *testing.T) {

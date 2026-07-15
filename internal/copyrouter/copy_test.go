@@ -246,6 +246,29 @@ func TestShardedCOPYRejectsUnsupportedSemantics(t *testing.T) {
 	}
 }
 
+func TestServerSideCOPYPlansOnlySchemaPlacement(t *testing.T) {
+	registry := schema.NewWithTypes(map[string][]string{"events": {"id"}}, map[string][]string{"events": {"bigint"}})
+	for _, query := range []string{
+		`COPY events FROM '/tmp/events.data' WITH (FREEZE true)`,
+		`COPY events TO '/tmp/events.data' WITH (FORMAT csv, FORCE_QUOTE *)`,
+	} {
+		plan, err := Parse(query, registry)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", query, err)
+		}
+		if !plan.ServerSide || plan.Program || !plan.Sharded || plan.Table != "events" {
+			t.Fatalf("Parse(%q) = %#v", query, plan)
+		}
+	}
+	plan, err := Parse(`COPY events FROM PROGRAM 'generate-events'`, registry)
+	if err != nil || !plan.Program || !plan.ServerSide {
+		t.Fatalf("COPY PROGRAM plan = %#v, %v", plan, err)
+	}
+	if _, err := Parse(`COPY (SELECT * FROM events) TO '/tmp/events.data'`, registry); err == nil || !strings.Contains(err.Error(), "must name a relation") {
+		t.Fatalf("query COPY error = %v", err)
+	}
+}
+
 func int64Field(value int64) []byte {
 	field := make([]byte, 8)
 	binary.BigEndian.PutUint64(field, uint64(value))

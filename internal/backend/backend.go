@@ -843,6 +843,15 @@ func cloneBackendMessage(message pgproto3.BackendMessage) pgproto3.BackendMessag
 			}
 		}
 		return &copy
+	case *pgproto3.NoticeResponse:
+		copy := *message
+		if message.UnknownFields != nil {
+			copy.UnknownFields = make(map[byte]string, len(message.UnknownFields))
+			for key, value := range message.UnknownFields {
+				copy.UnknownFields[key] = value
+			}
+		}
+		return &copy
 	default:
 		return message
 	}

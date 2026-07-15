@@ -135,6 +135,15 @@ COPY uses only the configured primary Burrow; the table definition still exists
 on every Burrow because DDL remains fleet-wide. In `replicated` mode, COPY input
 is sent once to every Burrow and COPY output uses one read Burrow.
 
+Server-side `COPY table FROM 'path'` and `COPY table TO 'path'` are supported
+only for a known unsharded table in `primary` mode. The statement executes once
+on the configured primary Burrow, which owns PostgreSQL's path, permission,
+option, command-tag, and error semantics. Server-side COPY is rejected before a
+Tunnel is opened for sharded tables and for replicated unsharded tables, because
+a path is local to each Burrow and therefore cannot safely describe one logical
+operation. `COPY PROGRAM` is always rejected. Each rejection directs clients to
+the topology-independent `STDIN` or `STDOUT` streaming form.
+
 Sharded `COPY FROM STDIN` is planned from PostgreSQL's COPY AST and the
 Nest-validated schema registry before any Burrow enters COPY mode. The command
 must name the relation and an explicit column list containing every annotated
