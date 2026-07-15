@@ -33,6 +33,8 @@ type Plan struct {
 	Table      string
 	Columns    []string
 	From       bool
+	ServerSide bool
+	Program    bool
 	Sharded    bool
 	Format     Format
 	Delimiter  byte
@@ -57,18 +59,20 @@ func Parse(sql string, registry schema.Registry) (Plan, error) {
 	}
 	statement := tree.Stmts[0].Stmt.GetCopyStmt()
 	plan := Plan{
-		From:      statement.IsFrom,
-		Format:    FormatText,
-		Delimiter: '\t',
-		Null:      `\N`,
-		Encoding:  "UTF8",
-	}
-	if statement.IsProgram || statement.Filename != "" {
-		return Plan{}, fmt.Errorf("Hamstergres Proxy supports only COPY FROM STDIN and COPY TO STDOUT")
+		From:       statement.IsFrom,
+		ServerSide: statement.Filename != "",
+		Program:    statement.IsProgram,
+		Format:     FormatText,
+		Delimiter:  '\t',
+		Null:       `\N`,
+		Encoding:   "UTF8",
 	}
 	if statement.Relation == nil {
 		if statement.IsFrom || statement.Query == nil {
 			return Plan{}, fmt.Errorf("COPY must name a relation")
+		}
+		if plan.ServerSide || plan.Program {
+			return Plan{}, fmt.Errorf("server-side COPY must name a relation")
 		}
 		return plan, nil
 	}
@@ -79,6 +83,12 @@ func Parse(sql string, registry schema.Registry) (Plan, error) {
 			return Plan{}, fmt.Errorf("COPY has an invalid column list")
 		}
 		plan.Columns = append(plan.Columns, column.Sval)
+	}
+	_, plan.Sharded = registry.ShardKey(plan.Table)
+	if plan.ServerSide || plan.Program {
+		// PostgreSQL owns server-side option and filesystem validation. The Proxy
+		// needs only the relation and schema placement to choose a safe policy.
+		return plan, nil
 	}
 
 	unsupported := make([]string, 0)
@@ -179,7 +189,6 @@ func Parse(sql string, registry schema.Registry) (Plan, error) {
 	}
 
 	keys, sharded := registry.ShardKey(plan.Table)
-	plan.Sharded = sharded
 	if !plan.From || !sharded {
 		return plan, nil
 	}

@@ -3,6 +3,7 @@
 package router
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/jruszo/hamstergres/internal/schema"
@@ -206,6 +207,107 @@ func TestAnalyzeSimpleAndExtendedProduceEquivalentPlans(t *testing.T) {
 	}
 	if !simple.Routed || !extended.Routed || simple.Target != extended.Target || simple.Table != extended.Table || simple.Write != extended.Write {
 		t.Fatalf("simple = %#v, extended = %#v", simple, extended)
+	}
+}
+
+func TestAnalyzeMarksTopologyIndependentReadsForOneBurrow(t *testing.T) {
+	registry := schema.New(map[string][]string{"public.accounts": {"tenant_id"}}).
+		WithAllTables([]string{"public.accounts", "public.settings"})
+	burrows := []string{"burrow-01", "burrow-02"}
+	tests := []string{
+		"SELECT 1",
+		"SHOW server_version",
+		"SELECT current_database(), current_schema()",
+		"SELECT c.relname FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace",
+		"SELECT table_name FROM information_schema.tables",
+		"SELECT count(*) FROM public.settings",
+	}
+	for _, query := range tests {
+		plan, err := Analyze(query, nil, registry, burrows)
+		if err != nil {
+			t.Fatalf("Analyze(%q): %v", query, err)
+		}
+		if !plan.SingleBurrow || plan.ScatterError != "" {
+			t.Errorf("Analyze(%q) = %#v, want topology-independent one-Burrow read", query, plan)
+		}
+	}
+
+	for _, query := range []string{
+		"SET application_name = 'compatibility-test'",
+		"SELECT tenant_id FROM public.accounts",
+	} {
+		plan, err := Analyze(query, nil, registry, burrows)
+		if err != nil {
+			t.Fatalf("Analyze(%q): %v", query, err)
+		}
+		if plan.SingleBurrow {
+			t.Errorf("Analyze(%q) = %#v, unexpectedly one-Burrow", query, plan)
+		}
+	}
+}
+
+func TestAnalyzeFailsClosedForUnsupportedGlobalShardedResults(t *testing.T) {
+	registry := schema.New(map[string][]string{"accounts": {"tenant_id"}})
+	burrows := []string{"burrow-01", "burrow-02"}
+	tests := []string{
+		"SELECT count(*) FROM accounts",
+		"SELECT sum(tenant_id), min(tenant_id), max(tenant_id), avg(tenant_id) FROM accounts",
+		"SELECT array_agg(tenant_id), string_agg(tenant_id::text, ',') FROM accounts",
+		"SELECT json_agg(tenant_id), jsonb_object_agg(tenant_id, tenant_id) FROM accounts",
+		"SELECT xmlagg(xmlelement(name value, tenant_id)) FROM accounts",
+		"SELECT bool_and(tenant_id > 0), bit_or(tenant_id) FROM accounts",
+		"SELECT stddev(tenant_id), variance(tenant_id) FROM accounts",
+		"SELECT corr(tenant_id, tenant_id), covar_pop(tenant_id, tenant_id), regr_slope(tenant_id, tenant_id) FROM accounts",
+		"SELECT DISTINCT tenant_id FROM accounts",
+		"SELECT tenant_id FROM accounts ORDER BY tenant_id",
+		"SELECT tenant_id FROM accounts LIMIT 10",
+		"SELECT tenant_id FROM accounts OFFSET 10",
+		"SELECT tenant_id, count(*) FROM accounts GROUP BY tenant_id",
+		"SELECT tenant_id, row_number() OVER (ORDER BY tenant_id) FROM accounts",
+		"SELECT a.tenant_id FROM accounts a JOIN accounts b ON a.tenant_id = b.tenant_id",
+		"WITH selected AS (SELECT tenant_id FROM accounts) SELECT * FROM selected",
+		"SELECT (SELECT tenant_id FROM accounts LIMIT 1)",
+		"SELECT tenant_id FROM accounts UNION SELECT tenant_id FROM accounts",
+	}
+	for _, query := range tests {
+		plan, err := Analyze(query, nil, registry, burrows)
+		if err != nil {
+			t.Fatalf("Analyze(%q): %v", query, err)
+		}
+		if plan.Routed || plan.SingleBurrow || plan.ScatterError == "" {
+			t.Errorf("Analyze(%q) = %#v, want explicit unsupported global result", query, plan)
+		}
+	}
+
+	keyed, err := Analyze("SELECT count(*) FROM accounts WHERE tenant_id = 42", nil, registry, burrows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !keyed.Routed || keyed.ScatterError != "" {
+		t.Fatalf("keyed aggregate = %#v, want ordinary one-Burrow routing", keyed)
+	}
+}
+
+func TestBuiltInAggregateNames(t *testing.T) {
+	names := []string{
+		"any_value", "array_agg", "avg", "bit_and", "bit_or", "bit_xor",
+		"bool_and", "bool_or", "count", "every", "json_agg", "json_agg_strict",
+		"json_arrayagg", "json_objectagg", "jsonb_agg", "jsonb_agg_strict",
+		"json_object_agg", "json_object_agg_strict", "json_object_agg_unique",
+		"json_object_agg_unique_strict", "jsonb_object_agg", "jsonb_object_agg_strict",
+		"jsonb_object_agg_unique", "jsonb_object_agg_unique_strict", "max", "min",
+		"range_agg", "range_intersect_agg", "string_agg", "sum", "xmlagg",
+		"corr", "covar_pop", "covar_samp", "regr_avgx", "regr_avgy", "regr_count",
+		"regr_intercept", "regr_r2", "regr_slope", "regr_sxx", "regr_sxy", "regr_syy",
+		"stddev", "stddev_pop", "stddev_samp", "variance", "var_pop", "var_samp",
+	}
+	for _, name := range names {
+		if !isBuiltInAggregateName(name) || !isBuiltInAggregateName(strings.ToUpper(name)) {
+			t.Errorf("aggregate %q was not recognized case-insensitively", name)
+		}
+	}
+	if isBuiltInAggregateName("ordinary_function") {
+		t.Fatal("ordinary function was classified as an aggregate")
 	}
 }
 

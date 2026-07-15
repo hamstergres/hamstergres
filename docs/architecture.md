@@ -49,10 +49,21 @@ exact comment `hamstergres.shard_key`. Multiple marked columns form a compound
 key in PostgreSQL attribute order, so numeric, text, and mixed-type tuples are
 supported. For example, mark both `accounts.tenant_id` and
 `accounts.region`. It routes reads and writes using the complete tuple and the
-64k-vshard ownership catalog persisted in Nest. It scatters only reads without
-a usable shard key and schema commands that must
-reach every Burrow. A simple-query write without one unambiguous primary key is
-rejected; it is never broadcast as a substitute for distributed transactions.
+64k-vshard ownership catalog persisted in Nest. It scatters append-safe reads
+without a usable shard key and schema commands that must reach every Burrow. A
+simple-query write to a sharded table without one complete, unambiguous
+annotated shard key is rejected; unsharded writes follow the configured fleet
+policy. Relation-free `SELECT`, PostgreSQL catalog reads, and session
+introspection execute once on one Burrow. In `primary` mode that is the
+configured primary Burrow; in `replicated` mode a stable round-robin selection
+distributes these reads across the sorted routable Burrows. Reads
+whose referenced user tables are all unsharded also execute once, using the
+configured primary or one selected replica according to the fleet policy. This
+keeps physical catalog copies and Burrow count invisible to PostgreSQL clients.
+Aggregates, grouping, `DISTINCT`, ordering, limits, offsets, joins, CTEs,
+subqueries, set operations, windows, and row locking fail before a Tunnel is
+opened with SQLSTATE `0A000` unless a complete shard key first reduces the query
+to one Burrow. Simple and extended-query execution share this planner.
 Within a simple-query transaction, statements may route to different Burrows.
 Transactions execute DML concurrently with other frontend transactions and do
 not take a Proxy-wide write lock. If a write touches more than one Burrow,
@@ -76,12 +87,13 @@ managers. Every Tunnel therefore sets PostgreSQL `lock_timeout` from
 `transactions.lock_timeout`, which defaults to one second. A bounded lock wait
 fails with SQLSTATE `55P03`; applications must retry the complete transaction.
 
-Extended-query statements are parsed on every affinity connection, but a portal
-whose bound parameters contain a complete primary key uses one Tunnel for its
-Bind, Describe, Execute, and Close lifecycle. Unkeyed reads scatter in stable
-Burrow order, and unroutable writes fail closed. Read-only and single-Burrow
-transactions avoid prepared transactions. Multi-Burrow writes use the same
-two-phase commit path as simple queries.
+Extended-query statements are parsed on every selected affinity connection,
+but a portal whose bound parameters contain a complete annotated shard key uses
+one Tunnel for its Bind, Describe, Execute, and Close lifecycle. Unkeyed reads
+scatter in stable Burrow order only when their results are append-safe;
+topology-independent reads use one Tunnel, and unroutable writes fail closed.
+Read-only and single-Burrow transactions avoid prepared transactions.
+Multi-Burrow writes use the same two-phase commit path as simple queries.
 
 The Proxy buffers an extended request through the frontend Flush or Sync
 boundary and forwards Bind, optional portal Describe, Execute, and Sync in one
@@ -123,6 +135,15 @@ FROM STDIN` and `COPY TO STDOUT`. For an unsharded table in `primary` mode,
 COPY uses only the configured primary Burrow; the table definition still exists
 on every Burrow because DDL remains fleet-wide. In `replicated` mode, COPY input
 is sent once to every Burrow and COPY output uses one read Burrow.
+
+Server-side `COPY table FROM 'path'` and `COPY table TO 'path'` are supported
+only for a known unsharded table in `primary` mode. The statement executes once
+on the configured primary Burrow, which owns PostgreSQL's path, permission,
+option, command-tag, and error semantics. Server-side COPY is rejected before a
+Tunnel is opened for sharded tables and for replicated unsharded tables, because
+a path is local to each Burrow and therefore cannot safely describe one logical
+operation. `COPY PROGRAM` is always rejected. Each rejection directs clients to
+the topology-independent `STDIN` or `STDOUT` streaming form.
 
 Sharded `COPY FROM STDIN` is planned from PostgreSQL's COPY AST and the
 Nest-validated schema registry before any Burrow enters COPY mode. The command

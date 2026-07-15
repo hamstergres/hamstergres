@@ -42,6 +42,7 @@ type Server struct {
 
 	connections       atomic.Int64
 	activeConnections atomic.Int64
+	topologyReadIndex atomic.Uint64
 }
 
 func New(backends *backend.Manager, logger *slog.Logger, twoPhaseCommit ...bool) *Server {
@@ -191,6 +192,11 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 					state.failed = true
 					break
 				}
+				if decision.scatterError != "" {
+					s.sendExtendedError(frontend, "0A000", decision.scatterError)
+					state.failed = true
+					break
+				}
 				if decision.keyedWrite && !decision.routed {
 					s.sendExtendedError(frontend, "0A000", "write to a sharded table must include one unambiguous annotated shard key")
 					state.failed = true
@@ -208,7 +214,7 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 					if active, ok := ensureSession(); ok {
 						s.handleCopyQuery(frontend, active, message.String, &state)
 					}
-				} else if session != nil || isTransactionControl(message.String) {
+				} else if session != nil || isTransactionControl(message.String) || requiresFleetWriteOrder(message.String, len(s.backends.ShardNames())) {
 					if active, ok := ensureSession(); ok {
 						s.handleSessionQuery(frontend, active, message.String, &state)
 					}
@@ -228,6 +234,11 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 				decision, err := s.routePortal(statement.routing, parameters, s.backends.ShardNames())
 				if err != nil {
 					s.sendExtendedError(frontend, "42601", err.Error())
+					state.failed = true
+					break
+				}
+				if decision.scatterError != "" {
+					s.sendExtendedError(frontend, "0A000", decision.scatterError)
 					state.failed = true
 					break
 				}
@@ -778,6 +789,13 @@ func (s *Server) handleCopyQuery(frontend *pgproto3.Backend, session *backend.Se
 		s.sendSessionError(frontend, state.txStatus(), "0A000", err.Error())
 		return false
 	}
+	if copyPlan.Program {
+		s.sendSessionError(frontend, state.txStatus(), "0A000", "COPY PROGRAM is not supported by Hamstergres Proxy; use COPY FROM STDIN or COPY TO STDOUT")
+		return false
+	}
+	if copyPlan.ServerSide {
+		return s.handleServerSideCopy(frontend, session, sql, copyPlan, state)
+	}
 	targets, err := s.copyTargets(sql)
 	if err != nil {
 		s.sendSessionError(frontend, state.txStatus(), "42601", err.Error())
@@ -866,6 +884,84 @@ func (s *Server) handleCopyQuery(frontend *pgproto3.Backend, session *backend.Se
 		s.sendExtendedError(frontend, "08P01", fmt.Sprintf("unexpected COPY response %T", first))
 		return false
 	}
+}
+
+func (s *Server) handleServerSideCopy(frontend *pgproto3.Backend, session *backend.Session, sql string, plan copyrouter.Plan, state *extendedState) bool {
+	registry := s.backends.Schema()
+	if plan.Table == "" || !registry.HasTable(plan.Table) {
+		s.sendSessionError(frontend, state.txStatus(), "0A000", "server-side COPY requires a known unsharded table; use COPY FROM STDIN or COPY TO STDOUT")
+		return false
+	}
+	if plan.Sharded {
+		s.sendSessionError(frontend, state.txStatus(), "0A000", "server-side COPY for a sharded table is not supported; use COPY FROM STDIN or COPY TO STDOUT")
+		return false
+	}
+	if s.backends.UnshardedMode() != "primary" {
+		s.sendSessionError(frontend, state.txStatus(), "0A000", "server-side COPY is not supported for replicated unsharded tables because file paths are Burrow-local; use COPY FROM STDIN or COPY TO STDOUT")
+		return false
+	}
+	target := s.backends.PrimaryBurrow()
+	if target == "" {
+		s.sendSessionError(frontend, state.txStatus(), "08006", "no primary Burrow configured")
+		return false
+	}
+
+	started := time.Now()
+	success := false
+	errorCategory := "query_execution"
+	traceContext, span := otel.Tracer("github.com/jruszo/hamstergres/proxy").Start(context.Background(), "proxy.query", trace.WithAttributes(
+		attribute.String("db.operation.name", "COPY"), attribute.String("hamstergres.route", "single_burrow")))
+	tunnelSpans := startTunnelSpans(traceContext, []string{target})
+	defer func() {
+		outcome := "failure"
+		if success {
+			outcome = "success"
+			span.SetStatus(codes.Ok, "")
+		} else {
+			span.SetStatus(codes.Error, "COPY failed")
+		}
+		span.End()
+		s.backends.RecordOperation("copy", outcome)
+		s.backends.RecordQueryTargetsCategory(sql, success, time.Since(started), []string{target}, errorCategory)
+	}()
+
+	responses, err := exchangeOne(session, target, &pgproto3.Query{String: sql}, isQueryDone)
+	if err != nil {
+		errorCategory = "burrow_transport"
+		endTunnelSpans(tunnelSpans, err)
+		state.transactionFailed = state.transaction
+		s.sendSessionError(frontend, state.txStatus(), "08006", err.Error())
+		return false
+	}
+	if len(responses) != 1 || len(responses[0]) == 0 {
+		err := fmt.Errorf("no primary Burrow COPY response")
+		errorCategory = "protocol"
+		endTunnelSpans(tunnelSpans, err)
+		s.sendSessionError(frontend, state.txStatus(), "XX000", err.Error())
+		return false
+	}
+	backendError := firstError(responses)
+	if backendError != nil {
+		errorCategory = postgresErrorCategory(backendError.Code)
+		endTunnelSpans(tunnelSpans, fmt.Errorf("PostgreSQL error %s", backendError.Code))
+	} else {
+		endTunnelSpans(tunnelSpans, nil)
+	}
+	for _, message := range responses[0] {
+		frontend.Send(message)
+	}
+	if backendError != nil {
+		state.transactionFailed = readyTxStatus(responses) == 'E'
+		return false
+	}
+	if plan.From {
+		s.markWriteParticipants(state, []string{target})
+		if state.transaction {
+			state.mutated = true
+		}
+	}
+	success = true
+	return true
 }
 
 func (s *Server) handleCopyData(frontend *pgproto3.Backend, session *backend.Session, message *pgproto3.CopyData, state *extendedState) bool {
@@ -1777,6 +1873,11 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 		return false
 	}
 	target, routed := decision.target, decision.routed
+	if decision.scatterError != "" {
+		errorCategory = "unsupported_global_result"
+		s.sendSessionError(frontend, state.txStatus(), "0A000", decision.scatterError)
+		return false
+	}
 	if decision.keyedWrite && !routed {
 		errorCategory = "unsafe_routing"
 		s.sendSessionError(frontend, state.txStatus(), "0A000", "write to a sharded table must include its annotated shard key")
@@ -1821,7 +1922,8 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 	var description *pgproto3.RowDescription
 	var rows []*pgproto3.DataRow
 	var tags []string
-	for _, response := range responses {
+	var notices []*pgproto3.NoticeResponse
+	for responseIndex, response := range responses {
 		for _, wireMessage := range response {
 			switch wireMessage := wireMessage.(type) {
 			case *pgproto3.RowDescription:
@@ -1835,8 +1937,17 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 				rows = append(rows, wireMessage)
 			case *pgproto3.CommandComplete:
 				tags = append(tags, string(wireMessage.CommandTag))
-			case *pgproto3.EmptyQueryResponse, *pgproto3.ReadyForQuery, *pgproto3.NoticeResponse, *pgproto3.ParameterStatus, *pgproto3.NotificationResponse:
-				// ReadyForQuery is merged after result data. Notices and notifications are Burrow-local.
+			case *pgproto3.NoticeResponse:
+				// A fleet-wide statement produces the same logical notice on every
+				// Burrow. Relay one representative stream so PostgreSQL behavior is
+				// visible without exposing the physical fan-out.
+				if responseIndex == 0 {
+					notice := *wireMessage
+					notices = append(notices, &notice)
+				}
+			case *pgproto3.EmptyQueryResponse, *pgproto3.ReadyForQuery, *pgproto3.ParameterStatus, *pgproto3.NotificationResponse:
+				// ReadyForQuery is merged after result data. Parameter status and
+				// notifications remain Burrow-local asynchronous state.
 			case *pgproto3.CopyInResponse, *pgproto3.CopyOutResponse, *pgproto3.CopyBothResponse:
 				s.sendError(frontend, "0A000", "COPY is not supported by Hamstergres Proxy")
 				return false
@@ -1851,6 +1962,9 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 			s.sendSessionError(frontend, state.txStatus(), "55000", fmt.Sprintf("refresh schema registry after DDL: %v", err))
 			return false
 		}
+	}
+	for _, notice := range notices {
+		frontend.Send(notice)
 	}
 	if description != nil {
 		frontend.Send(description)
@@ -2009,9 +2123,10 @@ func runTransactionCommand(session *backend.Session, burrow, sql string) *pgprot
 }
 
 type routeDecision struct {
-	target     string
-	routed     bool
-	keyedWrite bool
+	target       string
+	routed       bool
+	keyedWrite   bool
+	scatterError string
 }
 
 func (s *Server) routeSQL(sql string, burrows []string) (routeDecision, error) {
@@ -2032,7 +2147,21 @@ func (s *Server) routePortal(prepared *router.Prepared, parameters [][]byte, bur
 }
 
 func (s *Server) routePlan(plan router.Plan, burrows []string) routeDecision {
-	decision := routeDecision{target: plan.Target, routed: plan.Routed, keyedWrite: plan.Write && (plan.Table == "" || plan.Sharded)}
+	decision := routeDecision{target: plan.Target, routed: plan.Routed, keyedWrite: plan.Write && (plan.Table == "" || plan.Sharded), scatterError: plan.ScatterError}
+	if plan.SingleBurrow {
+		if len(burrows) == 0 {
+			return decision
+		}
+		if s.backends.UnshardedMode() == "primary" {
+			decision.target = s.backends.PrimaryBurrow()
+		} else if plan.Deterministic {
+			decision.target = s.balancedBurrow(burrows)
+		} else {
+			decision.target = randomBurrow(burrows)
+		}
+		decision.routed = decision.target != ""
+		return decision
+	}
 	if plan.Routed || plan.Table == "" || plan.Sharded {
 		return decision
 	}
@@ -2046,14 +2175,30 @@ func (s *Server) routePlan(plan router.Plan, burrows []string) routeDecision {
 	if len(burrows) == 0 {
 		return decision
 	}
-	var value [8]byte
-	if _, err := rand.Read(value[:]); err != nil {
-		decision.target, decision.routed = burrows[0], true
-		return decision
-	}
-	decision.target = burrows[binary.LittleEndian.Uint64(value[:])%uint64(len(burrows))]
+	decision.target = randomBurrow(burrows)
 	decision.routed = true
 	return decision
+}
+
+func (s *Server) balancedBurrow(burrows []string) string {
+	if len(burrows) == 0 {
+		return ""
+	}
+	ordered := append([]string(nil), burrows...)
+	sort.Strings(ordered)
+	index := s.topologyReadIndex.Add(1) - 1
+	return ordered[index%uint64(len(ordered))]
+}
+
+func randomBurrow(burrows []string) string {
+	if len(burrows) == 0 {
+		return ""
+	}
+	var value [8]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return burrows[0]
+	}
+	return burrows[binary.LittleEndian.Uint64(value[:])%uint64(len(burrows))]
 }
 
 func requiresRoutedWrite(sql string) bool {
@@ -2245,6 +2390,11 @@ func (s *Server) handleQuery(frontend *pgproto3.Backend, sql string) {
 		return
 	}
 	target, routed := decision.target, decision.routed
+	if decision.scatterError != "" {
+		errorCategory = "unsupported_global_result"
+		s.sendError(frontend, "0A000", decision.scatterError)
+		return
+	}
 	if decision.keyedWrite && !routed {
 		errorCategory = "unsafe_routing"
 		s.sendError(frontend, "0A000", "write to a sharded table must include its annotated shard key")

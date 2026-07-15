@@ -39,8 +39,26 @@ not ok 2      + char                                   202 ms
 func TestValidateCompletenessRejectsTruncatedRun(t *testing.T) {
 	results := Results{Tests: []TestResult{{Name: "boolean", Status: StatusPass}}}
 	err := ValidateCompleteness(&results, []string{"boolean", "char"})
-	if err == nil || !strings.Contains(err.Error(), "missing: char") {
+	if err == nil || !strings.Contains(err.Error(), "completed 1 of 2") || !strings.Contains(err.Error(), "missing: char") {
 		t.Fatalf("error = %v, want missing test", err)
+	}
+	if results.ExpectedTests != 2 || results.PassedTests != 1 || results.FailedTests != 1 ||
+		len(results.MissingTests) != 1 || results.MissingTests[0] != "char" ||
+		len(results.Tests) != 2 || results.Tests[1].Name != "char" || results.Tests[1].Status != StatusMissing {
+		t.Fatalf("partial results = %#v", results)
+	}
+}
+
+func TestParseTAPToleratesInterleavedDiagnosticPrefix(t *testing.T) {
+	log := `# not ok 165   + foreign_key                                 5 ms
+(test process exited with exit code 2)
+`
+	results, err := ParseTAP(strings.NewReader(log), "17.10", time.Unix(123, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results.Tests) != 1 || results.Tests[0].Name != "foreign_key" || results.Tests[0].Status != StatusFail {
+		t.Fatalf("interleaved result = %#v", results)
 	}
 }
 
@@ -83,6 +101,7 @@ func TestWriteAndReadResultsRoundTrip(t *testing.T) {
 		ExpectedTests:     2,
 		PassedTests:       1,
 		FailedTests:       1,
+		MissingTests:      []string{"missing_test"},
 		ProxyCrashes:      1,
 		Tests: []TestResult{
 			{Name: "boolean", Status: StatusPass, DurationMS: 10},
@@ -99,9 +118,51 @@ func TestWriteAndReadResultsRoundTrip(t *testing.T) {
 	if got.FormatVersion != want.FormatVersion || got.PostgreSQLVersion != want.PostgreSQLVersion ||
 		!got.GeneratedAt.Equal(want.GeneratedAt) || got.ExpectedTests != want.ExpectedTests ||
 		got.PassedTests != want.PassedTests || got.FailedTests != want.FailedTests ||
+		strings.Join(got.MissingTests, ",") != strings.Join(want.MissingTests, ",") ||
 		got.ProxyCrashes != want.ProxyCrashes || len(got.Tests) != len(want.Tests) ||
 		got.Tests[0] != want.Tests[0] || got.Tests[1] != want.Tests[1] {
 		t.Fatalf("round trip = %#v, want %#v", got, want)
+	}
+}
+
+func TestWriteBadgeEndpoint(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "badges", "overall.json")
+	results := Results{PostgreSQLVersion: "17.10", ExpectedTests: 225, PassedTests: 12}
+	if err := WriteBadgeEndpoint(path, results); err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"schemaVersion": 1`, `"label": "PostgreSQL 17.10"`, `"message": "12/225 passing"`, `"color": "red"`} {
+		if !strings.Contains(string(contents), want) {
+			t.Fatalf("badge endpoint does not contain %q:\n%s", want, contents)
+		}
+	}
+
+	results.MissingTests = []string{"foreign_key"}
+	if err := WriteBadgeEndpoint(path, results); err != nil {
+		t.Fatal(err)
+	}
+	contents, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(contents), `"message": "12/225 passing (incomplete)"`) {
+		t.Fatalf("incomplete badge endpoint:\n%s", contents)
+	}
+}
+
+func TestBadgeColor(t *testing.T) {
+	for _, test := range []struct {
+		passed int
+		total  int
+		want   string
+	}{{0, 0, "lightgrey"}, {225, 225, "brightgreen"}, {180, 225, "yellow"}, {113, 225, "orange"}, {12, 225, "red"}} {
+		if got := badgeColor(test.passed, test.total); got != test.want {
+			t.Fatalf("badgeColor(%d, %d) = %q, want %q", test.passed, test.total, got, test.want)
+		}
 	}
 }
 
@@ -140,5 +201,25 @@ func TestMarkdownExplainsMissingBaseline(t *testing.T) {
 	report := Markdown(Results{PostgreSQLVersion: "17.10"}, nil, false)
 	if !strings.Contains(report, "No compatible baseline was supplied") {
 		t.Fatalf("report did not explain missing baseline:\n%s", report)
+	}
+}
+
+func TestMarkdownReportsPartialInventory(t *testing.T) {
+	results := Results{
+		PostgreSQLVersion: "17.10",
+		ExpectedTests:     2,
+		PassedTests:       1,
+		FailedTests:       1,
+		MissingTests:      []string{"foreign_key"},
+		Tests: []TestResult{
+			{Name: "boolean", Status: StatusPass, DurationMS: 10},
+			{Name: "foreign_key", Status: StatusMissing},
+		},
+	}
+	report := Markdown(results, nil, false)
+	for _, want := range []string{"1/2 passing", "Harness incomplete", "`foreign_key`", "| `foreign_key` | MISSING | 0 ms |"} {
+		if !strings.Contains(report, want) {
+			t.Fatalf("partial report does not contain %q:\n%s", want, report)
+		}
 	}
 }
