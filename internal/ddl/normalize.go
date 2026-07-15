@@ -33,25 +33,8 @@ func Normalize(sql string) (Result, error) {
 		if create := raw.Stmt.GetCreateStmt(); create != nil {
 			result.Schema = true
 			for _, element := range create.TableElts {
-				column := element.GetColumnDef()
-				if column == nil {
-					continue
-				}
-				serial := serialType(column.TypeName)
-				identity := identityConstraint(column.Constraints)
-				if serial {
-					column.TypeName.Names = []*pg_query.Node{pg_query.MakeStrNode("pg_catalog"), pg_query.MakeStrNode("int8")}
-					column.Constraints = append(column.Constraints, constraintNode(&pg_query.Constraint{Contype: pg_query.ConstrType_CONSTR_IDENTITY, GeneratedWhen: "d"}))
+				if normalizeColumnDefinition(element.GetColumnDef()) {
 					result.Changed = true
-				} else if identity != nil {
-					if !bigintType(column.TypeName) {
-						column.TypeName.Names = []*pg_query.Node{pg_query.MakeStrNode("pg_catalog"), pg_query.MakeStrNode("int8")}
-						result.Changed = true
-					}
-					if identity.GeneratedWhen != "d" {
-						identity.GeneratedWhen = "d"
-						result.Changed = true
-					}
 				}
 			}
 		}
@@ -63,22 +46,8 @@ func Normalize(sql string) (Result, error) {
 					continue
 				}
 				if command.Subtype == pg_query.AlterTableType_AT_AddColumn {
-					column := command.Def.GetColumnDef()
-					if column != nil {
-						serial := serialType(column.TypeName)
-						identity := identityConstraint(column.Constraints)
-						if serial {
-							column.TypeName.Names = []*pg_query.Node{pg_query.MakeStrNode("pg_catalog"), pg_query.MakeStrNode("int8")}
-							column.Constraints = append(column.Constraints, constraintNode(&pg_query.Constraint{Contype: pg_query.ConstrType_CONSTR_IDENTITY, GeneratedWhen: "d"}))
-							result.Changed = true
-						} else if identity != nil && identity.GeneratedWhen != "d" {
-							identity.GeneratedWhen = "d"
-							result.Changed = true
-						}
-						if identity != nil && !bigintType(column.TypeName) {
-							column.TypeName.Names = []*pg_query.Node{pg_query.MakeStrNode("pg_catalog"), pg_query.MakeStrNode("int8")}
-							result.Changed = true
-						}
+					if normalizeColumnDefinition(command.Def.GetColumnDef()) {
+						result.Changed = true
 					}
 				}
 				if command.Subtype == pg_query.AlterTableType_AT_AddIdentity {
@@ -88,7 +57,11 @@ func Normalize(sql string) (Result, error) {
 					}
 				}
 				if command.Subtype == pg_query.AlterTableType_AT_SetIdentity {
-					for _, item := range command.Def.GetList().Items {
+					options := command.Def.GetList()
+					if options == nil {
+						continue
+					}
+					for _, item := range options.Items {
 						if option := item.GetDefElem(); option != nil && option.Defname == "generated" {
 							if value := option.Arg.GetInteger(); value != nil && value.Ival != int32('d') {
 								value.Ival = int32('d')
@@ -109,8 +82,43 @@ func Normalize(sql string) (Result, error) {
 	return result, nil
 }
 
+// normalizeColumnDefinition rewrites an ordinary, self-contained column
+// definition to the Hamstergres generated-key contract. PostgreSQL also uses
+// ColumnDef for typed-table and partition column options. Those nodes inherit
+// their type from another relation and deliberately have a nil TypeName. Leave
+// them unchanged so PostgreSQL can return its native unsupported-shape error.
+func normalizeColumnDefinition(column *pg_query.ColumnDef) bool {
+	if column == nil || column.TypeName == nil {
+		return false
+	}
+
+	identity := identityConstraint(column.Constraints)
+	if serialType(column.TypeName) {
+		column.TypeName.Names = []*pg_query.Node{pg_query.MakeStrNode("pg_catalog"), pg_query.MakeStrNode("int8")}
+		column.Constraints = append(column.Constraints, constraintNode(&pg_query.Constraint{Contype: pg_query.ConstrType_CONSTR_IDENTITY, GeneratedWhen: "d"}))
+		return true
+	}
+	if identity == nil {
+		return false
+	}
+
+	changed := false
+	if !bigintType(column.TypeName) {
+		column.TypeName.Names = []*pg_query.Node{pg_query.MakeStrNode("pg_catalog"), pg_query.MakeStrNode("int8")}
+		changed = true
+	}
+	if identity.GeneratedWhen != "d" {
+		identity.GeneratedWhen = "d"
+		changed = true
+	}
+	return changed
+}
+
 func identityConstraint(nodes []*pg_query.Node) *pg_query.Constraint {
 	for _, node := range nodes {
+		if node == nil {
+			continue
+		}
 		constraint := node.GetConstraint()
 		if constraint != nil && constraint.Contype == pg_query.ConstrType_CONSTR_IDENTITY {
 			return constraint
@@ -137,5 +145,13 @@ func lastTypeName(value *pg_query.TypeName) string {
 	if value == nil || len(value.Names) == 0 {
 		return ""
 	}
-	return value.Names[len(value.Names)-1].GetString_().Sval
+	last := value.Names[len(value.Names)-1]
+	if last == nil {
+		return ""
+	}
+	name := last.GetString_()
+	if name == nil {
+		return ""
+	}
+	return name.Sval
 }

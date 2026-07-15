@@ -71,3 +71,34 @@ func TestNormalizePreservesOrdinaryStatements(t *testing.T) {
 		t.Fatalf("Normalize = %#v", result)
 	}
 }
+
+func TestNormalizePreservesInheritedColumnIdentityErrors(t *testing.T) {
+	for _, sql := range []string{
+		"CREATE TABLE itest12 OF itest_type (f1 WITH OPTIONS GENERATED ALWAYS AS IDENTITY)",
+		"CREATE TABLE pitest1_pfail PARTITION OF pitest1 (f3 WITH OPTIONS GENERATED ALWAYS AS IDENTITY) FOR VALUES FROM ('2016-11-01') TO ('2016-12-01')",
+	} {
+		result, err := Normalize(sql)
+		if err != nil {
+			t.Fatalf("Normalize(%q): %v", sql, err)
+		}
+		if !result.Schema || result.Changed || result.SQL != sql {
+			t.Fatalf("Normalize(%q) = %#v", sql, result)
+		}
+	}
+}
+
+func FuzzNormalizeDDLNeverPanics(f *testing.F) {
+	for _, sql := range []string{
+		"CREATE TABLE users (id serial PRIMARY KEY, name text)",
+		"CREATE TABLE itest12 OF itest_type (f1 WITH OPTIONS GENERATED ALWAYS AS IDENTITY)",
+		"CREATE TABLE pitest1_pfail PARTITION OF pitest1 (f3 WITH OPTIONS GENERATED ALWAYS AS IDENTITY) FOR VALUES FROM ('2016-11-01') TO ('2016-12-01')",
+		"ALTER TABLE users ADD COLUMN id bigint GENERATED ALWAYS AS IDENTITY",
+		"ALTER TABLE users ALTER COLUMN id SET GENERATED ALWAYS",
+	} {
+		f.Add(sql)
+	}
+
+	f.Fuzz(func(t *testing.T, sql string) {
+		_, _ = Normalize(sql)
+	})
+}
