@@ -57,6 +57,33 @@ func TestRoutingParametersDecodeBinaryIntegers(t *testing.T) {
 	}
 }
 
+func TestBalancedBurrowUsesStableRoundRobin(t *testing.T) {
+	server := &Server{}
+	burrows := []string{"burrow-03", "burrow-01", "burrow-02"}
+	want := []string{"burrow-01", "burrow-02", "burrow-03", "burrow-01"}
+	for index, expected := range want {
+		if got := server.balancedBurrow(burrows); got != expected {
+			t.Fatalf("balanced selection %d = %q, want %q", index, got, expected)
+		}
+	}
+	if got := server.balancedBurrow(nil); got != "" {
+		t.Fatalf("empty balanced selection = %q, want empty", got)
+	}
+}
+
+func TestRandomBurrowReturnsAvailableBurrow(t *testing.T) {
+	burrows := []string{"burrow-01", "burrow-02"}
+	for range 20 {
+		got := randomBurrow(burrows)
+		if got != burrows[0] && got != burrows[1] {
+			t.Fatalf("randomBurrow = %q, want an available Burrow", got)
+		}
+	}
+	if got := randomBurrow(nil); got != "" {
+		t.Fatalf("empty random selection = %q, want empty", got)
+	}
+}
+
 func BenchmarkRoutingParametersTextBigint(b *testing.B) {
 	message := &pgproto3.Bind{Parameters: [][]byte{[]byte("42")}}
 	for b.Loop() {

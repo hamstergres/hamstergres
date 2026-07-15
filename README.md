@@ -322,10 +322,11 @@ instead of being duplicated across the fleet. DDL is still applied to every
 Burrow. The `sharding.unsharded_tables` configuration selects either one
 primary Burrow for all unsharded traffic or replicated writes with randomly
 load-balanced reads. Topology-independent reads use the primary Burrow in
-`primary` mode and the lexicographically first routable Burrow in `replicated`
-mode. Extended-protocol portals with a complete bound shard key use one Tunnel
-for Bind, Describe, Execute, and Close; append-safe unkeyed read portals retain
-deterministic scatter behavior. Global operations over scattered sharded rows,
+`primary` mode and stable round-robin selection across sorted routable Burrows
+in `replicated` mode. Extended-protocol portals with a complete bound shard key
+use one Tunnel for Bind, Describe, Execute, and Close; append-safe unkeyed read
+portals retain deterministic scatter behavior. Global operations over scattered
+sharded rows,
 including aggregates, `DISTINCT`, `ORDER BY`, `LIMIT`, `OFFSET`, joins, CTEs,
 subqueries, set operations, and window functions, fail closed with SQLSTATE
 `0A000` until the Proxy has a PostgreSQL-equivalent global result operator. The

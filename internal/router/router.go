@@ -843,13 +843,30 @@ func hasAggregateOrWindow(statement *pg_query.SelectStmt) bool {
 			found = true
 			return
 		}
-		name := strings.ToLower(functionName(call.Funcname))
-		switch name {
-		case "avg", "count", "max", "min", "sum":
+		name := functionName(call.Funcname)
+		if isBuiltInAggregateName(name) {
 			found = true
 		}
 	})
 	return found
+}
+
+func isBuiltInAggregateName(name string) bool {
+	switch strings.ToLower(name) {
+	case "any_value", "array_agg", "avg", "bit_and", "bit_or", "bit_xor",
+		"bool_and", "bool_or", "count", "every", "json_agg", "json_agg_strict",
+		"json_arrayagg", "json_objectagg", "jsonb_agg", "jsonb_agg_strict",
+		"json_object_agg", "json_object_agg_strict", "json_object_agg_unique",
+		"json_object_agg_unique_strict", "jsonb_object_agg", "jsonb_object_agg_strict",
+		"jsonb_object_agg_unique", "jsonb_object_agg_unique_strict", "max", "min",
+		"range_agg", "range_intersect_agg", "string_agg", "sum", "xmlagg",
+		"corr", "covar_pop", "covar_samp", "regr_avgx", "regr_avgy", "regr_count",
+		"regr_intercept", "regr_r2", "regr_slope", "regr_sxx", "regr_sxy", "regr_syy",
+		"stddev", "stddev_pop", "stddev_samp", "variance", "var_pop", "var_samp":
+		return true
+	default:
+		return false
+	}
 }
 
 func functionName(nodes []*pg_query.Node) string {

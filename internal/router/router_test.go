@@ -3,6 +3,7 @@
 package router
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/jruszo/hamstergres/internal/schema"
@@ -251,6 +252,12 @@ func TestAnalyzeFailsClosedForUnsupportedGlobalShardedResults(t *testing.T) {
 	tests := []string{
 		"SELECT count(*) FROM accounts",
 		"SELECT sum(tenant_id), min(tenant_id), max(tenant_id), avg(tenant_id) FROM accounts",
+		"SELECT array_agg(tenant_id), string_agg(tenant_id::text, ',') FROM accounts",
+		"SELECT json_agg(tenant_id), jsonb_object_agg(tenant_id, tenant_id) FROM accounts",
+		"SELECT xmlagg(xmlelement(name value, tenant_id)) FROM accounts",
+		"SELECT bool_and(tenant_id > 0), bit_or(tenant_id) FROM accounts",
+		"SELECT stddev(tenant_id), variance(tenant_id) FROM accounts",
+		"SELECT corr(tenant_id, tenant_id), covar_pop(tenant_id, tenant_id), regr_slope(tenant_id, tenant_id) FROM accounts",
 		"SELECT DISTINCT tenant_id FROM accounts",
 		"SELECT tenant_id FROM accounts ORDER BY tenant_id",
 		"SELECT tenant_id FROM accounts LIMIT 10",
@@ -278,6 +285,29 @@ func TestAnalyzeFailsClosedForUnsupportedGlobalShardedResults(t *testing.T) {
 	}
 	if !keyed.Routed || keyed.ScatterError != "" {
 		t.Fatalf("keyed aggregate = %#v, want ordinary one-Burrow routing", keyed)
+	}
+}
+
+func TestBuiltInAggregateNames(t *testing.T) {
+	names := []string{
+		"any_value", "array_agg", "avg", "bit_and", "bit_or", "bit_xor",
+		"bool_and", "bool_or", "count", "every", "json_agg", "json_agg_strict",
+		"json_arrayagg", "json_objectagg", "jsonb_agg", "jsonb_agg_strict",
+		"json_object_agg", "json_object_agg_strict", "json_object_agg_unique",
+		"json_object_agg_unique_strict", "jsonb_object_agg", "jsonb_object_agg_strict",
+		"jsonb_object_agg_unique", "jsonb_object_agg_unique_strict", "max", "min",
+		"range_agg", "range_intersect_agg", "string_agg", "sum", "xmlagg",
+		"corr", "covar_pop", "covar_samp", "regr_avgx", "regr_avgy", "regr_count",
+		"regr_intercept", "regr_r2", "regr_slope", "regr_sxx", "regr_sxy", "regr_syy",
+		"stddev", "stddev_pop", "stddev_samp", "variance", "var_pop", "var_samp",
+	}
+	for _, name := range names {
+		if !isBuiltInAggregateName(name) || !isBuiltInAggregateName(strings.ToUpper(name)) {
+			t.Errorf("aggregate %q was not recognized case-insensitively", name)
+		}
+	}
+	if isBuiltInAggregateName("ordinary_function") {
+		t.Fatal("ordinary function was classified as an aggregate")
 	}
 }
 

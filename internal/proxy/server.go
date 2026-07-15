@@ -42,6 +42,7 @@ type Server struct {
 
 	connections       atomic.Int64
 	activeConnections atomic.Int64
+	topologyReadIndex atomic.Uint64
 }
 
 func New(backends *backend.Manager, logger *slog.Logger, twoPhaseCommit ...bool) *Server {
@@ -2154,16 +2155,9 @@ func (s *Server) routePlan(plan router.Plan, burrows []string) routeDecision {
 		if s.backends.UnshardedMode() == "primary" {
 			decision.target = s.backends.PrimaryBurrow()
 		} else if plan.Deterministic {
-			ordered := append([]string(nil), burrows...)
-			sort.Strings(ordered)
-			decision.target = ordered[0]
+			decision.target = s.balancedBurrow(burrows)
 		} else {
-			var value [8]byte
-			if _, err := rand.Read(value[:]); err != nil {
-				decision.target = burrows[0]
-			} else {
-				decision.target = burrows[binary.LittleEndian.Uint64(value[:])%uint64(len(burrows))]
-			}
+			decision.target = randomBurrow(burrows)
 		}
 		decision.routed = decision.target != ""
 		return decision
@@ -2181,14 +2175,30 @@ func (s *Server) routePlan(plan router.Plan, burrows []string) routeDecision {
 	if len(burrows) == 0 {
 		return decision
 	}
-	var value [8]byte
-	if _, err := rand.Read(value[:]); err != nil {
-		decision.target, decision.routed = burrows[0], true
-		return decision
-	}
-	decision.target = burrows[binary.LittleEndian.Uint64(value[:])%uint64(len(burrows))]
+	decision.target = randomBurrow(burrows)
 	decision.routed = true
 	return decision
+}
+
+func (s *Server) balancedBurrow(burrows []string) string {
+	if len(burrows) == 0 {
+		return ""
+	}
+	ordered := append([]string(nil), burrows...)
+	sort.Strings(ordered)
+	index := s.topologyReadIndex.Add(1) - 1
+	return ordered[index%uint64(len(ordered))]
+}
+
+func randomBurrow(burrows []string) string {
+	if len(burrows) == 0 {
+		return ""
+	}
+	var value [8]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return burrows[0]
+	}
+	return burrows[binary.LittleEndian.Uint64(value[:])%uint64(len(burrows))]
 }
 
 func requiresRoutedWrite(sql string) bool {
