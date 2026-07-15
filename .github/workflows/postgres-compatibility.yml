@@ -18,7 +18,7 @@ jobs:
   pg-regress:
     name: Full PostgreSQL regression suite
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 20
 
     steps:
       - name: Check out Hamstergres
@@ -45,17 +45,18 @@ jobs:
         id: compatibility
         env:
           POSTGRES_COMPATIBILITY_BASELINE: /tmp/hamstergres-pgcompat-baseline/results.json
+          POSTGRES_COMPATIBILITY_TIMEOUT: 10m
         run: make test-postgres-compatibility
 
       - name: Add report to the job summary
-        if: ${{ !cancelled() }}
+        if: ${{ always() }}
         run: |
           if [[ -f build/postgres-compatibility/compatibility-report.md ]]; then
             sed -n '1,320p' build/postgres-compatibility/compatibility-report.md >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Upload compatibility report, raw diffs, and Proxy log
-        if: ${{ !cancelled() }}
+        if: ${{ always() }}
         uses: actions/upload-artifact@v7
         with:
           name: postgres-compatibility-${{ github.run_id }}

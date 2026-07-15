@@ -981,6 +981,53 @@ func TestExtendedQueryEndToEnd(t *testing.T) {
 	assertSummary(t, snapshot.QueryMetrics.QuerySummaries, "SELECT $?::int4 AS value")
 }
 
+func TestSessionSettingsDoNotLeakIntoExtendedQueries(t *testing.T) {
+	repoRoot := repositoryRoot(t)
+	ensureDockerBurrows(t, repoRoot)
+
+	frontendAddress := availableAddress(t)
+	statusAddress := availableAddress(t)
+	binary := buildGateway(t, repoRoot)
+	configPath := writeGatewayConfig(t, frontendAddress, statusAddress)
+	logs := startGateway(t, binary, configPath)
+	waitForHealthyGateway(t, "http://"+statusAddress, logs)
+
+	firstConfig, err := pgx.ParseConfig("postgres://any-user@" + frontendAddress + "/any-database?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	first, err := pgx.ConnectConfig(context.Background(), firstConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Exec(context.Background(), "SET standard_conforming_strings = off"); err != nil {
+		first.Close(context.Background())
+		t.Fatalf("set session parameter: %v", err)
+	}
+	var setting string
+	if err := first.QueryRow(context.Background(), "SHOW standard_conforming_strings").Scan(&setting); err != nil || setting != "off" {
+		first.Close(context.Background())
+		t.Fatalf("session setting = %q, err = %v", setting, err)
+	}
+	first.Close(context.Background())
+
+	second, err := pgx.Connect(context.Background(), "postgres://any-user@"+frontendAddress+"/any-database?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close(context.Background())
+	queryContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var value int32
+	if err := second.QueryRow(queryContext, "SELECT $1::int4", int32(7)).Scan(&value); err != nil || value != 7 {
+		t.Fatalf("extended query after prior SET = %d, err = %v\ngateway logs:\n%s", value, err, logs.String())
+	}
+	if err := second.QueryRow(queryContext, "SHOW standard_conforming_strings").Scan(&setting); err != nil || setting != "on" {
+		t.Fatalf("new frontend setting = %q, err = %v", setting, err)
+	}
+}
+
 func TestExtendedPreparedStatementLifecycleEndToEnd(t *testing.T) {
 	repoRoot := repositoryRoot(t)
 	ensureDockerBurrows(t, repoRoot)

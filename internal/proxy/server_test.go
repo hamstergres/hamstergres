@@ -5,9 +5,11 @@ package proxy
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgproto3"
+	"github.com/jruszo/hamstergres/internal/backend"
 	"github.com/jruszo/hamstergres/internal/schema"
 )
 
@@ -30,6 +32,74 @@ func TestCloneFrontendMessageOwnsCopyAndBindBuffers(t *testing.T) {
 	bind.ResultFormatCodes[0] = 0
 	if !bytes.Equal(clonedBind.Parameters[0], []byte("42")) || clonedBind.ParameterFormatCodes[0] != 1 || clonedBind.ResultFormatCodes[0] != 1 {
 		t.Fatalf("cloned Bind reused receive buffers: %#v", clonedBind)
+	}
+}
+
+func TestPendingExtendedFailureAtSyncEmitsReadyForQuery(t *testing.T) {
+	manager := &backend.Manager{}
+	session, err := manager.NewSession(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := extendedState{pending: &pendingExtended{
+		targets:   []string{"burrow-missing"},
+		bind:      &pgproto3.Bind{},
+		statement: statementState{},
+	}}
+	var wire bytes.Buffer
+	frontend := pgproto3.NewBackend(bytes.NewReader(nil), &wire)
+	if (&Server{}).flushPendingExtended(frontend, session, &state, true) {
+		t.Fatal("failed pending request reported success")
+	}
+	if err := frontend.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	client := pgproto3.NewFrontend(bytes.NewReader(wire.Bytes()), io.Discard)
+	message, err := client.Receive()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response, ok := message.(*pgproto3.ErrorResponse); !ok || response.Code != "08006" {
+		t.Fatalf("first response = %#v, want connection error", message)
+	}
+	message, err = client.Receive()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := message.(*pgproto3.ReadyForQuery); !ok {
+		t.Fatalf("second response = %#v, want ReadyForQuery", message)
+	}
+	if state.failed {
+		t.Fatal("Sync recovery left the extended protocol in failed state")
+	}
+}
+
+func TestRequiresSessionAffinityForSessionSettings(t *testing.T) {
+	for _, sql := range []string{"SET standard_conforming_strings = off", "RESET ALL", "DISCARD ALL"} {
+		if !requiresSessionAffinity(sql) {
+			t.Fatalf("requiresSessionAffinity(%q) = false", sql)
+		}
+	}
+	if requiresSessionAffinity("SELECT 1") {
+		t.Fatal("ordinary query unexpectedly requires session affinity")
+	}
+}
+
+func TestCopyStartDrainsReadyForQueryAfterError(t *testing.T) {
+	if isCopyStarted(&pgproto3.ErrorResponse{}) {
+		t.Fatal("COPY startup stopped before draining ReadyForQuery")
+	}
+	if !isCopyStarted(&pgproto3.ReadyForQuery{}) {
+		t.Fatal("COPY startup did not stop at ReadyForQuery")
+	}
+}
+
+func TestContainsCopyStatementInMultiStatementQuery(t *testing.T) {
+	if !containsCopyStatement("SELECT 0; COPY test3 FROM STDIN; SELECT 1") {
+		t.Fatal("multi-statement COPY was not detected")
+	}
+	if containsCopyStatement("SELECT 'COPY test3 FROM STDIN'") {
+		t.Fatal("COPY text inside a literal was treated as a statement")
 	}
 }
 

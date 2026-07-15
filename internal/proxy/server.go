@@ -22,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/jackc/pgx/v5/pgtype"
+	pg_query "github.com/pganalyze/pg_query_go/v6"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -214,7 +215,9 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 					if active, ok := ensureSession(); ok {
 						s.handleCopyQuery(frontend, active, message.String, &state)
 					}
-				} else if session != nil || isTransactionControl(message.String) || requiresFleetWriteOrder(message.String, len(s.backends.ShardNames())) {
+				} else if containsCopyStatement(message.String) {
+					s.sendSessionError(frontend, state.txStatus(), "0A000", "COPY in a multi-statement query is not supported; send COPY as a standalone statement")
+				} else if session != nil || requiresSessionAffinity(message.String) || isTransactionControl(message.String) || requiresFleetWriteOrder(message.String, len(s.backends.ShardNames())) {
 					if active, ok := ensureSession(); ok {
 						s.handleSessionQuery(frontend, active, message.String, &state)
 					}
@@ -397,7 +400,7 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 		default:
 			s.sendError(frontend, "0A000", fmt.Sprintf("unsupported PostgreSQL frontend message %T", message))
 		}
-		if _, sync := message.(*pgproto3.Sync); sync && session != nil && !state.transaction && !state.copyIn && state.pending == nil && !state.failed {
+		if _, sync := message.(*pgproto3.Sync); sync && session != nil && !state.transaction && !state.sessionAffinity && !state.copyIn && state.pending == nil && !state.failed {
 			session.Close(context.Background(), true)
 			session = nil
 			s.backends.RecordOperation("backend_connection_multiplex", "release")
@@ -487,6 +490,7 @@ type extendedState struct {
 	writeParticipants map[string]struct{}
 	pending           *pendingExtended
 	syncConsumed      bool
+	sessionAffinity   bool
 }
 
 type pendingExtended struct {
@@ -1260,8 +1264,7 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 	}
 	if pending.execute != nil {
 		if requiresFleetWriteOrder(pending.portal.sql, len(pending.targets)) && !session.LockFleetWritesContext(session.Context()) {
-			s.sendExtendedError(frontend, "57014", "frontend session ended while waiting to execute a write")
-			return false
+			return s.failPendingExtended(frontend, state, emitReady, "57014", "frontend session ended while waiting to execute a write")
 		}
 		messages = append(messages, pending.execute)
 	}
@@ -1270,8 +1273,7 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 	preparedMissing := make(map[string]struct{}, len(pending.targets))
 	for _, target := range pending.targets {
 		if err := session.Ensure(target); err != nil {
-			s.sendExtendedError(frontend, "08006", err.Error())
-			return false
+			return s.failPendingExtended(frontend, state, emitReady, "08006", err.Error())
 		}
 		targetMessages := messages
 		if pending.statement.backendName != "" && !session.Prepared(target, pending.statement.backendName) {
@@ -1280,8 +1282,7 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 			preparedMissing[target] = struct{}{}
 		}
 		if err := session.SendBatchTo(target, targetMessages...); err != nil {
-			s.sendExtendedError(frontend, "08006", err.Error())
-			return false
+			return s.failPendingExtended(frontend, state, emitReady, "08006", err.Error())
 		}
 	}
 	success := pending.execute != nil
@@ -1368,8 +1369,7 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 			return nil
 		})
 		if err != nil {
-			s.sendExtendedError(frontend, "08006", err.Error())
-			return false
+			return s.failPendingExtended(frontend, state, emitReady, "08006", err.Error())
 		}
 	}
 	if preparedMaterialized {
@@ -1395,6 +1395,9 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 			if pending.portal.schema {
 				state.schemaDirty = true
 			}
+			if requiresSessionAffinity(pending.portal.sql) {
+				state.sessionAffinity = true
+			}
 			updateTransactionState(state, pending.portal.sql)
 		}
 	}
@@ -1416,6 +1419,17 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 		session.UnlockFleetWrites()
 	}
 	return true
+}
+
+func (s *Server) failPendingExtended(frontend *pgproto3.Backend, state *extendedState, emitReady bool, code, message string) bool {
+	s.sendExtendedError(frontend, code, message)
+	state.failed = !emitReady
+	if emitReady {
+		// The failure happened while processing the frontend's Sync, so there
+		// is no later recovery boundary to wait for.
+		frontend.Send(&pgproto3.ReadyForQuery{TxStatus: state.txStatus()})
+	}
+	return false
 }
 
 // handleExecute merges rows from the fan-out execution. Data values are
@@ -1546,6 +1560,9 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 	}
 	if portal.schema {
 		state.schemaDirty = true
+	}
+	if requiresSessionAffinity(portal.sql) {
+		state.sessionAffinity = true
 	}
 	recordWriteParticipants(state, portal.sql, targets)
 	updateTransactionState(state, portal.sql)
@@ -1744,7 +1761,7 @@ func isExecuteDone(message pgproto3.BackendMessage) bool {
 
 func isCopyStarted(message pgproto3.BackendMessage) bool {
 	switch message.(type) {
-	case *pgproto3.CopyInResponse, *pgproto3.CopyOutResponse, *pgproto3.CopyBothResponse, *pgproto3.ErrorResponse, *pgproto3.ReadyForQuery:
+	case *pgproto3.CopyInResponse, *pgproto3.CopyOutResponse, *pgproto3.CopyBothResponse, *pgproto3.ReadyForQuery:
 		return true
 	default:
 		return false
@@ -1983,6 +2000,9 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 		recordWriteParticipants(state, sql, targets)
 	}
 	updateTransactionState(state, sql)
+	if requiresSessionAffinity(sql) {
+		state.sessionAffinity = true
+	}
 	if invalidatesPreparedStatements(sql) {
 		s.backends.InvalidatePreparedStatements(targets)
 	}
@@ -2321,6 +2341,28 @@ func firstSQLKeyword(sql string) string {
 		}
 	}
 	return strings.ToUpper(trimmed)
+}
+
+func containsCopyStatement(sql string) bool {
+	tree, err := pg_query.Parse(sql)
+	if err != nil {
+		return false
+	}
+	for _, raw := range tree.Stmts {
+		if raw.Stmt != nil && raw.Stmt.GetCopyStmt() != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func requiresSessionAffinity(sql string) bool {
+	switch firstSQLKeyword(sql) {
+	case "SET", "RESET", "DISCARD":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Server) handleQuery(frontend *pgproto3.Backend, sql string) {

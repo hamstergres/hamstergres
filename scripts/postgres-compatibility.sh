@@ -9,6 +9,7 @@ postgres_ref="REL_${postgres_version//./_}"
 image="${POSTGRES_COMPATIBILITY_IMAGE:-hamstergres-postgres-compatibility:${postgres_version}}"
 results_dir="${POSTGRES_COMPATIBILITY_RESULTS_DIR:-${repo_root}/build/postgres-compatibility}"
 baseline="${POSTGRES_COMPATIBILITY_BASELINE:-}"
+suite_timeout="${POSTGRES_COMPATIBILITY_TIMEOUT:-10m}"
 compose_project="hamstergres-pgcompat"
 proxy_pid=""
 
@@ -25,6 +26,15 @@ export BURROW_02_DATA_VOLUME="${compose_project}-burrow-02-data"
 cleanup() {
   if [[ -n "${proxy_pid}" ]]; then
     kill -INT "${proxy_pid}" 2>/dev/null || true
+    for _ in $(seq 1 50); do
+      if ! kill -0 "${proxy_pid}" 2>/dev/null; then
+        break
+      fi
+      sleep 0.1
+    done
+    if kill -0 "${proxy_pid}" 2>/dev/null; then
+      kill -KILL "${proxy_pid}" 2>/dev/null || true
+    fi
     wait "${proxy_pid}" 2>/dev/null || true
   fi
   docker compose -f "${repo_root}/docker-compose.yml" down -v --remove-orphans >/dev/null 2>&1 || true
@@ -82,11 +92,13 @@ docker run --rm \
   --env PGUSER=hamster \
   --env PGPASSWORD=hamster \
   --env PGDATABASE=regression \
+  --env "POSTGRES_COMPATIBILITY_TIMEOUT=${suite_timeout}" \
   "${image}" \
   -euo pipefail -c '
     cp /usr/src/postgresql/src/test/regress/parallel_schedule /results/parallel_schedule
     cd /usr/src/postgresql/src/test/regress
-    make installcheck EXTRA_REGRESS_OPTS="--use-existing --dbname=regression --outputdir=/results --dlpath=/usr/lib/postgresql/17/lib"
+    timeout --foreground --signal=INT --kill-after=30s "${POSTGRES_COMPATIBILITY_TIMEOUT}" \
+      make installcheck EXTRA_REGRESS_OPTS="--use-existing --dbname=regression --outputdir=/results --dlpath=/usr/lib/postgresql/17/lib"
   ' 2>&1 | tee "${results_dir}/pg_regress.log"
 pg_regress_status=${PIPESTATUS[0]}
 set -e
@@ -96,6 +108,9 @@ set -e
 # from a broken or truncated harness.
 if [[ "${pg_regress_status}" -ne 0 ]]; then
   echo "pg_regress reported compatibility differences (status ${pg_regress_status})"
+fi
+if [[ "${pg_regress_status}" -eq 124 || "${pg_regress_status}" -eq 137 ]]; then
+  echo "pg_regress exceeded the ${suite_timeout} compatibility timeout" >&2
 fi
 
 report_args=(

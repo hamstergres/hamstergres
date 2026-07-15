@@ -84,6 +84,24 @@ func New(ctx context.Context, cfg config.Config) (*Manager, error) {
 			poolConfig.ConnConfig.RuntimeParams = make(map[string]string)
 		}
 		poolConfig.ConnConfig.RuntimeParams["lock_timeout"] = cfg.TransactionLockTimeout()
+		afterRelease := poolConfig.AfterRelease
+		poolConfig.AfterRelease = func(connection *pgx.Conn) bool {
+			if afterRelease != nil && !afterRelease(connection) {
+				return false
+			}
+			// Every frontend is told that standard-conforming strings are on.
+			// Never return a physical connection with conflicting parser state to
+			// another frontend session, even if a state-changing query escaped the
+			// affinity path.
+			return connection.PgConn().ParameterStatus("standard_conforming_strings") == "on"
+		}
+		beforeClose := poolConfig.BeforeClose
+		poolConfig.BeforeClose = func(connection *pgx.Conn) {
+			m.forgetPreparedConnection(name, connection.PgConn().PID())
+			if beforeClose != nil {
+				beforeClose(connection)
+			}
+		}
 		pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 		if err != nil {
 			m.Close()
@@ -424,7 +442,9 @@ func (s *Session) acquire(name string) (*sessionShard, error) {
 		return nil, fmt.Errorf("connect session to Burrow %s: %w", target.name, err)
 	}
 	if err := s.manager.syncPreparedStatements(s.Context(), target.name, pooled.Conn()); err != nil {
-		pooled.Release()
+		connection := pooled.Hijack()
+		s.manager.forgetPreparedConnection(target.name, connection.PgConn().PID())
+		_ = connection.Close(context.Background())
 		s.manager.RecordOperation("backend_connection", "failure")
 		return nil, fmt.Errorf("synchronize prepared statements on Burrow %s: %w", target.name, err)
 	}
@@ -491,6 +511,15 @@ func (m *Manager) syncPreparedStatements(ctx context.Context, burrow string, con
 
 func preparedConnectionKey(burrow string, pid uint32) string {
 	return burrow + "\x00" + strconv.FormatUint(uint64(pid), 10)
+}
+
+func (m *Manager) forgetPreparedConnection(burrow string, pid uint32) {
+	if m == nil {
+		return
+	}
+	m.preparedMu.Lock()
+	delete(m.prepared, preparedConnectionKey(burrow, pid))
+	m.preparedMu.Unlock()
 }
 
 // Prepared reports whether the physical PostgreSQL connection currently has
