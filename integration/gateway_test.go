@@ -989,6 +989,7 @@ func TestSessionSettingsDoNotLeakIntoExtendedQueries(t *testing.T) {
 	statusAddress := availableAddress(t)
 	binary := buildGateway(t, repoRoot)
 	configPath := writeGatewayConfig(t, frontendAddress, statusAddress)
+	setBackendPoolMaxConnections(t, configPath, 1)
 	logs := startGateway(t, binary, configPath)
 	waitForHealthyGateway(t, "http://"+statusAddress, logs)
 
@@ -1009,6 +1010,17 @@ func TestSessionSettingsDoNotLeakIntoExtendedQueries(t *testing.T) {
 		first.Close(context.Background())
 		t.Fatalf("session parameter status = %q, want off", setting)
 	}
+	var setting string
+	results, err := first.PgConn().Exec(context.Background(), "SHOW standard_conforming_strings").ReadAll()
+	if err != nil || len(results) != 1 || len(results[0].Rows) != 1 || len(results[0].Rows[0]) != 1 {
+		first.Close(context.Background())
+		t.Fatalf("read replayed simple-query setting: results = %#v, err = %v", results, err)
+	}
+	setting = string(results[0].Rows[0][0])
+	if setting != "off" {
+		first.Close(context.Background())
+		t.Fatalf("replayed simple-query setting = %q, want off", setting)
+	}
 	first.Close(context.Background())
 
 	second, err := pgx.Connect(context.Background(), "postgres://any-user@"+frontendAddress+"/any-database?sslmode=disable")
@@ -1018,13 +1030,33 @@ func TestSessionSettingsDoNotLeakIntoExtendedQueries(t *testing.T) {
 	defer second.Close(context.Background())
 	queryContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	var setting string
 	var value int32
 	if err := second.QueryRow(queryContext, "SELECT $1::int4", int32(7)).Scan(&value); err != nil || value != 7 {
 		t.Fatalf("extended query after prior SET = %d, err = %v\ngateway logs:\n%s", value, err, logs.String())
 	}
 	if err := second.QueryRow(queryContext, "SHOW standard_conforming_strings").Scan(&setting); err != nil || setting != "on" {
 		t.Fatalf("new frontend setting = %q, err = %v", setting, err)
+	}
+	if _, err := second.Exec(queryContext, "SET TimeZone = 'America/Los_Angeles'"); err != nil {
+		t.Fatalf("set extended-query session parameter: %v", err)
+	}
+	if err := second.QueryRow(queryContext, "SHOW TimeZone").Scan(&setting); err != nil || setting != "America/Los_Angeles" {
+		t.Fatalf("replayed extended-query setting = %q, err = %v", setting, err)
+	}
+	second.Close(context.Background())
+
+	thirdConfig, err := pgx.ParseConfig("postgres://any-user@" + frontendAddress + "/any-database?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	thirdConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	third, err := pgx.ConnectConfig(queryContext, thirdConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer third.Close(context.Background())
+	if err := third.QueryRow(queryContext, "SHOW TimeZone").Scan(&setting); err != nil || setting != "UTC" {
+		t.Fatalf("new frontend TimeZone = %q, err = %v", setting, err)
 	}
 }
 
@@ -2054,6 +2086,21 @@ func writeGatewayConfig(t *testing.T, frontendAddress, statusAddress string) str
 	t.Helper()
 	testKey := gatewayTestKey(frontendAddress)
 	return writeGatewayConfigWithKey(t, frontendAddress, statusAddress, testKey)
+}
+
+func setBackendPoolMaxConnections(t *testing.T, configPath string, maximum int) {
+	t.Helper()
+	contents, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := strings.Replace(string(contents), "sharding:\n", fmt.Sprintf("sharding:\n  backend_pool:\n    max_connections: %d\n", maximum), 1)
+	if updated == string(contents) {
+		t.Fatal("sharding configuration marker is missing")
+	}
+	if err := os.WriteFile(configPath, []byte(updated), 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func gatewayTestKey(frontendAddress string) string {

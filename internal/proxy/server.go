@@ -27,6 +27,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/protobuf/reflect/protoreflect"
 
 	"github.com/jruszo/hamstergres/internal/backend"
 	"github.com/jruszo/hamstergres/internal/copyrouter"
@@ -234,12 +235,12 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend, runtimeParams map[stri
 		}
 	}()
 
-	state := extendedState{statements: make(map[string]statementState), portals: make(map[string]portalState), writeParticipants: make(map[string]struct{}), sessionAffinity: requiresStartupSessionAffinity(runtimeParams)}
+	state := extendedState{statements: make(map[string]statementState), portals: make(map[string]portalState), writeParticipants: make(map[string]struct{})}
 	defer finishCopyTrace(&state, fmt.Errorf("frontend session ended during COPY"))
 	var session *backend.Session
 	defer func() {
 		if session != nil {
-			session.Close(context.Background())
+			session.Close(context.Background(), !state.sessionDestroy, state.sessionDiscardPrepared)
 		}
 	}()
 
@@ -247,7 +248,7 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend, runtimeParams map[stri
 		if session != nil {
 			return session, true
 		}
-		created, err := s.backends.NewSession(sessionContext, runtimeParams)
+		created, err := s.backends.NewSession(sessionContext, runtimeParams, state.sessionReplaySQL())
 		if err != nil {
 			s.sendExtendedError(frontend, "08006", err.Error())
 			state.failed = true
@@ -305,7 +306,7 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend, runtimeParams map[stri
 					}
 				} else if containsCopyStatement(message.String) {
 					s.sendSessionError(frontend, state.txStatus(), "0A000", "COPY in a multi-statement query is not supported; send COPY as a standalone statement")
-				} else if session != nil || len(runtimeParams) > 0 || requiresSessionAffinity(message.String) || isTransactionControl(message.String) || requiresFleetWriteOrder(message.String, len(s.backends.ShardNames())) {
+				} else if session != nil || len(runtimeParams) > 0 || len(state.sessionSettings) > 0 || requiresSessionBackend(message.String) || isTransactionControl(message.String) || requiresFleetWriteOrder(message.String, len(s.backends.ShardNames())) {
 					if active, ok := ensureSession(); ok {
 						s.handleSessionQuery(frontend, active, message.String, &state)
 					}
@@ -504,15 +505,6 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend, runtimeParams map[stri
 	}
 }
 
-func requiresStartupSessionAffinity(runtimeParams map[string]string) bool {
-	for name := range runtimeParams {
-		if !strings.EqualFold(name, "application_name") {
-			return true
-		}
-	}
-	return false
-}
-
 func cloneFrontendMessage(message pgproto3.FrontendMessage) pgproto3.FrontendMessage {
 	switch message := message.(type) {
 	case *pgproto3.Bind:
@@ -573,26 +565,34 @@ func cloneFrontendMessage(message pgproto3.FrontendMessage) pgproto3.FrontendMes
 }
 
 type extendedState struct {
-	statements        map[string]statementState
-	portals           map[string]portalState
-	failed            bool
-	transaction       bool
-	transactionFailed bool
-	mutated           bool
-	target            string
-	schemaDirty       bool
-	copyIn            bool
-	copyTargets       []string
-	copyPlan          copyrouter.Plan
-	copyStream        *copyrouter.Stream
-	copyReplicated    bool
-	copyAborted       bool
-	copyTraceSpan     trace.Span
-	copyTunnelSpans   []trace.Span
-	writeParticipants map[string]struct{}
-	pending           *pendingExtended
-	syncConsumed      bool
-	sessionAffinity   bool
+	statements             map[string]statementState
+	portals                map[string]portalState
+	failed                 bool
+	transaction            bool
+	transactionFailed      bool
+	mutated                bool
+	target                 string
+	schemaDirty            bool
+	copyIn                 bool
+	copyTargets            []string
+	copyPlan               copyrouter.Plan
+	copyStream             *copyrouter.Stream
+	copyReplicated         bool
+	copyAborted            bool
+	copyTraceSpan          trace.Span
+	copyTunnelSpans        []trace.Span
+	writeParticipants      map[string]struct{}
+	pending                *pendingExtended
+	syncConsumed           bool
+	sessionAffinity        bool
+	sessionDestroy         bool
+	sessionDiscardPrepared bool
+	sessionSettings        []sessionSetting
+}
+
+type sessionSetting struct {
+	name string
+	sql  string
 }
 
 type pendingExtended struct {
@@ -1369,10 +1369,13 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 	}
 
 	messages := []pgproto3.FrontendMessage{pending.bind}
+	sessionPolicy := sessionStatePolicy{}
 	if pending.describe != nil {
 		messages = append(messages, pending.describe)
 	}
 	if pending.execute != nil {
+		sessionPolicy = state.classifySessionState(pending.portal.sql)
+		state.beginSessionState(sessionPolicy)
 		if requiresFleetWriteOrder(pending.portal.sql, len(pending.targets)) && !session.LockFleetWritesContext(session.Context()) {
 			return s.failPendingExtended(frontend, state, emitReady, "57014", "frontend session ended while waiting to execute a write")
 		}
@@ -1510,9 +1513,7 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 			if pending.portal.schema {
 				state.schemaDirty = true
 			}
-			if requiresSessionAffinity(pending.portal.sql) {
-				state.sessionAffinity = true
-			}
+			state.commitSessionState(sessionPolicy)
 			updateTransactionState(state, pending.portal.sql)
 		}
 	}
@@ -1567,6 +1568,8 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 			s.logger.Error("frontend query failed", "event", "query_failed", "component", "hamstergres-proxy", "correlation_id", fmt.Sprintf("query-%08x", randomUint32()), "error_category", errorCategory)
 		}
 	}()
+	sessionPolicy := state.classifySessionState(portal.sql)
+	state.beginSessionState(sessionPolicy)
 	targets := s.backends.ShardNames()
 	defer func() {
 		if portal.sql != "" {
@@ -1680,9 +1683,7 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 	if portal.schema {
 		state.schemaDirty = true
 	}
-	if requiresSessionAffinity(portal.sql) {
-		state.sessionAffinity = true
-	}
+	state.commitSessionState(sessionPolicy)
 	recordWriteParticipants(state, portal.sql, targets)
 	updateTransactionState(state, portal.sql)
 	return true
@@ -1941,9 +1942,8 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 		frontend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 		return true
 	}
-	if requiresSessionAffinity(sql) {
-		state.sessionAffinity = true
-	}
+	sessionPolicy := state.classifySessionState(sql)
+	state.beginSessionState(sessionPolicy)
 	if state.transaction && !state.transactionFailed && state.mutated && s.twoPhaseCommit && (firstSQLKeyword(sql) == "COMMIT" || firstSQLKeyword(sql) == "END") && len(state.writeParticipants) > 1 {
 		return s.handleTwoPhaseCommit(frontend, session, state)
 	}
@@ -2131,6 +2131,7 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 	if invalidatesPreparedStatements(sql) {
 		s.backends.InvalidatePreparedStatements(targets)
 	}
+	state.commitSessionState(sessionPolicy)
 	frontend.Send(&pgproto3.ReadyForQuery{TxStatus: state.txStatus()})
 	if !state.transaction {
 		session.UnlockFleetWrites()
@@ -2399,14 +2400,27 @@ func invalidatesPreparedStatements(sql string) bool {
 }
 
 func updateTransactionState(state *extendedState, sql string) {
-	switch firstSQLKeyword(sql) {
-	case "BEGIN", "START":
+	kind := pg_query.TransactionStmtKind_TRANSACTION_STMT_KIND_UNDEFINED
+	if tree, err := pg_query.Parse(sql); err == nil && len(tree.Stmts) == 1 && tree.Stmts[0].Stmt != nil {
+		if transaction := tree.Stmts[0].Stmt.GetTransactionStmt(); transaction != nil {
+			kind = transaction.Kind
+		}
+	}
+	switch kind {
+	case pg_query.TransactionStmtKind_TRANS_STMT_BEGIN, pg_query.TransactionStmtKind_TRANS_STMT_START:
 		state.transaction = true
 		state.transactionFailed = false
 		state.target = ""
 		state.mutated = false
 		clear(state.writeParticipants)
-	case "COMMIT", "END", "ROLLBACK", "ABORT":
+	case pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK_TO:
+		state.transaction = true
+		state.transactionFailed = false
+	case pg_query.TransactionStmtKind_TRANS_STMT_COMMIT,
+		pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK,
+		pg_query.TransactionStmtKind_TRANS_STMT_PREPARE,
+		pg_query.TransactionStmtKind_TRANS_STMT_COMMIT_PREPARED,
+		pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK_PREPARED:
 		state.transaction = false
 		state.transactionFailed = false
 		state.target = ""
@@ -2505,25 +2519,204 @@ func containsCopyStatement(sql string) bool {
 	return false
 }
 
+type sessionStatePolicy struct {
+	requiresBackend bool
+	pin             bool
+	destroy         bool
+	discardPrepared bool
+	resetAll        bool
+	replayName      string
+	replaySQL       string
+}
+
+func requiresSessionBackend(sql string) bool {
+	return classifySessionState(sql).requiresBackend
+}
+
 func requiresSessionAffinity(sql string) bool {
+	return classifySessionState(sql).pin
+}
+
+func classifySessionState(sql string) sessionStatePolicy {
 	tree, err := pg_query.Parse(sql)
 	if err != nil {
 		switch firstSQLKeyword(sql) {
 		case "SET", "RESET", "DISCARD", "LISTEN", "UNLISTEN", "PREPARE":
-			return true
+			return sessionStatePolicy{requiresBackend: true, pin: true, destroy: true}
 		}
+		return sessionStatePolicy{}
+	}
+	policies := make([]sessionStatePolicy, 0, len(tree.Stmts))
+	for _, raw := range tree.Stmts {
+		policies = append(policies, classifyRawSessionState(raw, strings.TrimSpace(sql)))
+	}
+	if len(policies) == 1 {
+		return policies[0]
+	}
+	combined := sessionStatePolicy{}
+	for _, policy := range policies {
+		combined.requiresBackend = combined.requiresBackend || policy.requiresBackend
+		combined.pin = combined.pin || policy.pin || policy.replayName != "" || policy.resetAll
+		combined.destroy = combined.destroy || policy.destroy
+		combined.discardPrepared = combined.discardPrepared || policy.discardPrepared
+	}
+	return combined
+}
+
+func classifyRawSessionState(raw *pg_query.RawStmt, replaySQL string) sessionStatePolicy {
+	if raw == nil || raw.Stmt == nil {
+		return sessionStatePolicy{}
+	}
+	statement := raw.Stmt
+	if variable := statement.GetVariableSetStmt(); variable != nil {
+		policy := sessionStatePolicy{requiresBackend: true}
+		if variable.IsLocal {
+			return policy
+		}
+		if variable.Kind == pg_query.VariableSetKind_VAR_RESET_ALL {
+			policy.resetAll = true
+			return policy
+		}
+		switch variable.Kind {
+		case pg_query.VariableSetKind_VAR_SET_VALUE,
+			pg_query.VariableSetKind_VAR_SET_DEFAULT,
+			pg_query.VariableSetKind_VAR_SET_CURRENT,
+			pg_query.VariableSetKind_VAR_RESET:
+			if variable.Name != "" {
+				policy.replayName = strings.ToLower(variable.Name)
+				policy.replaySQL = replaySQL
+				return policy
+			}
+		}
+		policy.pin = true
+		return policy
+	}
+	if discard := statement.GetDiscardStmt(); discard != nil {
+		policy := sessionStatePolicy{requiresBackend: true}
+		if discard.Target == pg_query.DiscardMode_DISCARD_ALL {
+			policy.resetAll = true
+		} else {
+			policy.pin = true
+		}
+		return policy
+	}
+	if statement.GetPrepareStmt() != nil {
+		return sessionStatePolicy{requiresBackend: true, pin: true, discardPrepared: true}
+	}
+	if statement.GetListenStmt() != nil || statement.GetUnlistenStmt() != nil || statement.GetDeclareCursorStmt() != nil {
+		return sessionStatePolicy{requiresBackend: true, pin: true}
+	}
+	if statement.GetLoadStmt() != nil {
+		return sessionStatePolicy{requiresBackend: true, pin: true, destroy: true}
+	}
+	if protobufContainsSessionState(statement.ProtoReflect()) {
+		return sessionStatePolicy{requiresBackend: true, pin: true}
+	}
+	return sessionStatePolicy{}
+}
+
+func protobufContainsSessionState(message protoreflect.Message) bool {
+	if !message.IsValid() {
 		return false
 	}
-	for _, raw := range tree.Stmts {
-		statement := raw.Stmt
-		if statement == nil {
-			continue
+	switch value := message.Interface().(type) {
+	case *pg_query.RangeVar:
+		if value.Relpersistence == "t" {
+			return true
 		}
-		if statement.GetVariableSetStmt() != nil || statement.GetDiscardStmt() != nil || statement.GetListenStmt() != nil || statement.GetUnlistenStmt() != nil || statement.GetPrepareStmt() != nil {
+	case *pg_query.FuncCall:
+		name := functionName(value)
+		switch name {
+		case "set_config", "pg_advisory_lock", "pg_advisory_lock_shared", "pg_try_advisory_lock", "pg_try_advisory_lock_shared":
 			return true
 		}
 	}
-	return false
+	found := false
+	message.Range(func(field protoreflect.FieldDescriptor, value protoreflect.Value) bool {
+		switch {
+		case field.IsList() && field.Message() != nil:
+			list := value.List()
+			for index := 0; index < list.Len(); index++ {
+				if protobufContainsSessionState(list.Get(index).Message()) {
+					found = true
+					return false
+				}
+			}
+		case field.IsMap() && field.MapValue().Message() != nil:
+			value.Map().Range(func(_ protoreflect.MapKey, mapValue protoreflect.Value) bool {
+				found = protobufContainsSessionState(mapValue.Message())
+				return !found
+			})
+		case field.Message() != nil:
+			found = protobufContainsSessionState(value.Message())
+		}
+		return !found
+	})
+	return found
+}
+
+func functionName(call *pg_query.FuncCall) string {
+	parts := make([]string, 0, len(call.Funcname))
+	for _, node := range call.Funcname {
+		if value := node.GetString_(); value != nil {
+			parts = append(parts, value.Sval)
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.ToLower(parts[len(parts)-1])
+}
+
+func (state *extendedState) beginSessionState(policy sessionStatePolicy) {
+	state.sessionAffinity = state.sessionAffinity || policy.pin
+	state.sessionDestroy = state.sessionDestroy || policy.destroy
+	state.sessionDiscardPrepared = state.sessionDiscardPrepared || policy.discardPrepared
+}
+
+func (state *extendedState) classifySessionState(sql string) sessionStatePolicy {
+	policy := classifySessionState(sql)
+	if state.transaction && (policy.replayName != "" || policy.resetAll) {
+		// PostgreSQL rolls transaction-scoped SET and RESET changes back with
+		// the transaction. Keep that frontend on its current Tunnel instead of
+		// guessing whether the eventual COMMIT, ROLLBACK, or savepoint retained
+		// the change. DISCARD ALL can later make the session multiplexable again.
+		policy.pin = true
+		policy.replayName = ""
+		policy.replaySQL = ""
+		policy.resetAll = false
+	}
+	return policy
+}
+
+func (state *extendedState) commitSessionState(policy sessionStatePolicy) {
+	if policy.resetAll {
+		state.sessionSettings = nil
+		// DISCARD ALL resets PostgreSQL-managed session state, but it cannot
+		// undo process-local effects such as LOAD. Such a Tunnel stays marked
+		// for destruction rather than returning to the pool.
+		state.sessionAffinity = state.sessionDestroy
+		state.sessionDiscardPrepared = false
+		return
+	}
+	if policy.replayName == "" {
+		return
+	}
+	settings := state.sessionSettings[:0]
+	for _, setting := range state.sessionSettings {
+		if setting.name != policy.replayName {
+			settings = append(settings, setting)
+		}
+	}
+	state.sessionSettings = append(settings, sessionSetting{name: policy.replayName, sql: policy.replaySQL})
+}
+
+func (state *extendedState) sessionReplaySQL() []string {
+	replay := make([]string, 0, len(state.sessionSettings))
+	for _, setting := range state.sessionSettings {
+		replay = append(replay, setting.sql)
+	}
+	return replay
 }
 
 func (s *Server) handleQuery(frontend *pgproto3.Backend, sql string) {

@@ -101,15 +101,6 @@ func TestSendStartupReportsEffectiveRuntimeParameters(t *testing.T) {
 	}
 }
 
-func TestStartupSessionAffinityIgnoresApplicationName(t *testing.T) {
-	if requiresStartupSessionAffinity(map[string]string{"application_name": "pg_regress"}) {
-		t.Fatal("application_name unexpectedly requires session affinity")
-	}
-	if !requiresStartupSessionAffinity(map[string]string{"DateStyle": "SQL, DMY"}) {
-		t.Fatal("formatting-sensitive DateStyle did not require session affinity")
-	}
-}
-
 func TestCloneFrontendMessageOwnsCopyAndBindBuffers(t *testing.T) {
 	copyData := &pgproto3.CopyData{Data: []byte("first frame")}
 	clonedCopy := cloneFrontendMessage(copyData).(*pgproto3.CopyData)
@@ -171,16 +162,27 @@ func TestPendingExtendedFailureAtSyncEmitsReadyForQuery(t *testing.T) {
 	}
 }
 
-func TestRequiresSessionAffinityForSessionSettings(t *testing.T) {
+func TestSessionStatePolicyReplaysSettingsAndPinsBackendState(t *testing.T) {
 	for _, sql := range []string{
 		"SET standard_conforming_strings = off",
 		"RESET ALL",
 		"DISCARD ALL",
+		"SET ROLE application_user",
+	} {
+		if !requiresSessionBackend(sql) {
+			t.Fatalf("requiresSessionBackend(%q) = false", sql)
+		}
+		if requiresSessionAffinity(sql) {
+			t.Fatalf("requiresSessionAffinity(%q) = true for replayable state", sql)
+		}
+	}
+	for _, sql := range []string{
 		"LISTEN events",
 		"UNLISTEN events",
 		"PREPARE lookup AS SELECT 1",
 		"SELECT 1; SET search_path = private, public",
-		"SELECT 1; SET ROLE application_user",
+		"CREATE TEMP TABLE session_items (id bigint)",
+		"SELECT pg_advisory_lock(42)",
 	} {
 		if !requiresSessionAffinity(sql) {
 			t.Fatalf("requiresSessionAffinity(%q) = false", sql)
@@ -191,6 +193,81 @@ func TestRequiresSessionAffinityForSessionSettings(t *testing.T) {
 	}
 	if requiresSessionAffinity("SELECT 'SET ROLE application_user'") {
 		t.Fatal("affinity command text inside a literal required session affinity")
+	}
+}
+
+func TestSessionSettingReplayUsesLatestCommandOrder(t *testing.T) {
+	state := extendedState{}
+	for _, sql := range []string{
+		"SET ROLE application_user",
+		"SET SESSION AUTHORIZATION application_owner",
+		"SET ROLE reporting_user",
+		"SET search_path = private, public",
+	} {
+		policy := classifySessionState(sql)
+		state.beginSessionState(policy)
+		state.commitSessionState(policy)
+	}
+	want := []string{
+		"SET SESSION AUTHORIZATION application_owner",
+		"SET ROLE reporting_user",
+		"SET search_path = private, public",
+	}
+	if got := state.sessionReplaySQL(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("session replay = %#v, want %#v", got, want)
+	}
+	if state.sessionAffinity {
+		t.Fatal("replayable settings pinned the frontend to a Tunnel")
+	}
+
+	policy := classifySessionState("DISCARD ALL")
+	state.beginSessionState(policy)
+	state.commitSessionState(policy)
+	if got := state.sessionReplaySQL(); len(got) != 0 {
+		t.Fatalf("session replay after DISCARD ALL = %#v, want empty", got)
+	}
+}
+
+func TestUnsafeSessionStateDestroysTunnelEvenAfterDiscard(t *testing.T) {
+	state := extendedState{}
+	load := classifySessionState("LOAD 'unsafe_extension'")
+	state.beginSessionState(load)
+	state.commitSessionState(load)
+	if !state.sessionAffinity || !state.sessionDestroy {
+		t.Fatalf("LOAD policy = affinity %t destroy %t, want both", state.sessionAffinity, state.sessionDestroy)
+	}
+	discard := classifySessionState("DISCARD ALL")
+	state.beginSessionState(discard)
+	state.commitSessionState(discard)
+	if !state.sessionAffinity || !state.sessionDestroy {
+		t.Fatal("DISCARD ALL incorrectly made process-local LOAD state reusable")
+	}
+}
+
+func TestTransactionSessionSettingsStayPinnedInsteadOfBeingReplayed(t *testing.T) {
+	state := extendedState{transaction: true}
+	policy := state.classifySessionState("SET search_path = private, public")
+	if !policy.pin || policy.replayName != "" {
+		t.Fatalf("transactional SET policy = %#v, want pinned without replay", policy)
+	}
+	reset := state.classifySessionState("RESET ALL")
+	if !reset.pin || reset.resetAll {
+		t.Fatalf("transactional RESET policy = %#v, want pinned without replay reset", reset)
+	}
+}
+
+func TestRollbackToSavepointKeepsTransactionPinned(t *testing.T) {
+	state := extendedState{transaction: true, transactionFailed: true}
+	updateTransactionState(&state, "ROLLBACK TO SAVEPOINT before_enum_check")
+	if !state.transaction {
+		t.Fatal("ROLLBACK TO SAVEPOINT ended the frontend transaction")
+	}
+	if state.transactionFailed {
+		t.Fatal("ROLLBACK TO SAVEPOINT did not restore usable transaction state")
+	}
+	updateTransactionState(&state, "ROLLBACK")
+	if state.transaction {
+		t.Fatal("full ROLLBACK left the frontend transaction active")
 	}
 }
 

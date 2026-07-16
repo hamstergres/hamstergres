@@ -4,6 +4,7 @@ package backend
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"testing"
@@ -83,6 +84,36 @@ func TestChangedRuntimeParamsResetsOmittedOverrideAfterRelease(t *testing.T) {
 	manager.rememberRuntimeParam(key, "application_name", "")
 	if got := manager.changedRuntimeParams(key, nil); len(got) != 0 {
 		t.Fatalf("reset runtime params = %#v, want none", got)
+	}
+}
+
+func TestResetSessionStateRequiresIdleTunnel(t *testing.T) {
+	deallocated := false
+	discarded := false
+	err := resetSessionState(t.Context(), 'T', true, func(context.Context) error {
+		deallocated = true
+		return nil
+	}, func(context.Context) error {
+		discarded = true
+		return nil
+	})
+	if err == nil {
+		t.Fatal("transactional Tunnel was accepted for pool return")
+	}
+	if deallocated || discarded {
+		t.Fatal("dirty transactional Tunnel attempted reset commands")
+	}
+}
+
+func TestResetSessionStatePropagatesResetFailure(t *testing.T) {
+	want := fmt.Errorf("discard failed")
+	err := resetSessionState(t.Context(), 'I', false, func(context.Context) error {
+		return nil
+	}, func(context.Context) error {
+		return want
+	})
+	if !errors.Is(err, want) {
+		t.Fatalf("reset error = %v, want wrapped %v", err, want)
 	}
 }
 
