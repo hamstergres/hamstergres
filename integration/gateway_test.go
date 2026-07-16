@@ -76,7 +76,7 @@ func TestGatewayEndToEnd(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-	queryGatewayError(t, frontendAddress, "SELECT * FROM hamstergres_missing_table", "XX000")
+	queryGatewayError(t, frontendAddress, "SELECT * FROM hamstergres_missing_table", "42P01")
 
 	snapshot := gatewaySnapshot(t, statusURL+"/api/v1/status")
 	if snapshot.Sharding.Source != "hamstergres-nest" || snapshot.Sharding.VirtualShards != router.VirtualShards {
@@ -800,7 +800,7 @@ func TestTracingAndObservabilityFailureEndToEnd(t *testing.T) {
 		for rows.Next() {
 		}
 	})
-	queryGatewayError(t, frontendAddress, "SELECT * FROM hamstergres_missing_trace_table", "XX000")
+	queryGatewayError(t, frontendAddress, "SELECT * FROM hamstergres_missing_trace_table", "42P01")
 
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
@@ -1005,10 +1005,9 @@ func TestSessionSettingsDoNotLeakIntoExtendedQueries(t *testing.T) {
 		first.Close(context.Background())
 		t.Fatalf("set session parameter: %v", err)
 	}
-	var setting string
-	if err := first.QueryRow(context.Background(), "SHOW standard_conforming_strings").Scan(&setting); err != nil || setting != "off" {
+	if setting := first.PgConn().ParameterStatus("standard_conforming_strings"); setting != "off" {
 		first.Close(context.Background())
-		t.Fatalf("session setting = %q, err = %v", setting, err)
+		t.Fatalf("session parameter status = %q, want off", setting)
 	}
 	first.Close(context.Background())
 
@@ -1019,6 +1018,7 @@ func TestSessionSettingsDoNotLeakIntoExtendedQueries(t *testing.T) {
 	defer second.Close(context.Background())
 	queryContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	var setting string
 	var value int32
 	if err := second.QueryRow(queryContext, "SELECT $1::int4", int32(7)).Scan(&value); err != nil || value != 7 {
 		t.Fatalf("extended query after prior SET = %d, err = %v\ngateway logs:\n%s", value, err, logs.String())

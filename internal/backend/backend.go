@@ -397,6 +397,7 @@ func appendShardKey(keys, types map[string][]string, namespace, table, column, d
 // participates and is then kept stable until the session is released.
 type Session struct {
 	shards           map[string]*sessionShard
+	runtimeParams    map[string]string
 	fleetWriteGate   chan struct{}
 	fleetWriteLocked bool
 	ctx              context.Context
@@ -414,8 +415,14 @@ type sessionShard struct {
 // NewSession creates an empty affinity session. Connections are acquired on
 // first use by SendTo or SendBatchTo, so parsing, validation, and routed work do
 // not contact unrelated Burrows. The caller must close the returned session.
-func (m *Manager) NewSession(ctx context.Context) (*Session, error) {
-	return &Session{shards: make(map[string]*sessionShard), fleetWriteGate: m.fleetWriteGate, ctx: ctx, manager: m}, nil
+func (m *Manager) NewSession(ctx context.Context, runtimeParams ...map[string]string) (*Session, error) {
+	parameters := make(map[string]string)
+	if len(runtimeParams) > 0 {
+		for name, value := range runtimeParams[0] {
+			parameters[name] = value
+		}
+	}
+	return &Session{shards: make(map[string]*sessionShard), runtimeParams: parameters, fleetWriteGate: m.fleetWriteGate, ctx: ctx, manager: m}, nil
 }
 
 func (s *Session) acquire(name string) (*sessionShard, error) {
@@ -440,6 +447,19 @@ func (s *Session) acquire(name string) (*sessionShard, error) {
 		s.manager.RecordOperation("backend_connection", "failure")
 		slog.Error("Burrow session connection failed", "event", "backend_connection_failed", "component", "hamstergres-proxy", "burrow", target.name, "error_category", "burrow_unavailable", "error", err)
 		return nil, fmt.Errorf("connect session to Burrow %s: %w", target.name, err)
+	}
+	parameterNames := make([]string, 0, len(s.runtimeParams))
+	for parameter := range s.runtimeParams {
+		parameterNames = append(parameterNames, parameter)
+	}
+	sort.Strings(parameterNames)
+	for _, parameter := range parameterNames {
+		if _, err := pooled.Exec(s.Context(), "SELECT set_config($1, $2, false)", parameter, s.runtimeParams[parameter]); err != nil {
+			connection := pooled.Hijack()
+			_ = connection.Close(context.Background())
+			s.manager.RecordOperation("backend_connection", "failure")
+			return nil, fmt.Errorf("apply frontend setting %s on Burrow %s: %w", parameter, target.name, err)
+		}
 	}
 	if err := s.manager.syncPreparedStatements(s.Context(), target.name, pooled.Conn()); err != nil {
 		connection := pooled.Hijack()

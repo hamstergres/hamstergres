@@ -7,14 +7,58 @@ import (
 	"context"
 	"encoding/binary"
 	"io"
+	"reflect"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/jruszo/hamstergres/internal/backend"
 	"github.com/jruszo/hamstergres/internal/config"
 	"github.com/jruszo/hamstergres/internal/schema"
 )
+
+func TestStartupRuntimeParametersPreservePostgreSQLClientSettings(t *testing.T) {
+	startup := &pgproto3.StartupMessage{Parameters: map[string]string{
+		"user":        "hamster",
+		"database":    "regression",
+		"datestyle":   "Postgres, MDY",
+		"timezone":    "America/Los_Angeles",
+		"options":     "-c intervalstyle=postgres_verbose --search_path=public -capplication_name=pg_regress",
+		"unsupported": "ignored",
+	}}
+	got := startupRuntimeParameters(startup)
+	want := map[string]string{
+		"DateStyle":        "Postgres, MDY",
+		"TimeZone":         "America/Los_Angeles",
+		"IntervalStyle":    "postgres_verbose",
+		"search_path":      "public",
+		"application_name": "pg_regress",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("startup runtime parameters = %#v, want %#v", got, want)
+	}
+}
+
+func TestPostgresErrorResponsePreservesStructuredFields(t *testing.T) {
+	postgresError := &pgconn.PgError{
+		Severity: "ERROR", SeverityUnlocalized: "ERROR", Code: "42883",
+		Message: "function length(integer) does not exist", Detail: "detail", Hint: "hint",
+		Position: 15, InternalPosition: 4, InternalQuery: "SELECT 1", Where: "context",
+		SchemaName: "public", TableName: "items", ColumnName: "value", DataTypeName: "integer",
+		ConstraintName: "items_value_check", File: "parse_func.c", Line: 629, Routine: "ParseFuncOrColumn",
+	}
+	response := postgresErrorResponse(postgresError)
+	if response == nil || response.Code != postgresError.Code || response.Message != postgresError.Message ||
+		response.Detail != postgresError.Detail || response.Hint != postgresError.Hint || response.Position != postgresError.Position ||
+		response.InternalPosition != postgresError.InternalPosition || response.InternalQuery != postgresError.InternalQuery ||
+		response.Where != postgresError.Where || response.SchemaName != postgresError.SchemaName || response.TableName != postgresError.TableName ||
+		response.ColumnName != postgresError.ColumnName || response.DataTypeName != postgresError.DataTypeName ||
+		response.ConstraintName != postgresError.ConstraintName || response.File != postgresError.File || response.Line != postgresError.Line ||
+		response.Routine != postgresError.Routine || response.SeverityUnlocalized != postgresError.SeverityUnlocalized {
+		t.Fatalf("structured PostgreSQL error changed: %#v", response)
+	}
+}
 
 func TestCloneFrontendMessageOwnsCopyAndBindBuffers(t *testing.T) {
 	copyData := &pgproto3.CopyData{Data: []byte("first frame")}
@@ -225,6 +269,13 @@ func TestBalancedBurrowUsesStableRoundRobin(t *testing.T) {
 	}
 	if got := server.balancedBurrow(nil); got != "" {
 		t.Fatalf("empty balanced selection = %q, want empty", got)
+	}
+}
+
+func TestParserFallbackUsesOneDeterministicBurrow(t *testing.T) {
+	server := &Server{backends: &backend.Manager{}}
+	if got := server.parserFallbackBurrow([]string{"burrow-02", "burrow-01"}); got != "burrow-01" {
+		t.Fatalf("parser fallback = %q, want burrow-01", got)
 	}
 }
 

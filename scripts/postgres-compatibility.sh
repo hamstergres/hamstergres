@@ -59,7 +59,13 @@ docker compose -f "${repo_root}/docker-compose.yml" up -d --wait hamstergres-nes
 for burrow in burrow-01 burrow-02; do
   docker compose -f "${repo_root}/docker-compose.yml" exec -T "${burrow}" \
     psql --username hamster --dbname regression --set ON_ERROR_STOP=1 \
-    --command 'DROP SCHEMA public CASCADE; CREATE SCHEMA public AUTHORIZATION hamster;'
+    --command 'DROP SCHEMA public CASCADE; CREATE SCHEMA public AUTHORIZATION hamster;' \
+    --command "ALTER DATABASE \"${POSTGRES_DB}\" SET lc_messages TO 'C';" \
+    --command "ALTER DATABASE \"${POSTGRES_DB}\" SET lc_monetary TO 'C';" \
+    --command "ALTER DATABASE \"${POSTGRES_DB}\" SET lc_numeric TO 'C';" \
+    --command "ALTER DATABASE \"${POSTGRES_DB}\" SET lc_time TO 'C';" \
+    --command "ALTER DATABASE \"${POSTGRES_DB}\" SET bytea_output TO 'hex';" \
+    --command "ALTER DATABASE \"${POSTGRES_DB}\" SET timezone_abbreviations TO 'Default';"
 done
 
 echo "==> Starting Hamstergres Proxy"

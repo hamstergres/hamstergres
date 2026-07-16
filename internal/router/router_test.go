@@ -311,6 +311,16 @@ func TestBuiltInAggregateNames(t *testing.T) {
 	}
 }
 
+func TestAnalyzeExplainReturnsOneLogicalPlan(t *testing.T) {
+	plan, err := Analyze("EXPLAIN (COSTS OFF) SELECT * FROM text_tbl", nil, schema.Registry{}, []string{"burrow-01", "burrow-02"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.SingleBurrow || plan.Routed {
+		t.Fatalf("EXPLAIN plan = %#v, want one topology-transparent Burrow", plan)
+	}
+}
+
 func TestAnalyzeCopyRecordsRelationAndDirection(t *testing.T) {
 	from, err := Analyze("COPY public.accounts (id, value) FROM STDIN", nil, schema.Registry{}, []string{"burrow-01", "burrow-02"})
 	if err != nil {

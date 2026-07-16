@@ -80,7 +80,7 @@ func (s *Server) serveConn(conn net.Conn) error {
 		if err != nil {
 			return err
 		}
-		switch message.(type) {
+		switch message := message.(type) {
 		case *pgproto3.SSLRequest:
 			if _, err := conn.Write([]byte("N")); err != nil {
 				return err
@@ -89,23 +89,34 @@ func (s *Server) serveConn(conn net.Conn) error {
 		case *pgproto3.CancelRequest:
 			return nil
 		case *pgproto3.StartupMessage:
-			if err := s.sendStartup(frontend); err != nil {
+			runtimeParams := startupRuntimeParameters(message)
+			if err := s.sendStartup(frontend, runtimeParams); err != nil {
 				return err
 			}
-			return s.serveQueries(frontend)
+			return s.serveQueries(frontend, runtimeParams)
 		default:
 			return fmt.Errorf("unexpected startup message %T", message)
 		}
 	}
 }
 
-func (s *Server) sendStartup(frontend *pgproto3.Backend) error {
+func (s *Server) sendStartup(frontend *pgproto3.Backend, runtimeParams map[string]string) error {
+	dateStyle := "ISO, MDY"
+	if requested := runtimeParams["DateStyle"]; requested != "" {
+		dateStyle = requested
+	}
 	frontend.Send(&pgproto3.AuthenticationOk{})
 	frontend.Send(&pgproto3.ParameterStatus{Name: "client_encoding", Value: "UTF8"})
-	frontend.Send(&pgproto3.ParameterStatus{Name: "DateStyle", Value: "ISO, MDY"})
+	frontend.Send(&pgproto3.ParameterStatus{Name: "DateStyle", Value: dateStyle})
 	frontend.Send(&pgproto3.ParameterStatus{Name: "integer_datetimes", Value: "on"})
+	if intervalStyle := runtimeParams["IntervalStyle"]; intervalStyle != "" {
+		frontend.Send(&pgproto3.ParameterStatus{Name: "IntervalStyle", Value: intervalStyle})
+	}
 	frontend.Send(&pgproto3.ParameterStatus{Name: "server_version", Value: "17.0"})
 	frontend.Send(&pgproto3.ParameterStatus{Name: "standard_conforming_strings", Value: "on"})
+	if timezone := runtimeParams["TimeZone"]; timezone != "" {
+		frontend.Send(&pgproto3.ParameterStatus{Name: "TimeZone", Value: timezone})
+	}
 	frontend.Send(&pgproto3.BackendKeyData{
 		ProcessID: randomUint32(),
 		SecretKey: binary.BigEndian.AppendUint32(nil, randomUint32()),
@@ -114,7 +125,68 @@ func (s *Server) sendStartup(frontend *pgproto3.Backend) error {
 	return frontend.Flush()
 }
 
-func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
+func startupRuntimeParameters(startup *pgproto3.StartupMessage) map[string]string {
+	parameters := make(map[string]string)
+	if startup == nil {
+		return parameters
+	}
+	for name, value := range startup.Parameters {
+		switch strings.ToLower(name) {
+		case "datestyle":
+			parameters["DateStyle"] = value
+		case "timezone":
+			parameters["TimeZone"] = value
+		case "application_name":
+			parameters["application_name"] = value
+		case "options":
+			parseStartupOptions(parameters, value)
+		}
+	}
+	return parameters
+}
+
+func parseStartupOptions(parameters map[string]string, options string) {
+	fields := strings.Fields(options)
+	for index := 0; index < len(fields); index++ {
+		assignment := ""
+		switch {
+		case fields[index] == "-c" && index+1 < len(fields):
+			index++
+			assignment = fields[index]
+		case strings.HasPrefix(fields[index], "-c"):
+			assignment = strings.TrimPrefix(fields[index], "-c")
+		case strings.HasPrefix(fields[index], "--"):
+			assignment = strings.TrimPrefix(fields[index], "--")
+		}
+		name, value, found := strings.Cut(assignment, "=")
+		if !found || !validSettingName(name) {
+			continue
+		}
+		switch strings.ToLower(name) {
+		case "datestyle":
+			name = "DateStyle"
+		case "timezone":
+			name = "TimeZone"
+		case "intervalstyle":
+			name = "IntervalStyle"
+		}
+		parameters[name] = value
+	}
+}
+
+func validSettingName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, character := range name {
+		if character != '_' && (character < 'a' || character > 'z') && (character < 'A' || character > 'Z') && (character < '0' || character > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Server) serveQueries(frontend *pgproto3.Backend, runtimeParams map[string]string) error {
 	sessionContext, cancelSession := context.WithCancel(context.Background())
 	defer cancelSession()
 	type frontendReceive struct {
@@ -159,7 +231,7 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 		if session != nil {
 			return session, true
 		}
-		created, err := s.backends.NewSession(sessionContext)
+		created, err := s.backends.NewSession(sessionContext, runtimeParams)
 		if err != nil {
 			s.sendExtendedError(frontend, "08006", err.Error())
 			state.failed = true
@@ -217,7 +289,7 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend) error {
 					}
 				} else if containsCopyStatement(message.String) {
 					s.sendSessionError(frontend, state.txStatus(), "0A000", "COPY in a multi-statement query is not supported; send COPY as a standalone statement")
-				} else if session != nil || requiresSessionAffinity(message.String) || isTransactionControl(message.String) || requiresFleetWriteOrder(message.String, len(s.backends.ShardNames())) {
+				} else if session != nil || len(runtimeParams) > 0 || requiresSessionAffinity(message.String) || isTransactionControl(message.String) || requiresFleetWriteOrder(message.String, len(s.backends.ShardNames())) {
 					if active, ok := ensureSession(); ok {
 						s.handleSessionQuery(frontend, active, message.String, &state)
 					}
@@ -1370,7 +1442,11 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 			case *pgproto3.ReadyForQuery:
 				// The internally forwarded Sync is exposed only when the frontend
 				// reaches its own Sync boundary.
-			case *pgproto3.NoticeResponse, *pgproto3.ParameterStatus, *pgproto3.NotificationResponse:
+			case *pgproto3.ParameterStatus:
+				if target == pending.targets[0] {
+					frontend.Send(wireMessage)
+				}
+			case *pgproto3.NoticeResponse, *pgproto3.NotificationResponse:
 				// Burrow-local asynchronous messages are not duplicated.
 			default:
 				return fmt.Errorf("unexpected batched response %T", wireMessage)
@@ -1522,7 +1598,7 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 	var rows []*pgproto3.DataRow
 	var tags []string
 	portalSuspended := false
-	for _, response := range responses {
+	for responseIndex, response := range responses {
 		for _, wireMessage := range response {
 			switch wireMessage := wireMessage.(type) {
 			case *pgproto3.RowDescription:
@@ -1538,7 +1614,11 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 				tags = append(tags, string(wireMessage.CommandTag))
 			case *pgproto3.PortalSuspended:
 				portalSuspended = true
-			case *pgproto3.EmptyQueryResponse, *pgproto3.NoticeResponse, *pgproto3.ParameterStatus, *pgproto3.NotificationResponse:
+			case *pgproto3.ParameterStatus:
+				if responseIndex == 0 {
+					frontend.Send(wireMessage)
+				}
+			case *pgproto3.EmptyQueryResponse, *pgproto3.NoticeResponse, *pgproto3.NotificationResponse:
 				// The first three carry no result data. Notices and notifications
 				// are Burrow-local and must not be duplicated to the frontend.
 			case *pgproto3.CopyInResponse, *pgproto3.CopyOutResponse, *pgproto3.CopyBothResponse:
@@ -1846,11 +1926,8 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 	var generationErr error
 	registry := s.backends.Schema()
 	routing, err := router.Prepare(sql)
-	if err != nil {
-		s.sendSessionError(frontend, state.txStatus(), "42601", err.Error())
-		return false
-	}
-	if firstSQLKeyword(sql) == "INSERT" {
+	parserFallback := err != nil
+	if !parserFallback && firstSQLKeyword(sql) == "INSERT" {
 		if _, ok := registry.GeneratedPrimaryKey(routing.Table()); ok {
 			if rewritten, generated := router.RewriteGeneratedInsert(sql, registry, "0"); generated {
 				id, err := s.backends.NextGlobalID(context.Background())
@@ -1895,11 +1972,17 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 
 	var responses [][]pgproto3.BackendMessage
 	var tunnelSpans []trace.Span
-	decision, err := s.routePortal(routing, nil, targets)
-	if err != nil {
-		errorCategory = "sql_error"
-		s.sendSessionError(frontend, state.txStatus(), "42601", err.Error())
-		return false
+	decision := routeDecision{}
+	if parserFallback {
+		decision.target = s.parserFallbackBurrow(targets)
+		decision.routed = decision.target != ""
+	} else {
+		decision, err = s.routePortal(routing, nil, targets)
+		if err != nil {
+			errorCategory = "sql_error"
+			s.sendSessionError(frontend, state.txStatus(), "42601", err.Error())
+			return false
+		}
 	}
 	target, routed := decision.target, decision.routed
 	if decision.scatterError != "" {
@@ -1952,6 +2035,7 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 	var rows []*pgproto3.DataRow
 	var tags []string
 	var notices []*pgproto3.NoticeResponse
+	var parameterStatuses []*pgproto3.ParameterStatus
 	for responseIndex, response := range responses {
 		for _, wireMessage := range response {
 			switch wireMessage := wireMessage.(type) {
@@ -1974,9 +2058,14 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 					notice := *wireMessage
 					notices = append(notices, &notice)
 				}
-			case *pgproto3.EmptyQueryResponse, *pgproto3.ReadyForQuery, *pgproto3.ParameterStatus, *pgproto3.NotificationResponse:
-				// ReadyForQuery is merged after result data. Parameter status and
-				// notifications remain Burrow-local asynchronous state.
+			case *pgproto3.ParameterStatus:
+				if responseIndex == 0 {
+					status := *wireMessage
+					parameterStatuses = append(parameterStatuses, &status)
+				}
+			case *pgproto3.EmptyQueryResponse, *pgproto3.ReadyForQuery, *pgproto3.NotificationResponse:
+				// ReadyForQuery is merged after result data. Notifications remain
+				// Burrow-local asynchronous state.
 			case *pgproto3.CopyInResponse, *pgproto3.CopyOutResponse, *pgproto3.CopyBothResponse:
 				s.sendError(frontend, "0A000", "COPY is not supported by Hamstergres Proxy")
 				return false
@@ -1994,6 +2083,9 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 	}
 	for _, notice := range notices {
 		frontend.Send(notice)
+	}
+	for _, parameterStatus := range parameterStatuses {
+		frontend.Send(parameterStatus)
 	}
 	if description != nil {
 		frontend.Send(description)
@@ -2230,6 +2322,22 @@ func randomBurrow(burrows []string) string {
 	return burrows[binary.LittleEndian.Uint64(value[:])%uint64(len(burrows))]
 }
 
+func (s *Server) parserFallbackBurrow(burrows []string) string {
+	if len(burrows) == 0 {
+		return ""
+	}
+	if primary := s.backends.PrimaryBurrow(); primary != "" {
+		for _, burrow := range burrows {
+			if burrow == primary {
+				return primary
+			}
+		}
+	}
+	ordered := append([]string(nil), burrows...)
+	sort.Strings(ordered)
+	return ordered[0]
+}
+
 func requiresRoutedWrite(sql string) bool {
 	switch firstSQLKeyword(sql) {
 	case "INSERT", "UPDATE", "DELETE", "MERGE":
@@ -2416,12 +2524,8 @@ func (s *Server) handleQuery(frontend *pgproto3.Backend, sql string) {
 	sql = normalized.sql
 	registry := s.backends.Schema()
 	routing, err := router.Prepare(sql)
-	if err != nil {
-		errorCategory = "sql_error"
-		s.sendError(frontend, "42601", err.Error())
-		return
-	}
-	if firstSQLKeyword(sql) == "INSERT" {
+	parserFallback := err != nil
+	if !parserFallback && firstSQLKeyword(sql) == "INSERT" {
 		if _, ok := registry.GeneratedPrimaryKey(routing.Table()); ok {
 			if _, generated := router.RewriteGeneratedInsert(sql, registry, "0"); generated {
 				id, err := s.backends.NextGlobalID(context.Background())
@@ -2446,11 +2550,17 @@ func (s *Server) handleQuery(frontend *pgproto3.Backend, sql string) {
 		defer unlock()
 	}
 	var result backend.Result
-	decision, err := s.routePortal(routing, nil, s.backends.ShardNames())
-	if err != nil {
-		errorCategory = "sql_error"
-		s.sendError(frontend, "42601", err.Error())
-		return
+	decision := routeDecision{}
+	if parserFallback {
+		decision.target = s.parserFallbackBurrow(s.backends.ShardNames())
+		decision.routed = decision.target != ""
+	} else {
+		decision, err = s.routePortal(routing, nil, s.backends.ShardNames())
+		if err != nil {
+			errorCategory = "sql_error"
+			s.sendError(frontend, "42601", err.Error())
+			return
+		}
 	}
 	target, routed := decision.target, decision.routed
 	if decision.scatterError != "" {
@@ -2479,7 +2589,11 @@ func (s *Server) handleQuery(frontend *pgproto3.Backend, sql string) {
 	if err != nil {
 		errorCategory = classifyProxyError(err)
 		endTunnelSpans(tunnelSpans, err)
-		s.sendError(frontend, "XX000", err.Error())
+		if response := postgresErrorResponse(err); response != nil {
+			s.sendBackendError(frontend, 'I', response)
+		} else {
+			s.sendError(frontend, "XX000", err.Error())
+		}
 		return
 	}
 	endTunnelSpans(tunnelSpans, nil)
@@ -2512,12 +2626,44 @@ func classifyProxyError(err error) string {
 	return "burrow_transport"
 }
 
+func postgresErrorResponse(err error) *pgproto3.ErrorResponse {
+	var postgresError *pgconn.PgError
+	if !errors.As(err, &postgresError) {
+		return nil
+	}
+	return &pgproto3.ErrorResponse{
+		Severity:            postgresError.Severity,
+		SeverityUnlocalized: postgresError.SeverityUnlocalized,
+		Code:                postgresError.Code,
+		Message:             postgresError.Message,
+		Detail:              postgresError.Detail,
+		Hint:                postgresError.Hint,
+		Position:            postgresError.Position,
+		InternalPosition:    postgresError.InternalPosition,
+		InternalQuery:       postgresError.InternalQuery,
+		Where:               postgresError.Where,
+		SchemaName:          postgresError.SchemaName,
+		TableName:           postgresError.TableName,
+		ColumnName:          postgresError.ColumnName,
+		DataTypeName:        postgresError.DataTypeName,
+		ConstraintName:      postgresError.ConstraintName,
+		File:                postgresError.File,
+		Line:                postgresError.Line,
+		Routine:             postgresError.Routine,
+	}
+}
+
 func (s *Server) sendError(frontend *pgproto3.Backend, code, message string) {
 	s.sendSessionError(frontend, 'I', code, message)
 }
 
 func (s *Server) sendSessionError(frontend *pgproto3.Backend, status byte, code, message string) {
 	frontend.Send(&pgproto3.ErrorResponse{Severity: "ERROR", Code: code, Message: message})
+	frontend.Send(&pgproto3.ReadyForQuery{TxStatus: status})
+}
+
+func (s *Server) sendBackendError(frontend *pgproto3.Backend, status byte, response *pgproto3.ErrorResponse) {
+	frontend.Send(response)
 	frontend.Send(&pgproto3.ReadyForQuery{TxStatus: status})
 }
 

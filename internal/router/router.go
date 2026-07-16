@@ -103,6 +103,10 @@ func Prepare(sql string) (*Prepared, error) {
 		}
 	case *pg_query.Node_VariableShowStmt:
 		prepared.read = true
+	case *pg_query.Node_ExplainStmt:
+		// EXPLAIN describes one logical PostgreSQL plan. Returning one copy per
+		// Burrow exposes fan-out and duplicates every plan row at the frontend.
+		prepared.plan.SingleBurrow = true
 	default:
 	}
 
