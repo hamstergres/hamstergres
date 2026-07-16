@@ -39,6 +39,10 @@ Hamstergres Nest
 Nest is not a shard. A Burrow is a shard. Burrows are all shards together. The
 Nest contains the map that says which data belongs to which Burrow.
 
+The application-facing PostgreSQL target and the features that intentionally
+fail closed are defined in the
+[PostgreSQL compatibility contract](postgresql-compatibility.md).
+
 ## Routing vocabulary
 
 Use the familiar technical term `vshard` for virtual shards, named like
