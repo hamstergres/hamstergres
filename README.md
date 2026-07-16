@@ -1,6 +1,6 @@
 # Hamstergres
 
-[![PostgreSQL compatibility progress](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/hamstergres/hamstergres/gh-pages/postgres-compatibility/overall.json)](https://github.com/hamstergres/hamstergres/actions/workflows/postgres-compatibility.yml)
+[![PostgreSQL compatibility progress](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fhamstergres%2Fhamstergres%2Fgh-pages%2Fpostgres-compatibility%2Foverall.json&cacheSeconds=300)](https://github.com/hamstergres/hamstergres/actions/workflows/postgres-compatibility.yml)
 [![PostgreSQL Compatibility](https://github.com/hamstergres/hamstergres/actions/workflows/postgres-compatibility.yml/badge.svg?branch=main)](https://github.com/hamstergres/hamstergres/actions/workflows/postgres-compatibility.yml)
 
 Hamstergres is an experimental PostgreSQL sharding system: **Tiny paws, many

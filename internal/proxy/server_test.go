@@ -4,10 +4,15 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
+	"io"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
+	"github.com/jruszo/hamstergres/internal/backend"
+	"github.com/jruszo/hamstergres/internal/config"
 	"github.com/jruszo/hamstergres/internal/schema"
 )
 
@@ -30,6 +35,158 @@ func TestCloneFrontendMessageOwnsCopyAndBindBuffers(t *testing.T) {
 	bind.ResultFormatCodes[0] = 0
 	if !bytes.Equal(clonedBind.Parameters[0], []byte("42")) || clonedBind.ParameterFormatCodes[0] != 1 || clonedBind.ResultFormatCodes[0] != 1 {
 		t.Fatalf("cloned Bind reused receive buffers: %#v", clonedBind)
+	}
+}
+
+func TestPendingExtendedFailureAtSyncEmitsReadyForQuery(t *testing.T) {
+	manager := &backend.Manager{}
+	session, err := manager.NewSession(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := extendedState{pending: &pendingExtended{
+		targets:   []string{"burrow-missing"},
+		bind:      &pgproto3.Bind{},
+		statement: statementState{},
+	}}
+	var wire bytes.Buffer
+	frontend := pgproto3.NewBackend(bytes.NewReader(nil), &wire)
+	if (&Server{}).flushPendingExtended(frontend, session, &state, true) {
+		t.Fatal("failed pending request reported success")
+	}
+	if err := frontend.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	client := pgproto3.NewFrontend(bytes.NewReader(wire.Bytes()), io.Discard)
+	message, err := client.Receive()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response, ok := message.(*pgproto3.ErrorResponse); !ok || response.Code != "08006" {
+		t.Fatalf("first response = %#v, want connection error", message)
+	}
+	message, err = client.Receive()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := message.(*pgproto3.ReadyForQuery); !ok {
+		t.Fatalf("second response = %#v, want ReadyForQuery", message)
+	}
+	if state.failed {
+		t.Fatal("Sync recovery left the extended protocol in failed state")
+	}
+}
+
+func TestRequiresSessionAffinityForSessionSettings(t *testing.T) {
+	for _, sql := range []string{
+		"SET standard_conforming_strings = off",
+		"RESET ALL",
+		"DISCARD ALL",
+		"LISTEN events",
+		"UNLISTEN events",
+		"PREPARE lookup AS SELECT 1",
+		"SELECT 1; SET search_path = private, public",
+		"SELECT 1; SET ROLE application_user",
+	} {
+		if !requiresSessionAffinity(sql) {
+			t.Fatalf("requiresSessionAffinity(%q) = false", sql)
+		}
+	}
+	if requiresSessionAffinity("SELECT 1") {
+		t.Fatal("ordinary query unexpectedly requires session affinity")
+	}
+	if requiresSessionAffinity("SELECT 'SET ROLE application_user'") {
+		t.Fatal("affinity command text inside a literal required session affinity")
+	}
+}
+
+func TestPendingFleetWriteFailureReleasesGateOutsideTransaction(t *testing.T) {
+	manager, err := backend.New(t.Context(), emptyBackendConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	session, err := manager.NewSession(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := extendedState{pending: fleetWritePending(), statements: make(map[string]statementState), portals: make(map[string]portalState)}
+	frontend := pgproto3.NewBackend(bytes.NewReader(nil), io.Discard)
+	if (&Server{}).flushPendingExtended(frontend, session, &state, true) {
+		t.Fatal("failed pending fleet write reported success")
+	}
+
+	next, err := manager.NewSession(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if !next.LockFleetWritesContext(ctx) {
+		t.Fatal("fleet-write gate remained locked after non-transaction failure")
+	}
+	next.UnlockFleetWrites()
+}
+
+func TestPendingFleetWriteFailurePreservesGateDuringTransaction(t *testing.T) {
+	manager, err := backend.New(t.Context(), emptyBackendConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	session, err := manager.NewSession(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := extendedState{transaction: true, pending: fleetWritePending(), statements: make(map[string]statementState), portals: make(map[string]portalState)}
+	frontend := pgproto3.NewBackend(bytes.NewReader(nil), io.Discard)
+	if (&Server{}).flushPendingExtended(frontend, session, &state, true) {
+		t.Fatal("failed pending fleet write reported success")
+	}
+
+	next, err := manager.NewSession(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	if next.LockFleetWritesContext(ctx) {
+		next.UnlockFleetWrites()
+		t.Fatal("transactional fleet-write gate was released after pending failure")
+	}
+	session.UnlockFleetWrites()
+}
+
+func emptyBackendConfig() config.Config {
+	var cfg config.Config
+	cfg.Sharding.Unsharded.Mode = config.UnshardedReplicated
+	return cfg
+}
+
+func fleetWritePending() *pendingExtended {
+	return &pendingExtended{
+		targets: []string{"burrow-missing-01", "burrow-missing-02"},
+		bind:    &pgproto3.Bind{},
+		execute: &pgproto3.Execute{},
+		portal:  portalState{sql: "CREATE TABLE widgets (id bigint)"},
+	}
+}
+
+func TestCopyStartDrainsReadyForQueryAfterError(t *testing.T) {
+	if isCopyStarted(&pgproto3.ErrorResponse{}) {
+		t.Fatal("COPY startup stopped before draining ReadyForQuery")
+	}
+	if !isCopyStarted(&pgproto3.ReadyForQuery{}) {
+		t.Fatal("COPY startup did not stop at ReadyForQuery")
+	}
+}
+
+func TestContainsCopyStatementInMultiStatementQuery(t *testing.T) {
+	if !containsCopyStatement("SELECT 0; COPY test3 FROM STDIN; SELECT 1") {
+		t.Fatal("multi-statement COPY was not detected")
+	}
+	if containsCopyStatement("SELECT 'COPY test3 FROM STDIN'") {
+		t.Fatal("COPY text inside a literal was treated as a statement")
 	}
 }
 
