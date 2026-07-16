@@ -13,8 +13,9 @@ deterministic Burrow, while unsharded reads execute once according to their
 fleet policy, so the fleet looks like one PostgreSQL server. It supports simple
 queries and the core extended-query lifecycle used by prepared, parameterized
 PostgreSQL clients. Hamstergres Nest durably stores the versioned schema and
-per-table vshard topology consumed by the Proxy. See [the architecture and
-naming reference](docs/architecture.md) for the component model.
+per-table vshard topology consumed by the Proxy. See
+[the architecture and naming reference](docs/architecture.md) for the component
+model.
 
 ## Layout
 
@@ -43,14 +44,13 @@ make up
 
 The two independent PostgreSQL Burrows expose these host ports:
 
-| Burrow | Address |
-| --- | --- |
+| Burrow      | Address          |
+| ----------- | ---------------- |
 | `burrow-01` | `localhost:5541` |
 | `burrow-02` | `localhost:5542` |
 
-Both use the credentials in `.env` (the development defaults are
-`hamster` / `hamster` and database `hamstergres`) and start with the same
-`accounts` table:
+Both use the credentials in `.env` (the development defaults are `hamster` /
+`hamster` and database `hamstergres`) and start with the same `accounts` table:
 
 ```sql
 CREATE TABLE accounts (
@@ -69,8 +69,8 @@ psql "postgres://hamster:hamster@localhost:5541/hamstergres?sslmode=disable"
 psql "postgres://hamster:hamster@localhost:5542/hamstergres?sslmode=disable"
 ```
 
-`db/init/001_schema.sql` only runs when a Burrow's data volume is first
-created. To reinitialize both shards after changing it, run:
+`db/init/001_schema.sql` only runs when a Burrow's data volume is first created.
+To reinitialize both shards after changing it, run:
 
 ```bash
 docker compose down -v
@@ -82,17 +82,19 @@ make up
 [`config/hamstergres.example.yaml`](config/hamstergres.example.yaml) provides
 the Proxy's initial Tunnel endpoints:
 
-- `accounts` is distributed by its PostgreSQL primary key: `(tenant_id, account_id)`.
+- `accounts` is distributed by its PostgreSQL primary key:
+  `(tenant_id, account_id)`.
 - `hash(primary_key_tuple) % 65536` selects a vshard.
 - On the first upgrade, the exact v3 owner map is imported. A fresh Nest uses
-  the old one-indexed modulo layout once: odd vshards belong to `burrow-01`
-  and even vshards belong to `burrow-02` in the two-Burrow fixture.
+  the old one-indexed modulo layout once: odd vshards belong to `burrow-01` and
+  even vshards belong to `burrow-02` in the two-Burrow fixture.
 
-The DSNs in that file use Docker service names so a Proxy container can
-connect to the Burrows. When running a Go process directly on the host, use
-`localhost:5541` and `localhost:5542` instead. After bootstrap, Nest topology—not
-YAML order—is the placement source of truth. The current Proxy still requires
-the matching static endpoints at startup; dynamic Tunnel changes are issue #13.
+The DSNs in that file use Docker service names so a Proxy container can connect
+to the Burrows. When running a Go process directly on the host, use
+`localhost:5541` and `localhost:5542` instead. After bootstrap, Nest
+topology—not YAML order—is the placement source of truth. The current Proxy
+still requires the matching static endpoints at startup; dynamic Tunnel changes
+are issue #13.
 
 ## Checks
 
@@ -126,8 +128,8 @@ pinned PostgreSQL 17.10 image from the official PostgreSQL source so the
 Burrows, `pg_regress`, its SQL and expected-output corpus, and the server-side
 `regress.so` test module all use the same release. It then starts an isolated
 Nest and the normal two-Burrow topology, runs the full upstream
-`parallel_schedule` through a
-host-run Proxy, and writes these files under `build/postgres-compatibility/`:
+`parallel_schedule` through a host-run Proxy, and writes these files under
+`build/postgres-compatibility/`:
 
 - `compatibility-report.md` — pass count, current gaps, and regressions.
 - `results.json` — machine-readable per-test baseline data.
@@ -174,8 +176,8 @@ brew install sysbench
 ```
 
 The test validates the installed sysbench version, then checks the Proxy's
-process-owned status data for both single-Burrow and scattered routes, with
-both `SELECT` and `UPDATE` statements present.
+process-owned status data for both single-Burrow and scattered routes, with both
+`SELECT` and `UPDATE` statements present.
 
 ## Sharded and unsharded benchmark datasets
 
@@ -209,9 +211,9 @@ The pgbench sharded setup marks `pgbench_accounts.aid` before loading the
 branches and tellers tables and append-only history table remain unsharded and
 follow the configured unsharded-table policy. This preserves pgbench's scale
 discovery and models the common fact-table/dimension-table shape. The wrapper
-uses explicit-column COPY streams because shard-aware COPY deliberately
-rejects an implicit column order. Set `PGBENCH_SCALE` on the make command line
-to change the default scale of 1. Direct script use can pass `--scale` or set
+uses explicit-column COPY streams because shard-aware COPY deliberately rejects
+an implicit column order. Set `PGBENCH_SCALE` on the make command line to change
+the default scale of 1. Direct script use can pass `--scale` or set
 `HAMSTERGRES_PGBENCH_SCALE`. Partitioned and foreign-key pgbench setup is not
 supported in sharded mode because those layouts require a separate colocation
 design.
@@ -222,9 +224,9 @@ single-row inserts so each write contains exactly one shard key. Unsharded mode
 uses sysbench's stock bulk loader. Override `PGBENCH_OPTIONS` or
 `SYSBENCH_OPTIONS` on the make command line to change run duration, clients,
 table count, or table size. The connection defaults match `make run-proxy` and
-can be changed with `HAMSTERGRES_BENCHMARK_HOST`,
-`HAMSTERGRES_BENCHMARK_PORT`, `HAMSTERGRES_BENCHMARK_USER`,
-`HAMSTERGRES_BENCHMARK_PASSWORD`, and `HAMSTERGRES_BENCHMARK_DATABASE`.
+can be changed with `HAMSTERGRES_BENCHMARK_HOST`, `HAMSTERGRES_BENCHMARK_PORT`,
+`HAMSTERGRES_BENCHMARK_USER`, `HAMSTERGRES_BENCHMARK_PASSWORD`, and
+`HAMSTERGRES_BENCHMARK_DATABASE`.
 
 For a direct-versus-Proxy comparison in either dataset mode, start the local
 Proxy and run:
@@ -235,20 +237,19 @@ make benchmark-sysbench BENCHMARK_MODE=unsharded
 ```
 
 The default comparison is sharded. The benchmark runs 15-second, four-thread
-`oltp_read_only` and
-`oltp_read_write` workloads through Hamstergres Proxy and directly against
-`burrow-01`, prints the normal sysbench reports, and finishes with a JSON ratio
-record. It mutates and cleans up the two local `sbtest` tables and is therefore
-an explicit benchmark target rather than part of ordinary tests. Shorten or
-resize an exploratory run with `HAMSTERGRES_BENCHMARK_SECONDS`,
-`HAMSTERGRES_BENCHMARK_THREADS`, `HAMSTERGRES_BENCHMARK_TABLES`, and
-`HAMSTERGRES_BENCHMARK_TABLE_SIZE`.
+`oltp_read_only` and `oltp_read_write` workloads through Hamstergres Proxy and
+directly against `burrow-01`, prints the normal sysbench reports, and finishes
+with a JSON ratio record. It mutates and cleans up the two local `sbtest` tables
+and is therefore an explicit benchmark target rather than part of ordinary
+tests. Shorten or resize an exploratory run with
+`HAMSTERGRES_BENCHMARK_SECONDS`, `HAMSTERGRES_BENCHMARK_THREADS`,
+`HAMSTERGRES_BENCHMARK_TABLES`, and `HAMSTERGRES_BENCHMARK_TABLE_SIZE`.
 
 ### One-CPU sharding experiment
 
-The development Compose environment limits each PostgreSQL Burrow to one CPU.
-To measure whether two one-CPU Burrows provide more keyed-read throughput than
-one one-CPU Burrow, run:
+The development Compose environment limits each PostgreSQL Burrow to one CPU. To
+measure whether two one-CPU Burrows provide more keyed-read throughput than one
+one-CPU Burrow, run:
 
 ```bash
 make experiment-sharding-cpu
@@ -270,8 +271,8 @@ Three 15-second rounds at 1, 4, 8, 16, 32, and 64 clients are averaged by
 default. Each timed run has a three-second warmup. Proxy topology order and
 concurrency order are reversed on alternating rounds to reduce order bias.
 Override the concurrency curve with `HAMSTERGRES_EXPERIMENT_CONCURRENCY`, or
-select a single point with `HAMSTERGRES_EXPERIMENT_THREADS`. The duration can
-be changed with `HAMSTERGRES_EXPERIMENT_WARMUP_SECONDS`,
+select a single point with `HAMSTERGRES_EXPERIMENT_THREADS`. The duration can be
+changed with `HAMSTERGRES_EXPERIMENT_WARMUP_SECONDS`,
 `HAMSTERGRES_EXPERIMENT_SECONDS`, `HAMSTERGRES_EXPERIMENT_ROUNDS`, or
 `HAMSTERGRES_EXPERIMENT_TABLE_SIZE`.
 
@@ -297,7 +298,7 @@ make up
 make run-proxy
 ```
 
-The main example configuration is written for a proxy running *inside* Docker.
+The main example configuration is written for a proxy running _inside_ Docker.
 Use the host-ready local example when running the Go gateway on the host:
 
 ```bash
@@ -312,59 +313,59 @@ psql "postgres://anything@localhost:6432/anything?sslmode=disable" -c 'SELECT * 
 ```
 
 At startup, the Proxy reads explicit shard-key comments from every Burrow and
-refuses to start if the registry differs. Mark shard-key columns with `COMMENT ON
-COLUMN accounts.tenant_id IS 'hamstergres.shard_key'`. Multiple marked columns
-form an ordered compound key and may contain text, numeric, or mixed PostgreSQL
-types; tables without any marker are unsharded. `SELECT`, `INSERT`, `UPDATE`,
-and `DELETE` route to one Burrow when they provide the complete annotated key.
-Ambiguous or partial-key writes to sharded tables are rejected
-instead of being duplicated across the fleet. DDL is still applied to every
-Burrow. The `sharding.unsharded_tables` configuration selects either one
+refuses to start if the registry differs. Mark shard-key columns with
+`COMMENT ON COLUMN accounts.tenant_id IS 'hamstergres.shard_key'`. Multiple
+marked columns form an ordered compound key and may contain text, numeric, or
+mixed PostgreSQL types; tables without any marker are unsharded. `SELECT`,
+`INSERT`, `UPDATE`, and `DELETE` route to one Burrow when they provide the
+complete annotated key. Ambiguous or partial-key writes to sharded tables are
+rejected instead of being duplicated across the fleet. DDL is still applied to
+every Burrow. The `sharding.unsharded_tables` configuration selects either one
 primary Burrow for all unsharded traffic or replicated writes with randomly
 load-balanced reads. Topology-independent reads use the primary Burrow in
 `primary` mode and stable round-robin selection across sorted routable Burrows
 in `replicated` mode. Extended-protocol portals with a complete bound shard key
 use one Tunnel for Bind, Describe, Execute, and Close; append-safe unkeyed read
 portals retain deterministic scatter behavior. Global operations over scattered
-sharded rows,
-including aggregates, `DISTINCT`, `ORDER BY`, `LIMIT`, `OFFSET`, joins, CTEs,
-subqueries, set operations, and window functions, fail closed with SQLSTATE
-`0A000` until the Proxy has a PostgreSQL-equivalent global result operator. The
-Proxy preserves an extended request through
-Flush or Sync, so Bind, optional Describe, Execute, and Sync use one backend
-flush rather than one round trip per message. Equivalent Parse messages share
-a canonical backend name derived from SQL and parameter types; each Tunnel
-prepares that statement once and reuses it for frontend aliases. Clean idle
-Tunnels return to the per-Burrow connection pools after Sync and can be
-multiplexed across frontend sessions; transactions, COPY, and incomplete
-protocol batches remain pinned. Multi-Burrow write transactions use PostgreSQL
-two-phase commit by default, while read-only and single-Burrow transactions use
-ordinary commit. DML transactions run concurrently without a Proxy-wide write
-lock. Two-phase commit makes commit atomic but does not provide global
-cross-Burrow isolation; applications must retry complete transactions after
-PostgreSQL deadlock, serialization, or lock-timeout failures. The default
-`transactions.lock_timeout: 1s` prevents undetectable cross-Burrow lock cycles
-from blocking indefinitely. Operators who accept partial cross-Burrow commit risk may set
+sharded rows, including aggregates, `DISTINCT`, `ORDER BY`, `LIMIT`, `OFFSET`,
+joins, CTEs, subqueries, set operations, and window functions, fail closed with
+SQLSTATE `0A000` until the Proxy has a PostgreSQL-equivalent global result
+operator. The Proxy preserves an extended request through Flush or Sync, so
+Bind, optional Describe, Execute, and Sync use one backend flush rather than one
+round trip per message. Equivalent Parse messages share a canonical backend name
+derived from SQL and parameter types; each Tunnel prepares that statement once
+and reuses it for frontend aliases. Clean idle Tunnels return to the per-Burrow
+connection pools after Sync and can be multiplexed across frontend sessions;
+transactions, COPY, and incomplete protocol batches remain pinned. Multi-Burrow
+write transactions use PostgreSQL two-phase commit by default, while read-only
+and single-Burrow transactions use ordinary commit. DML transactions run
+concurrently without a Proxy-wide write lock. Two-phase commit makes commit
+atomic but does not provide global cross-Burrow isolation; applications must
+retry complete transactions after PostgreSQL deadlock, serialization, or
+lock-timeout failures. The default `transactions.lock_timeout: 1s` prevents
+undetectable cross-Burrow lock cycles from blocking indefinitely. Operators who
+accept partial cross-Burrow commit risk may set
 `transactions.two_phase_commit: false` to use sequential ordinary commits.
 Prepared statements and portals are pinned to the frontend session and retain
-supplied text or binary parameter and result formats. Unsharded `COPY FROM
-STDIN` follows the configured table policy: `primary` sends each row only to the
-primary Burrow, while `replicated` sends it once to every Burrow. Unsharded
-`COPY TO STDOUT` likewise reads from one policy-selected Burrow. Sharded `COPY
-FROM STDIN` requires an explicit column list containing the complete annotated
-shard key, decodes text, CSV, and supported binary rows, and sends each row
-exactly once to its vshard's owning Burrow. Compound and quoted key columns are
-supported; NULL, omitted, generated, or undecodable key values fail closed.
-CSV headers and binary envelopes reach every input Burrow without being counted
-as rows. The Proxy retains at most one incomplete input row, enforces a 16 MiB
-per-row limit, and flushes routed chunks synchronously for backpressure.
+supplied text or binary parameter and result formats. Unsharded
+`COPY FROM STDIN` follows the configured table policy: `primary` sends each row
+only to the primary Burrow, while `replicated` sends it once to every Burrow.
+Unsharded `COPY TO STDOUT` likewise reads from one policy-selected Burrow.
+Sharded `COPY FROM STDIN` requires an explicit column list containing the
+complete annotated shard key, decodes text, CSV, and supported binary rows, and
+sends each row exactly once to its vshard's owning Burrow. Compound and quoted
+key columns are supported; NULL, omitted, generated, or undecodable key values
+fail closed. CSV headers and binary envelopes reach every input Burrow without
+being counted as rows. The Proxy retains at most one incomplete input row,
+enforces a 16 MiB per-row limit, and flushes routed chunks synchronously for
+backpressure.
 
 Sharded `COPY TO STDOUT` appends Burrows in configured order. CSV output has one
 header and binary output has one valid header/trailer envelope. This is a
 deterministic concatenation, not a global sort; use an explicitly ordered query
-when global row order matters. COPY command tags report logical rows rather
-than replicated physical writes. A row-routing error aborts and drains every
-active Burrow COPY before the frontend returns to ready state. Use an explicit
+when global row order matters. COPY command tags report logical rows rather than
+replicated physical writes. A row-routing error aborts and drains every active
+Burrow COPY before the frontend returns to ready state. Use an explicit
 transaction when a multi-Burrow COPY must commit atomically through two-phase
 commit; without one, a transport failure during final completion can leave an
 already-completed Burrow committed and requires reconciliation. `COPY BOTH`
@@ -387,14 +388,13 @@ benchmarking the deployment.
 
 ### Versioned schema and topology in Hamstergres Nest
 
-The development Compose environment includes an etcd-backed **Hamstergres
-Nest** on port 2379. On the first successful Proxy startup, it stores two
-independent records: the versioned schema contract at
-`/hamstergres/schema-registry/v3` and the versioned routing topology at
-`/hamstergres/topology/v1`. The topology owns immutable Burrow identities,
-lifecycle state, Tunnel endpoint fingerprints, and complete per-table vshard
-placement. It is published with etcd compare-and-swap, so concurrent writers
-cannot replace one another or expose a partial map.
+The development Compose environment includes an etcd-backed **Hamstergres Nest**
+on port 2379. On the first successful Proxy startup, it stores two independent
+records: the versioned schema contract at `/hamstergres/schema-registry/v3` and
+the versioned routing topology at `/hamstergres/topology/v1`. The topology owns
+immutable Burrow identities, lifecycle state, Tunnel endpoint fingerprints, and
+complete per-table vshard placement. It is published with etcd compare-and-swap,
+so concurrent writers cannot replace one another or expose a partial map.
 
 An upgrade imports schema-registry v3's existing owner map exactly. If there is
 no legacy owner map, the Proxy commits the old modulo placement once. Later YAML
@@ -412,10 +412,10 @@ Migrations workflow.
 ### Nest storage maintenance
 
 Docker-backed tests keep their isolated schema registry, topology, and
-generated-ID sequence below `/hamstergres/tests/<test-key>/`. Each test deletes that exact
-namespace during `t.Cleanup` and logically compacts through its cleanup
-revision, keeping repeated suites from retaining the large prior values. The
-default schema registry, sequence, benchmark, and experiment namespaces are
+generated-ID sequence below `/hamstergres/tests/<test-key>/`. Each test deletes
+that exact namespace during `t.Cleanup` and logically compacts through its
+cleanup revision, keeping repeated suites from retaining the large prior values.
+The default schema registry, sequence, benchmark, and experiment namespaces are
 outside the deletion range. An abrupt machine or container stop can prevent
 lifecycle cleanup, so remove previously accumulated test state with:
 
@@ -442,11 +442,12 @@ maintenance guidance.
 After a `NOSPACE` alarm, stop test writers, run `make clean-nest-tests`, verify
 the reclaimed size with `make nest-status`, then run
 `docker compose exec -T hamstergres-nest etcdctl alarm disarm`. If the Nest was
-OOM-killed, first restart it with `docker compose up -d --wait
-hamstergres-nest`; etcd reopens the durable volume, after which the same cleanup
-reclaims the test history. If the backend quota prevents recovery, temporarily
-start Compose with a larger `NEST_QUOTA_BACKEND_BYTES`, clean and defragment,
-then return to the normal bound.
+OOM-killed, first restart it with
+`docker compose up -d --wait hamstergres-nest`; etcd reopens the durable volume,
+after which the same cleanup reclaims the test history. If the backend quota
+prevents recovery, temporarily start Compose with a larger
+`NEST_QUOTA_BACKEND_BYTES`, clean and defragment, then return to the normal
+bound.
 
 This is a local-development gateway. Its frontend currently accepts every
 startup user without a password and the example listener is reachable on all
@@ -463,10 +464,10 @@ It also records the last 10 seconds, 1 minute, 5 minutes, and 10 minutes of
 query traffic. Every window includes total and failed queries, scatter versus
 single-shard routing, average execution time, and per-Burrow execution counts.
 The page and JSON API keep up to 100 normalized query-shape summaries for the
-current process lifetime. They show SQL structure such as `SELECT * FROM
-accounts` while replacing string and numeric literals with `?`; for example,
-`WHERE tenant_id = 42` becomes `WHERE tenant_id = ?`. Every shape also has a
-stable 16-character fingerprint for searching and correlation.
+current process lifetime. They show SQL structure such as
+`SELECT * FROM accounts` while replacing string and numeric literals with `?`;
+for example, `WHERE tenant_id = 42` becomes `WHERE tenant_id = ?`. Every shape
+also has a stable 16-character fingerprint for searching and correlation.
 
 Status is self-contained: the gateway's `internal/status.Collector` reads the
 frontend's in-memory counters and its managed `pgx` pools directly. It never
@@ -485,28 +486,28 @@ required.
 The endpoint currently exports query success/failure counters, a query latency
 histogram in seconds, single-Burrow and scatter routing decisions, per-Burrow
 Tunnel executions, frontend connection counts, Burrow health, and backend pool
-capacity/use/acquisition signals. Metric names use the
-`hamstergres_proxy_` prefix. Labels are limited to fixed states, outcomes,
-routing decisions, and configured Burrow names. Raw SQL, query shapes,
-fingerprints, credentials, and bound values are deliberately never labels.
+capacity/use/acquisition signals. Metric names use the `hamstergres_proxy_`
+prefix. Labels are limited to fixed states, outcomes, routing decisions, and
+configured Burrow names. Raw SQL, query shapes, fingerprints, credentials, and
+bound values are deliberately never labels.
 
-| Metric | Unit | Labels |
-| --- | --- | --- |
-| `hamstergres_proxy_uptime_seconds` | seconds | none |
-| `hamstergres_proxy_frontend_connections` | connections | `state`: `active`, `total` |
-| `hamstergres_proxy_queries_total` | queries | `outcome`: `success`, `failure` |
-| `hamstergres_proxy_query_failures_total` | failures | bounded `category` values |
-| `hamstergres_proxy_query_routes_total` | queries | `route`: `single_burrow`, `scatter` |
-| `hamstergres_proxy_query_duration_seconds` | seconds | histogram bucket `le` only |
-| `hamstergres_proxy_burrow_executions_total` | executions | configured `burrow` |
-| `hamstergres_proxy_burrow_up` | boolean | configured `burrow` |
-| `hamstergres_proxy_schema_revision` | revision | process-applied Nest schema revision |
-| `hamstergres_proxy_topology_revision` | revision | process-applied Nest topology revision |
-| `hamstergres_proxy_backend_pool_connections` | connections | configured `burrow`; `state`: `capacity`, `in_use`, `idle` |
-| `hamstergres_proxy_backend_pool_acquire_total` | acquisitions | configured `burrow`; `outcome`: `success`, `canceled` |
-| `hamstergres_proxy_backend_pool_wait_total` | waits | configured `burrow` |
-| `hamstergres_proxy_backend_pool_acquire_duration_seconds_total` | seconds | configured `burrow` |
-| `hamstergres_proxy_operations_total` | operations | bounded `operation` and `outcome` values below |
+| Metric                                                          | Unit         | Labels                                                     |
+| --------------------------------------------------------------- | ------------ | ---------------------------------------------------------- |
+| `hamstergres_proxy_uptime_seconds`                              | seconds      | none                                                       |
+| `hamstergres_proxy_frontend_connections`                        | connections  | `state`: `active`, `total`                                 |
+| `hamstergres_proxy_queries_total`                               | queries      | `outcome`: `success`, `failure`                            |
+| `hamstergres_proxy_query_failures_total`                        | failures     | bounded `category` values                                  |
+| `hamstergres_proxy_query_routes_total`                          | queries      | `route`: `single_burrow`, `scatter`                        |
+| `hamstergres_proxy_query_duration_seconds`                      | seconds      | histogram bucket `le` only                                 |
+| `hamstergres_proxy_burrow_executions_total`                     | executions   | configured `burrow`                                        |
+| `hamstergres_proxy_burrow_up`                                   | boolean      | configured `burrow`                                        |
+| `hamstergres_proxy_schema_revision`                             | revision     | process-applied Nest schema revision                       |
+| `hamstergres_proxy_topology_revision`                           | revision     | process-applied Nest topology revision                     |
+| `hamstergres_proxy_backend_pool_connections`                    | connections  | configured `burrow`; `state`: `capacity`, `in_use`, `idle` |
+| `hamstergres_proxy_backend_pool_acquire_total`                  | acquisitions | configured `burrow`; `outcome`: `success`, `canceled`      |
+| `hamstergres_proxy_backend_pool_wait_total`                     | waits        | configured `burrow`                                        |
+| `hamstergres_proxy_backend_pool_acquire_duration_seconds_total` | seconds      | configured `burrow`                                        |
+| `hamstergres_proxy_operations_total`                            | operations   | bounded `operation` and `outcome` values below             |
 
 Operational values are fixed in code: `backend_connection`, `backend_query`,
 `copy`, `generated_id_allocation`, `nest_request`, `nest_registry_write`,
@@ -518,11 +519,11 @@ including `sql_error`, `data_error`, `transaction_error`, `unsafe_routing`,
 IDs, errors, query shapes, and other runtime values never appear in metric
 labels.
 
-Keep the status listener on a private operator network or place an
-authenticated reverse proxy in front of it. `/metrics`, `/api/v1/status`, and
-the HTML status page expose topology and traffic volumes and do not implement
-authentication themselves. Observability is local and pull-based by default;
-a slow or unavailable scraper cannot block PostgreSQL query processing.
+Keep the status listener on a private operator network or place an authenticated
+reverse proxy in front of it. `/metrics`, `/api/v1/status`, and the HTML status
+page expose topology and traffic volumes and do not implement authentication
+themselves. Observability is local and pull-based by default; a slow or
+unavailable scraper cannot block PostgreSQL query processing.
 
 Go runtime profiles are disabled by default. Set `status.profiling: true` only
 on a private diagnostic listener to expose `/debug/pprof/` CPU, allocation,
@@ -554,9 +555,9 @@ through `host.docker.internal:8080`, so rebuilding or containerizing the Proxy
 is not required. On Linux, Compose supplies the equivalent `host-gateway`
 mapping automatically.
 
-Open Grafana at <http://127.0.0.1:3000> and sign in with `admin` / `admin`.
-The provisioned **Hamstergres Demo Overview** dashboard is ready without any
-manual data-source or dashboard import. Prometheus is available at
+Open Grafana at <http://127.0.0.1:3000> and sign in with `admin` / `admin`. The
+provisioned **Hamstergres Demo Overview** dashboard is ready without any manual
+data-source or dashboard import. Prometheus is available at
 <http://127.0.0.1:9090>, Proxy status at <http://127.0.0.1:8080>, and the
 PostgreSQL client endpoint at `127.0.0.1:6432`. All published ports bind to
 loopback by default and can be changed with `GRAFANA_PORT`, `PROMETHEUS_PORT`,
@@ -579,19 +580,20 @@ The PostgreSQL exporters use the `pg_monitor` role created by
 the Burrow data volumes predate that initialization script, run
 `docker compose down --volumes` once to recreate this disposable demo data.
 
-This Compose environment is a local demonstration, not a production-hardened monitoring
-deployment. Its defaults intentionally use well-known development passwords,
-no TLS, no Grafana secret management, no metrics authentication, and local
-named volumes. Use managed secrets, authentication, TLS, retention/resource
-limits, backups, and your normal access controls in a real environment.
+This Compose environment is a local demonstration, not a production-hardened
+monitoring deployment. Its defaults intentionally use well-known development
+passwords, no TLS, no Grafana secret management, no metrics authentication, and
+local named volumes. Use managed secrets, authentication, TLS,
+retention/resource limits, backups, and your normal access controls in a real
+environment.
 
 Structured operational events use stable `event`, `component`, `burrow`,
 `transaction_id`, and `error_category` fields where applicable. Set
 `observability.log_file` to append JSON logs to a local file created with mode
 `0600`. Leaving it empty keeps the normal stderr logger. Hamstergres Proxy does
 not submit or export logs to an external service. If the configured file cannot
-be opened, the Proxy emits `logging_configuration_failed`, falls back to JSON
-on stderr, and continues serving queries.
+be opened, the Proxy emits `logging_configuration_failed`, falls back to JSON on
+stderr, and continues serving queries.
 
 Tracing hooks cover each frontend query and its selected Tunnel/Burrow
 executions. Export is disabled by default. To opt in, configure the standard
@@ -612,11 +614,11 @@ make proxy-status
 # or: go run ./cmd/hamstergres-proxy status --status-url http://host:8080/api/v1/status
 ```
 
-The binary is intentionally structured as a CLI (`hamstergres-proxy status`)
-so `add-shard` and `remove-shard` commands can be added without changing the
+The binary is intentionally structured as a CLI (`hamstergres-proxy status`) so
+`add-shard` and `remove-shard` commands can be added without changing the
 gateway process contract.
 
 ## License
 
-Hamstergres is licensed under the [GNU Affero General Public License v3.0](LICENSE)
-only (`AGPL-3.0-only`).
+Hamstergres is licensed under the
+[GNU Affero General Public License v3.0](LICENSE) only (`AGPL-3.0-only`).
