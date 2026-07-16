@@ -20,12 +20,13 @@ import (
 
 func TestStartupRuntimeParametersPreservePostgreSQLClientSettings(t *testing.T) {
 	startup := &pgproto3.StartupMessage{Parameters: map[string]string{
-		"user":        "hamster",
-		"database":    "regression",
-		"datestyle":   "Postgres, MDY",
-		"timezone":    "America/Los_Angeles",
-		"options":     "-c intervalstyle=postgres_verbose --search_path=public -capplication_name=pg_regress",
-		"unsupported": "ignored",
+		"user":             "hamster",
+		"database":         "regression",
+		"datestyle":        "Postgres, MDY",
+		"timezone":         "America/Los_Angeles",
+		"application_name": "direct_name",
+		"options":          "-c intervalstyle=postgres_verbose --search_path=public -ctimezone=UTC -capplication_name=options_name",
+		"unsupported":      "ignored",
 	}}
 	got := startupRuntimeParameters(startup)
 	want := map[string]string{
@@ -33,7 +34,7 @@ func TestStartupRuntimeParametersPreservePostgreSQLClientSettings(t *testing.T) 
 		"TimeZone":         "America/Los_Angeles",
 		"IntervalStyle":    "postgres_verbose",
 		"search_path":      "public",
-		"application_name": "pg_regress",
+		"application_name": "direct_name",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("startup runtime parameters = %#v, want %#v", got, want)
@@ -55,8 +56,52 @@ func TestPostgresErrorResponsePreservesStructuredFields(t *testing.T) {
 		response.Where != postgresError.Where || response.SchemaName != postgresError.SchemaName || response.TableName != postgresError.TableName ||
 		response.ColumnName != postgresError.ColumnName || response.DataTypeName != postgresError.DataTypeName ||
 		response.ConstraintName != postgresError.ConstraintName || response.File != postgresError.File || response.Line != postgresError.Line ||
-		response.Routine != postgresError.Routine || response.SeverityUnlocalized != postgresError.SeverityUnlocalized {
+		response.Routine != postgresError.Routine || response.Severity != postgresError.Severity ||
+		response.SeverityUnlocalized != postgresError.SeverityUnlocalized {
 		t.Fatalf("structured PostgreSQL error changed: %#v", response)
+	}
+}
+
+func TestSendStartupReportsEffectiveRuntimeParameters(t *testing.T) {
+	var wire bytes.Buffer
+	frontend := pgproto3.NewBackend(bytes.NewReader(nil), &wire)
+	if err := (&Server{}).sendStartup(frontend, map[string]string{"standard_conforming_strings": "off"}); err != nil {
+		t.Fatal(err)
+	}
+
+	client := pgproto3.NewFrontend(bytes.NewReader(wire.Bytes()), io.Discard)
+	statuses := make(map[string]string)
+	for {
+		message, err := client.Receive()
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch message := message.(type) {
+		case *pgproto3.ParameterStatus:
+			statuses[message.Name] = message.Value
+		case *pgproto3.ReadyForQuery:
+			want := map[string]string{
+				"DateStyle":                   "ISO, MDY",
+				"IntervalStyle":               "postgres",
+				"TimeZone":                    "UTC",
+				"standard_conforming_strings": "off",
+			}
+			for name, value := range want {
+				if statuses[name] != value {
+					t.Fatalf("ParameterStatus %s = %q, want %q", name, statuses[name], value)
+				}
+			}
+			return
+		}
+	}
+}
+
+func TestStartupSessionAffinityIgnoresApplicationName(t *testing.T) {
+	if requiresStartupSessionAffinity(map[string]string{"application_name": "pg_regress"}) {
+		t.Fatal("application_name unexpectedly requires session affinity")
+	}
+	if !requiresStartupSessionAffinity(map[string]string{"DateStyle": "SQL, DMY"}) {
+		t.Fatal("formatting-sensitive DateStyle did not require session affinity")
 	}
 }
 
@@ -84,7 +129,7 @@ func TestCloneFrontendMessageOwnsCopyAndBindBuffers(t *testing.T) {
 
 func TestPendingExtendedFailureAtSyncEmitsReadyForQuery(t *testing.T) {
 	manager := &backend.Manager{}
-	session, err := manager.NewSession(t.Context())
+	session, err := manager.NewSession(t.Context(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +195,7 @@ func TestPendingFleetWriteFailureReleasesGateOutsideTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer manager.Close()
-	session, err := manager.NewSession(t.Context())
+	session, err := manager.NewSession(t.Context(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +205,7 @@ func TestPendingFleetWriteFailureReleasesGateOutsideTransaction(t *testing.T) {
 		t.Fatal("failed pending fleet write reported success")
 	}
 
-	next, err := manager.NewSession(t.Context())
+	next, err := manager.NewSession(t.Context(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +223,7 @@ func TestPendingFleetWriteFailurePreservesGateDuringTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer manager.Close()
-	session, err := manager.NewSession(t.Context())
+	session, err := manager.NewSession(t.Context(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +233,7 @@ func TestPendingFleetWriteFailurePreservesGateDuringTransaction(t *testing.T) {
 		t.Fatal("failed pending fleet write reported success")
 	}
 
-	next, err := manager.NewSession(t.Context())
+	next, err := manager.NewSession(t.Context(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

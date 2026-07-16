@@ -312,12 +312,31 @@ func TestBuiltInAggregateNames(t *testing.T) {
 }
 
 func TestAnalyzeExplainReturnsOneLogicalPlan(t *testing.T) {
-	plan, err := Analyze("EXPLAIN (COSTS OFF) SELECT * FROM text_tbl", nil, schema.Registry{}, []string{"burrow-01", "burrow-02"})
+	burrows := []string{"burrow-01", "burrow-02"}
+	plan, err := Analyze("EXPLAIN (COSTS OFF) SELECT * FROM text_tbl", nil, schema.Registry{}, burrows)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !plan.SingleBurrow || plan.Routed {
 		t.Fatalf("EXPLAIN plan = %#v, want one topology-transparent Burrow", plan)
+	}
+
+	registry := schema.New(map[string][]string{"accounts": {"tenant_id"}})
+	keyedWrite, err := Analyze("EXPLAIN ANALYZE INSERT INTO accounts (tenant_id) VALUES (42)", nil, registry, burrows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantTarget := BurrowForKey("42", burrows)
+	if keyedWrite.SingleBurrow || !keyedWrite.Write || !keyedWrite.Sharded || !keyedWrite.Routed || keyedWrite.Target != wantTarget {
+		t.Fatalf("keyed EXPLAIN ANALYZE write = %#v, want routed Burrow %q", keyedWrite, wantTarget)
+	}
+
+	unkeyedWrite, err := Analyze("EXPLAIN ANALYZE UPDATE accounts SET payload = 'changed'", nil, registry, burrows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unkeyedWrite.SingleBurrow || !unkeyedWrite.Write || !unkeyedWrite.Sharded || unkeyedWrite.Routed {
+		t.Fatalf("unkeyed EXPLAIN ANALYZE write = %#v, want shard-key requirement", unkeyedWrite)
 	}
 }
 

@@ -104,8 +104,13 @@ func Prepare(sql string) (*Prepared, error) {
 	case *pg_query.Node_VariableShowStmt:
 		prepared.read = true
 	case *pg_query.Node_ExplainStmt:
+		if explainAnalyze(value.ExplainStmt) && prepareExplainWrite(prepared, value.ExplainStmt.Query) {
+			break
+		}
 		// EXPLAIN describes one logical PostgreSQL plan. Returning one copy per
 		// Burrow exposes fan-out and duplicates every plan row at the frontend.
+		// EXPLAIN ANALYZE writes are different: they execute the wrapped DML and
+		// therefore retain its shard-key routing and fail-closed behavior.
 		prepared.plan.SingleBurrow = true
 	default:
 	}
@@ -120,6 +125,54 @@ func Prepare(sql string) (*Prepared, error) {
 	}
 	prepared.plan.Table = relationName(prepared.relation)
 	return prepared, nil
+}
+
+func explainAnalyze(statement *pg_query.ExplainStmt) bool {
+	if statement == nil {
+		return false
+	}
+	for _, optionNode := range statement.Options {
+		option := optionNode.GetDefElem()
+		if option == nil || !strings.EqualFold(option.Defname, "analyze") {
+			continue
+		}
+		value := option.Arg.GetBoolean()
+		return value == nil || value.Boolval
+	}
+	return false
+}
+
+func prepareExplainWrite(prepared *Prepared, statement *pg_query.Node) bool {
+	if prepared == nil || statement == nil {
+		return false
+	}
+	switch value := statement.GetNode().(type) {
+	case *pg_query.Node_InsertStmt:
+		prepared.plan.Write = true
+		prepared.insert = value.InsertStmt
+		prepared.relation = value.InsertStmt.Relation
+	case *pg_query.Node_UpdateStmt:
+		prepared.plan.Write = true
+		prepared.update = value.UpdateStmt
+		prepared.relation = value.UpdateStmt.Relation
+		prepared.predicate = value.UpdateStmt.WhereClause
+		if value.UpdateStmt.WithClause != nil || len(value.UpdateStmt.FromClause) != 0 {
+			prepared.predicate = nil
+		}
+	case *pg_query.Node_DeleteStmt:
+		prepared.plan.Write = true
+		prepared.relation = value.DeleteStmt.Relation
+		prepared.predicate = value.DeleteStmt.WhereClause
+		if value.DeleteStmt.WithClause != nil || len(value.DeleteStmt.UsingClause) != 0 {
+			prepared.predicate = nil
+		}
+	case *pg_query.Node_MergeStmt:
+		prepared.plan.Write = true
+		prepared.relation = value.MergeStmt.Relation
+	default:
+		return false
+	}
+	return true
 }
 
 // MaxParameter returns the highest real ParamRef found while preparing the

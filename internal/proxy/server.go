@@ -101,22 +101,18 @@ func (s *Server) serveConn(conn net.Conn) error {
 }
 
 func (s *Server) sendStartup(frontend *pgproto3.Backend, runtimeParams map[string]string) error {
-	dateStyle := "ISO, MDY"
-	if requested := runtimeParams["DateStyle"]; requested != "" {
-		dateStyle = requested
-	}
+	dateStyle := runtimeParamOrDefault(runtimeParams, "DateStyle", "ISO, MDY")
+	intervalStyle := runtimeParamOrDefault(runtimeParams, "IntervalStyle", "postgres")
+	standardConformingStrings := runtimeParamOrDefault(runtimeParams, "standard_conforming_strings", "on")
+	timezone := runtimeParamOrDefault(runtimeParams, "TimeZone", "UTC")
 	frontend.Send(&pgproto3.AuthenticationOk{})
 	frontend.Send(&pgproto3.ParameterStatus{Name: "client_encoding", Value: "UTF8"})
 	frontend.Send(&pgproto3.ParameterStatus{Name: "DateStyle", Value: dateStyle})
 	frontend.Send(&pgproto3.ParameterStatus{Name: "integer_datetimes", Value: "on"})
-	if intervalStyle := runtimeParams["IntervalStyle"]; intervalStyle != "" {
-		frontend.Send(&pgproto3.ParameterStatus{Name: "IntervalStyle", Value: intervalStyle})
-	}
+	frontend.Send(&pgproto3.ParameterStatus{Name: "IntervalStyle", Value: intervalStyle})
 	frontend.Send(&pgproto3.ParameterStatus{Name: "server_version", Value: "17.0"})
-	frontend.Send(&pgproto3.ParameterStatus{Name: "standard_conforming_strings", Value: "on"})
-	if timezone := runtimeParams["TimeZone"]; timezone != "" {
-		frontend.Send(&pgproto3.ParameterStatus{Name: "TimeZone", Value: timezone})
-	}
+	frontend.Send(&pgproto3.ParameterStatus{Name: "standard_conforming_strings", Value: standardConformingStrings})
+	frontend.Send(&pgproto3.ParameterStatus{Name: "TimeZone", Value: timezone})
 	frontend.Send(&pgproto3.BackendKeyData{
 		ProcessID: randomUint32(),
 		SecretKey: binary.BigEndian.AppendUint32(nil, randomUint32()),
@@ -125,24 +121,40 @@ func (s *Server) sendStartup(frontend *pgproto3.Backend, runtimeParams map[strin
 	return frontend.Flush()
 }
 
+func runtimeParamOrDefault(runtimeParams map[string]string, name, defaultValue string) string {
+	if value := runtimeParams[name]; value != "" {
+		return value
+	}
+	return defaultValue
+}
+
 func startupRuntimeParameters(startup *pgproto3.StartupMessage) map[string]string {
 	parameters := make(map[string]string)
 	if startup == nil {
 		return parameters
 	}
-	for name, value := range startup.Parameters {
-		switch strings.ToLower(name) {
-		case "datestyle":
-			parameters["DateStyle"] = value
-		case "timezone":
-			parameters["TimeZone"] = value
-		case "application_name":
-			parameters["application_name"] = value
-		case "options":
-			parseStartupOptions(parameters, value)
+	if options, ok := startupParameter(startup.Parameters, "options"); ok {
+		parseStartupOptions(parameters, options)
+	}
+	for _, direct := range []struct{ startup, runtime string }{
+		{startup: "datestyle", runtime: "DateStyle"},
+		{startup: "timezone", runtime: "TimeZone"},
+		{startup: "application_name", runtime: "application_name"},
+	} {
+		if value, ok := startupParameter(startup.Parameters, direct.startup); ok {
+			parameters[direct.runtime] = value
 		}
 	}
 	return parameters
+}
+
+func startupParameter(parameters map[string]string, wanted string) (string, bool) {
+	for name, value := range parameters {
+		if strings.EqualFold(name, wanted) {
+			return value, true
+		}
+	}
+	return "", false
 }
 
 func parseStartupOptions(parameters map[string]string, options string) {
@@ -169,6 +181,10 @@ func parseStartupOptions(parameters map[string]string, options string) {
 			name = "TimeZone"
 		case "intervalstyle":
 			name = "IntervalStyle"
+		case "standard_conforming_strings":
+			name = "standard_conforming_strings"
+		case "application_name":
+			name = "application_name"
 		}
 		parameters[name] = value
 	}
@@ -218,7 +234,7 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend, runtimeParams map[stri
 		}
 	}()
 
-	state := extendedState{statements: make(map[string]statementState), portals: make(map[string]portalState), writeParticipants: make(map[string]struct{})}
+	state := extendedState{statements: make(map[string]statementState), portals: make(map[string]portalState), writeParticipants: make(map[string]struct{}), sessionAffinity: requiresStartupSessionAffinity(runtimeParams)}
 	defer finishCopyTrace(&state, fmt.Errorf("frontend session ended during COPY"))
 	var session *backend.Session
 	defer func() {
@@ -477,10 +493,24 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend, runtimeParams map[stri
 			session = nil
 			s.backends.RecordOperation("backend_connection_multiplex", "release")
 		}
+		if _, query := message.(*pgproto3.Query); query && session != nil && !state.transaction && !state.sessionAffinity && !state.copyIn && state.pending == nil && !state.failed {
+			session.Close(context.Background(), true)
+			session = nil
+			s.backends.RecordOperation("backend_connection_multiplex", "release")
+		}
 		if err := frontend.Flush(); err != nil {
 			return err
 		}
 	}
+}
+
+func requiresStartupSessionAffinity(runtimeParams map[string]string) bool {
+	for name := range runtimeParams {
+		if !strings.EqualFold(name, "application_name") {
+			return true
+		}
+	}
+	return false
 }
 
 func cloneFrontendMessage(message pgproto3.FrontendMessage) pgproto3.FrontendMessage {
@@ -1972,17 +2002,11 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 
 	var responses [][]pgproto3.BackendMessage
 	var tunnelSpans []trace.Span
-	decision := routeDecision{}
-	if parserFallback {
-		decision.target = s.parserFallbackBurrow(targets)
-		decision.routed = decision.target != ""
-	} else {
-		decision, err = s.routePortal(routing, nil, targets)
-		if err != nil {
-			errorCategory = "sql_error"
-			s.sendSessionError(frontend, state.txStatus(), "42601", err.Error())
-			return false
-		}
+	decision, err := s.resolveRouteDecision(routing, err, targets)
+	if err != nil {
+		errorCategory = "sql_error"
+		s.sendSessionError(frontend, state.txStatus(), "42601", err.Error())
+		return false
 	}
 	target, routed := decision.target, decision.routed
 	if decision.scatterError != "" {
@@ -2265,6 +2289,14 @@ func (s *Server) routePortal(prepared *router.Prepared, parameters [][]byte, bur
 		return s.routePlan(router.Plan{}, burrows), nil
 	}
 	return s.routePlan(prepared.Analyze(parameters, s.backends.Schema(), burrows), burrows), nil
+}
+
+func (s *Server) resolveRouteDecision(prepared *router.Prepared, prepareErr error, burrows []string) (routeDecision, error) {
+	if prepareErr != nil {
+		target := s.parserFallbackBurrow(burrows)
+		return routeDecision{target: target, routed: target != ""}, nil
+	}
+	return s.routePortal(prepared, nil, burrows)
 }
 
 func (s *Server) routePlan(plan router.Plan, burrows []string) routeDecision {
@@ -2550,17 +2582,11 @@ func (s *Server) handleQuery(frontend *pgproto3.Backend, sql string) {
 		defer unlock()
 	}
 	var result backend.Result
-	decision := routeDecision{}
-	if parserFallback {
-		decision.target = s.parserFallbackBurrow(s.backends.ShardNames())
-		decision.routed = decision.target != ""
-	} else {
-		decision, err = s.routePortal(routing, nil, s.backends.ShardNames())
-		if err != nil {
-			errorCategory = "sql_error"
-			s.sendError(frontend, "42601", err.Error())
-			return
-		}
+	decision, err := s.resolveRouteDecision(routing, err, s.backends.ShardNames())
+	if err != nil {
+		errorCategory = "sql_error"
+		s.sendError(frontend, "42601", err.Error())
+		return
 	}
 	target, routed := decision.target, decision.routed
 	if decision.scatterError != "" {

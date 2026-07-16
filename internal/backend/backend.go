@@ -59,6 +59,8 @@ type Manager struct {
 	topologyRevision uint64
 	preparedMu       sync.Mutex
 	prepared         map[string]map[string]struct{}
+	runtimeParamsMu  sync.Mutex
+	runtimeParams    map[string]map[string]string
 	unshardedMode    string
 	primaryBurrow    string
 }
@@ -72,7 +74,7 @@ func New(ctx context.Context, cfg config.Config) (*Manager, error) {
 	if primary == "" && len(cfg.ShardNames()) > 0 {
 		primary = cfg.ShardNames()[0]
 	}
-	m := &Manager{metrics: statistics.NewCollector(), fleetWriteGate: newFleetWriteGate(), prepared: make(map[string]map[string]struct{}), unshardedMode: mode, primaryBurrow: primary}
+	m := &Manager{metrics: statistics.NewCollector(), fleetWriteGate: newFleetWriteGate(), prepared: make(map[string]map[string]struct{}), runtimeParams: make(map[string]map[string]string), unshardedMode: mode, primaryBurrow: primary}
 	for _, name := range cfg.ShardNames() {
 		poolConfig, err := pgxpool.ParseConfig(cfg.Sharding.PhysicalShards[name].DSN)
 		if err != nil {
@@ -83,6 +85,10 @@ func New(ctx context.Context, cfg config.Config) (*Manager, error) {
 		if poolConfig.ConnConfig.RuntimeParams == nil {
 			poolConfig.ConnConfig.RuntimeParams = make(map[string]string)
 		}
+		poolConfig.ConnConfig.RuntimeParams["DateStyle"] = "ISO, MDY"
+		poolConfig.ConnConfig.RuntimeParams["IntervalStyle"] = "postgres"
+		poolConfig.ConnConfig.RuntimeParams["TimeZone"] = "UTC"
+		poolConfig.ConnConfig.RuntimeParams["standard_conforming_strings"] = "on"
 		poolConfig.ConnConfig.RuntimeParams["lock_timeout"] = cfg.TransactionLockTimeout()
 		afterRelease := poolConfig.AfterRelease
 		poolConfig.AfterRelease = func(connection *pgx.Conn) bool {
@@ -98,6 +104,7 @@ func New(ctx context.Context, cfg config.Config) (*Manager, error) {
 		beforeClose := poolConfig.BeforeClose
 		poolConfig.BeforeClose = func(connection *pgx.Conn) {
 			m.forgetPreparedConnection(name, connection.PgConn().PID())
+			m.forgetRuntimeParams(name, connection.PgConn().PID())
 			if beforeClose != nil {
 				beforeClose(connection)
 			}
@@ -415,14 +422,8 @@ type sessionShard struct {
 // NewSession creates an empty affinity session. Connections are acquired on
 // first use by SendTo or SendBatchTo, so parsing, validation, and routed work do
 // not contact unrelated Burrows. The caller must close the returned session.
-func (m *Manager) NewSession(ctx context.Context, runtimeParams ...map[string]string) (*Session, error) {
-	parameters := make(map[string]string)
-	if len(runtimeParams) > 0 {
-		for name, value := range runtimeParams[0] {
-			parameters[name] = value
-		}
-	}
-	return &Session{shards: make(map[string]*sessionShard), runtimeParams: parameters, fleetWriteGate: m.fleetWriteGate, ctx: ctx, manager: m}, nil
+func (m *Manager) NewSession(ctx context.Context, runtimeParams map[string]string) (*Session, error) {
+	return &Session{shards: make(map[string]*sessionShard), runtimeParams: runtimeParams, fleetWriteGate: m.fleetWriteGate, ctx: ctx, manager: m}, nil
 }
 
 func (s *Session) acquire(name string) (*sessionShard, error) {
@@ -448,22 +449,28 @@ func (s *Session) acquire(name string) (*sessionShard, error) {
 		slog.Error("Burrow session connection failed", "event", "backend_connection_failed", "component", "hamstergres-proxy", "burrow", target.name, "error_category", "burrow_unavailable", "error", err)
 		return nil, fmt.Errorf("connect session to Burrow %s: %w", target.name, err)
 	}
-	parameterNames := make([]string, 0, len(s.runtimeParams))
-	for parameter := range s.runtimeParams {
+	connectionKey := preparedConnectionKey(target.name, pooled.Conn().PgConn().PID())
+	changedRuntimeParams := s.manager.changedRuntimeParams(connectionKey, s.runtimeParams)
+	parameterNames := make([]string, 0, len(changedRuntimeParams))
+	for parameter := range changedRuntimeParams {
 		parameterNames = append(parameterNames, parameter)
 	}
 	sort.Strings(parameterNames)
 	for _, parameter := range parameterNames {
-		if _, err := pooled.Exec(s.Context(), "SELECT set_config($1, $2, false)", parameter, s.runtimeParams[parameter]); err != nil {
+		value := changedRuntimeParams[parameter]
+		if _, err := pooled.Exec(s.Context(), "SELECT set_config($1, $2, false)", parameter, value); err != nil {
 			connection := pooled.Hijack()
+			s.manager.forgetRuntimeParams(target.name, connection.PgConn().PID())
 			_ = connection.Close(context.Background())
 			s.manager.RecordOperation("backend_connection", "failure")
 			return nil, fmt.Errorf("apply frontend setting %s on Burrow %s: %w", parameter, target.name, err)
 		}
+		s.manager.rememberRuntimeParam(connectionKey, parameter, value)
 	}
 	if err := s.manager.syncPreparedStatements(s.Context(), target.name, pooled.Conn()); err != nil {
 		connection := pooled.Hijack()
 		s.manager.forgetPreparedConnection(target.name, connection.PgConn().PID())
+		s.manager.forgetRuntimeParams(target.name, connection.PgConn().PID())
 		_ = connection.Close(context.Background())
 		s.manager.RecordOperation("backend_connection", "failure")
 		return nil, fmt.Errorf("synchronize prepared statements on Burrow %s: %w", target.name, err)
@@ -473,6 +480,37 @@ func (s *Session) acquire(name string) (*sessionShard, error) {
 	s.shards[target.name] = connection
 	s.manager.RecordOperation("backend_connection", "success")
 	return connection, nil
+}
+
+func (m *Manager) changedRuntimeParams(connectionKey string, desired map[string]string) map[string]string {
+	m.runtimeParamsMu.Lock()
+	defer m.runtimeParamsMu.Unlock()
+	current := m.runtimeParams[connectionKey]
+	changed := make(map[string]string)
+	for name, value := range desired {
+		if current == nil || current[name] != value {
+			changed[name] = value
+		}
+	}
+	return changed
+}
+
+func (m *Manager) rememberRuntimeParam(connectionKey, name, value string) {
+	m.runtimeParamsMu.Lock()
+	defer m.runtimeParamsMu.Unlock()
+	if m.runtimeParams == nil {
+		m.runtimeParams = make(map[string]map[string]string)
+	}
+	if m.runtimeParams[connectionKey] == nil {
+		m.runtimeParams[connectionKey] = make(map[string]string)
+	}
+	m.runtimeParams[connectionKey][name] = value
+}
+
+func (m *Manager) forgetRuntimeParams(name string, processID uint32) {
+	m.runtimeParamsMu.Lock()
+	defer m.runtimeParamsMu.Unlock()
+	delete(m.runtimeParams, preparedConnectionKey(name, processID))
 }
 
 // Ensure acquires one Burrow affinity connection without sending a frontend
@@ -930,6 +968,7 @@ func (s *Session) Close(ctx context.Context, reusable ...bool) {
 			s.manager.preparedMu.Lock()
 			delete(s.manager.prepared, key)
 			s.manager.preparedMu.Unlock()
+			s.manager.forgetRuntimeParams(shard.name, shard.conn.PID())
 		}
 	}
 	if s.manager != nil {
