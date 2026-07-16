@@ -85,6 +85,8 @@ func TestRequiresSessionAffinityForSessionSettings(t *testing.T) {
 		"LISTEN events",
 		"UNLISTEN events",
 		"PREPARE lookup AS SELECT 1",
+		"SELECT 1; SET search_path = private, public",
+		"SELECT 1; SET ROLE application_user",
 	} {
 		if !requiresSessionAffinity(sql) {
 			t.Fatalf("requiresSessionAffinity(%q) = false", sql)
@@ -92,6 +94,9 @@ func TestRequiresSessionAffinityForSessionSettings(t *testing.T) {
 	}
 	if requiresSessionAffinity("SELECT 1") {
 		t.Fatal("ordinary query unexpectedly requires session affinity")
+	}
+	if requiresSessionAffinity("SELECT 'SET ROLE application_user'") {
+		t.Fatal("affinity command text inside a literal required session affinity")
 	}
 }
 

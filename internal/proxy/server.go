@@ -1831,6 +1831,9 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 		frontend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 		return true
 	}
+	if requiresSessionAffinity(sql) {
+		state.sessionAffinity = true
+	}
 	if state.transaction && !state.transactionFailed && state.mutated && s.twoPhaseCommit && (firstSQLKeyword(sql) == "COMMIT" || firstSQLKeyword(sql) == "END") && len(state.writeParticipants) > 1 {
 		return s.handleTwoPhaseCommit(frontend, session, state)
 	}
@@ -2009,9 +2012,6 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 		recordWriteParticipants(state, sql, targets)
 	}
 	updateTransactionState(state, sql)
-	if requiresSessionAffinity(sql) {
-		state.sessionAffinity = true
-	}
 	if invalidatesPreparedStatements(sql) {
 		s.backends.InvalidatePreparedStatements(targets)
 	}
@@ -2366,12 +2366,24 @@ func containsCopyStatement(sql string) bool {
 }
 
 func requiresSessionAffinity(sql string) bool {
-	switch firstSQLKeyword(sql) {
-	case "SET", "RESET", "DISCARD", "LISTEN", "UNLISTEN", "PREPARE":
-		return true
-	default:
+	tree, err := pg_query.Parse(sql)
+	if err != nil {
+		switch firstSQLKeyword(sql) {
+		case "SET", "RESET", "DISCARD", "LISTEN", "UNLISTEN", "PREPARE":
+			return true
+		}
 		return false
 	}
+	for _, raw := range tree.Stmts {
+		statement := raw.Stmt
+		if statement == nil {
+			continue
+		}
+		if statement.GetVariableSetStmt() != nil || statement.GetDiscardStmt() != nil || statement.GetListenStmt() != nil || statement.GetUnlistenStmt() != nil || statement.GetPrepareStmt() != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) handleQuery(frontend *pgproto3.Backend, sql string) {
