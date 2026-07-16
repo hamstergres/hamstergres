@@ -71,6 +71,7 @@ func TestSendStartupReportsEffectiveRuntimeParameters(t *testing.T) {
 
 	client := pgproto3.NewFrontend(bytes.NewReader(wire.Bytes()), io.Discard)
 	statuses := make(map[string]string)
+	statusCounts := make(map[string]int)
 	for {
 		message, err := client.Receive()
 		if err != nil {
@@ -78,6 +79,10 @@ func TestSendStartupReportsEffectiveRuntimeParameters(t *testing.T) {
 		}
 		switch message := message.(type) {
 		case *pgproto3.ParameterStatus:
+			statusCounts[message.Name]++
+			if statusCounts[message.Name] > 1 {
+				t.Fatalf("ParameterStatus %s emitted %d times, want once", message.Name, statusCounts[message.Name])
+			}
 			statuses[message.Name] = message.Value
 		case *pgproto3.ReadyForQuery:
 			want := map[string]string{

@@ -104,7 +104,8 @@ func Prepare(sql string) (*Prepared, error) {
 	case *pg_query.Node_VariableShowStmt:
 		prepared.read = true
 	case *pg_query.Node_ExplainStmt:
-		if explainAnalyze(value.ExplainStmt) && prepareExplainWrite(prepared, value.ExplainStmt.Query) {
+		if explainAnalyze(value.ExplainStmt) && prepared.plan.Write {
+			prepareExplainWrite(prepared, value.ExplainStmt.Query)
 			break
 		}
 		// EXPLAIN describes one logical PostgreSQL plan. Returning one copy per

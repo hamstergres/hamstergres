@@ -60,9 +60,14 @@ type Manager struct {
 	preparedMu       sync.Mutex
 	prepared         map[string]map[string]struct{}
 	runtimeParamsMu  sync.Mutex
-	runtimeParams    map[string]map[string]string
+	runtimeParams    map[string]*runtimeParamState
 	unshardedMode    string
 	primaryBurrow    string
+}
+
+type runtimeParamState struct {
+	baseline map[string]string
+	current  map[string]string
 }
 
 func New(ctx context.Context, cfg config.Config) (*Manager, error) {
@@ -74,7 +79,7 @@ func New(ctx context.Context, cfg config.Config) (*Manager, error) {
 	if primary == "" && len(cfg.ShardNames()) > 0 {
 		primary = cfg.ShardNames()[0]
 	}
-	m := &Manager{metrics: statistics.NewCollector(), fleetWriteGate: newFleetWriteGate(), prepared: make(map[string]map[string]struct{}), runtimeParams: make(map[string]map[string]string), unshardedMode: mode, primaryBurrow: primary}
+	m := &Manager{metrics: statistics.NewCollector(), fleetWriteGate: newFleetWriteGate(), prepared: make(map[string]map[string]struct{}), runtimeParams: make(map[string]*runtimeParamState), unshardedMode: mode, primaryBurrow: primary}
 	for _, name := range cfg.ShardNames() {
 		poolConfig, err := pgxpool.ParseConfig(cfg.Sharding.PhysicalShards[name].DSN)
 		if err != nil {
@@ -449,23 +454,9 @@ func (s *Session) acquire(name string) (*sessionShard, error) {
 		slog.Error("Burrow session connection failed", "event", "backend_connection_failed", "component", "hamstergres-proxy", "burrow", target.name, "error_category", "burrow_unavailable", "error", err)
 		return nil, fmt.Errorf("connect session to Burrow %s: %w", target.name, err)
 	}
-	connectionKey := preparedConnectionKey(target.name, pooled.Conn().PgConn().PID())
-	changedRuntimeParams := s.manager.changedRuntimeParams(connectionKey, s.runtimeParams)
-	parameterNames := make([]string, 0, len(changedRuntimeParams))
-	for parameter := range changedRuntimeParams {
-		parameterNames = append(parameterNames, parameter)
-	}
-	sort.Strings(parameterNames)
-	for _, parameter := range parameterNames {
-		value := changedRuntimeParams[parameter]
-		if _, err := pooled.Exec(s.Context(), "SELECT set_config($1, $2, false)", parameter, value); err != nil {
-			connection := pooled.Hijack()
-			s.manager.forgetRuntimeParams(target.name, connection.PgConn().PID())
-			_ = connection.Close(context.Background())
-			s.manager.RecordOperation("backend_connection", "failure")
-			return nil, fmt.Errorf("apply frontend setting %s on Burrow %s: %w", parameter, target.name, err)
-		}
-		s.manager.rememberRuntimeParam(connectionKey, parameter, value)
+	if err := s.manager.applyRuntimeParams(s.Context(), target.name, pooled, s.runtimeParams); err != nil {
+		s.manager.RecordOperation("backend_connection", "failure")
+		return nil, err
 	}
 	if err := s.manager.syncPreparedStatements(s.Context(), target.name, pooled.Conn()); err != nil {
 		connection := pooled.Hijack()
@@ -482,29 +473,112 @@ func (s *Session) acquire(name string) (*sessionShard, error) {
 	return connection, nil
 }
 
+func (m *Manager) applyRuntimeParams(ctx context.Context, burrow string, connection *pgxpool.Conn, desired map[string]string) error {
+	connectionKey := preparedConnectionKey(burrow, connection.Conn().PgConn().PID())
+	if err := m.ensureRuntimeParamBaselines(ctx, connectionKey, connection, desired); err != nil {
+		m.discardRuntimeParamConnection(burrow, connection)
+		return fmt.Errorf("inspect frontend settings on Burrow %s: %w", burrow, err)
+	}
+	changed := m.changedRuntimeParams(connectionKey, desired)
+	names := make([]string, 0, len(changed))
+	for name := range changed {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		value := changed[name]
+		if _, err := connection.Exec(ctx, "SELECT set_config($1, $2, false)", name, value); err != nil {
+			m.discardRuntimeParamConnection(burrow, connection)
+			return fmt.Errorf("apply frontend setting %s on Burrow %s: %w", name, burrow, err)
+		}
+		m.rememberRuntimeParam(connectionKey, name, value)
+	}
+	return nil
+}
+
+func (m *Manager) discardRuntimeParamConnection(burrow string, pooled *pgxpool.Conn) {
+	connection := pooled.Hijack()
+	m.forgetRuntimeParams(burrow, connection.PgConn().PID())
+	_ = connection.Close(context.Background())
+}
+
+func (m *Manager) ensureRuntimeParamBaselines(ctx context.Context, connectionKey string, connection *pgxpool.Conn, desired map[string]string) error {
+	m.runtimeParamsMu.Lock()
+	state := m.runtimeParams[connectionKey]
+	missing := make([]string, 0, len(desired))
+	for name := range desired {
+		if state == nil {
+			missing = append(missing, name)
+			continue
+		}
+		if _, ok := state.baseline[name]; !ok {
+			missing = append(missing, name)
+		}
+	}
+	m.runtimeParamsMu.Unlock()
+	sort.Strings(missing)
+	for _, name := range missing {
+		var value string
+		if err := connection.QueryRow(ctx, "SELECT current_setting($1)", name).Scan(&value); err != nil {
+			return fmt.Errorf("inspect default for %s: %w", name, err)
+		}
+		m.rememberRuntimeParamBaseline(connectionKey, name, value)
+	}
+	return nil
+}
+
 func (m *Manager) changedRuntimeParams(connectionKey string, desired map[string]string) map[string]string {
 	m.runtimeParamsMu.Lock()
 	defer m.runtimeParamsMu.Unlock()
-	current := m.runtimeParams[connectionKey]
-	changed := make(map[string]string)
+	state := m.runtimeParams[connectionKey]
+	effective := make(map[string]string, len(desired))
+	if state != nil {
+		for name, value := range state.baseline {
+			effective[name] = value
+		}
+	}
 	for name, value := range desired {
-		if current == nil || current[name] != value {
+		effective[name] = value
+	}
+	changed := make(map[string]string)
+	for name, value := range effective {
+		current := ""
+		if state != nil {
+			current = state.current[name]
+		}
+		if current != value {
 			changed[name] = value
 		}
 	}
 	return changed
 }
 
+func (m *Manager) rememberRuntimeParamBaseline(connectionKey, name, value string) {
+	m.runtimeParamsMu.Lock()
+	defer m.runtimeParamsMu.Unlock()
+	if m.runtimeParams == nil {
+		m.runtimeParams = make(map[string]*runtimeParamState)
+	}
+	if m.runtimeParams[connectionKey] == nil {
+		m.runtimeParams[connectionKey] = &runtimeParamState{baseline: make(map[string]string), current: make(map[string]string)}
+	}
+	state := m.runtimeParams[connectionKey]
+	if _, exists := state.baseline[name]; !exists {
+		state.baseline[name] = value
+		state.current[name] = value
+	}
+}
+
 func (m *Manager) rememberRuntimeParam(connectionKey, name, value string) {
 	m.runtimeParamsMu.Lock()
 	defer m.runtimeParamsMu.Unlock()
 	if m.runtimeParams == nil {
-		m.runtimeParams = make(map[string]map[string]string)
+		m.runtimeParams = make(map[string]*runtimeParamState)
 	}
 	if m.runtimeParams[connectionKey] == nil {
-		m.runtimeParams[connectionKey] = make(map[string]string)
+		m.runtimeParams[connectionKey] = &runtimeParamState{baseline: make(map[string]string), current: make(map[string]string)}
 	}
-	m.runtimeParams[connectionKey][name] = value
+	m.runtimeParams[connectionKey].current[name] = value
 }
 
 func (m *Manager) forgetRuntimeParams(name string, processID uint32) {
@@ -1006,7 +1080,7 @@ func (m *Manager) QueryAll(ctx context.Context, sql string) (Result, error) {
 	results := make(chan outcome, len(m.shards))
 	for _, s := range m.shards {
 		go func(s *shard) {
-			result, err := queryShard(ctx, s.pool, sql)
+			result, err := m.queryShard(ctx, s, sql)
 			results <- outcome{name: s.name, result: result, err: err}
 		}(s)
 	}
@@ -1063,7 +1137,7 @@ func (m *Manager) QueryOne(ctx context.Context, sql, name string) (Result, error
 		if shard.name != name {
 			continue
 		}
-		result, err := queryShard(ctx, shard.pool, sql)
+		result, err := m.queryShard(ctx, shard, sql)
 		success = err == nil
 		if err != nil {
 			errorCategory = classifyQueryError(err)
@@ -1210,8 +1284,16 @@ func (m *Manager) shardNames() []string {
 	return m.names
 }
 
-func queryShard(ctx context.Context, pool *pgxpool.Pool, sql string) (Result, error) {
-	rows, err := pool.Query(ctx, sql, pgx.QueryExecModeSimpleProtocol)
+func (m *Manager) queryShard(ctx context.Context, shard *shard, sql string) (Result, error) {
+	connection, err := shard.pool.Acquire(ctx)
+	if err != nil {
+		return Result{}, err
+	}
+	if err := m.applyRuntimeParams(ctx, shard.name, connection, nil); err != nil {
+		return Result{}, err
+	}
+	defer connection.Release()
+	rows, err := connection.Query(ctx, sql, pgx.QueryExecModeSimpleProtocol)
 	if err != nil {
 		return Result{}, err
 	}

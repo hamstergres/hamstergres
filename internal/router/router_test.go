@@ -338,6 +338,14 @@ func TestAnalyzeExplainReturnsOneLogicalPlan(t *testing.T) {
 	if unkeyedWrite.SingleBurrow || !unkeyedWrite.Write || !unkeyedWrite.Sharded || unkeyedWrite.Routed {
 		t.Fatalf("unkeyed EXPLAIN ANALYZE write = %#v, want shard-key requirement", unkeyedWrite)
 	}
+
+	cteWrite, err := Analyze("EXPLAIN ANALYZE WITH changed AS (UPDATE accounts SET payload = 'changed' RETURNING tenant_id) SELECT * FROM changed", nil, registry, burrows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cteWrite.SingleBurrow || !cteWrite.Write || cteWrite.Routed {
+		t.Fatalf("data-modifying CTE EXPLAIN ANALYZE plan = %#v, want fail-closed routing", cteWrite)
+	}
 }
 
 func TestAnalyzeCopyRecordsRelationAndDirection(t *testing.T) {
