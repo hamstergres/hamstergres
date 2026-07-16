@@ -1257,6 +1257,14 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 		return true
 	}
 	state.pending = nil
+	fleetWriteGateAcquired := false
+	fail := func(code, message string) bool {
+		if fleetWriteGateAcquired && !state.transaction {
+			session.UnlockFleetWrites()
+			fleetWriteGateAcquired = false
+		}
+		return s.failPendingExtended(frontend, state, emitReady, code, message)
+	}
 
 	messages := []pgproto3.FrontendMessage{pending.bind}
 	if pending.describe != nil {
@@ -1266,6 +1274,7 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 		if requiresFleetWriteOrder(pending.portal.sql, len(pending.targets)) && !session.LockFleetWritesContext(session.Context()) {
 			return s.failPendingExtended(frontend, state, emitReady, "57014", "frontend session ended while waiting to execute a write")
 		}
+		fleetWriteGateAcquired = requiresFleetWriteOrder(pending.portal.sql, len(pending.targets))
 		messages = append(messages, pending.execute)
 	}
 	messages = append(messages, &pgproto3.Sync{})
@@ -1273,7 +1282,7 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 	preparedMissing := make(map[string]struct{}, len(pending.targets))
 	for _, target := range pending.targets {
 		if err := session.Ensure(target); err != nil {
-			return s.failPendingExtended(frontend, state, emitReady, "08006", err.Error())
+			return fail("08006", err.Error())
 		}
 		targetMessages := messages
 		if pending.statement.backendName != "" && !session.Prepared(target, pending.statement.backendName) {
@@ -1282,7 +1291,7 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 			preparedMissing[target] = struct{}{}
 		}
 		if err := session.SendBatchTo(target, targetMessages...); err != nil {
-			return s.failPendingExtended(frontend, state, emitReady, "08006", err.Error())
+			return fail("08006", err.Error())
 		}
 	}
 	success := pending.execute != nil
@@ -1369,7 +1378,7 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 			return nil
 		})
 		if err != nil {
-			return s.failPendingExtended(frontend, state, emitReady, "08006", err.Error())
+			return fail("08006", err.Error())
 		}
 	}
 	if preparedMaterialized {
@@ -2358,7 +2367,7 @@ func containsCopyStatement(sql string) bool {
 
 func requiresSessionAffinity(sql string) bool {
 	switch firstSQLKeyword(sql) {
-	case "SET", "RESET", "DISCARD":
+	case "SET", "RESET", "DISCARD", "LISTEN", "UNLISTEN", "PREPARE":
 		return true
 	default:
 		return false

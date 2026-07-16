@@ -109,7 +109,7 @@ set -e
 if [[ "${pg_regress_status}" -ne 0 ]]; then
   echo "pg_regress reported compatibility differences (status ${pg_regress_status})"
 fi
-if [[ "${pg_regress_status}" -eq 124 || "${pg_regress_status}" -eq 137 ]]; then
+if [[ "${pg_regress_status}" -eq 124 ]]; then
   echo "pg_regress exceeded the ${suite_timeout} compatibility timeout" >&2
 fi
 

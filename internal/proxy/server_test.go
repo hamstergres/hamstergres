@@ -4,12 +4,15 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/jruszo/hamstergres/internal/backend"
+	"github.com/jruszo/hamstergres/internal/config"
 	"github.com/jruszo/hamstergres/internal/schema"
 )
 
@@ -75,13 +78,92 @@ func TestPendingExtendedFailureAtSyncEmitsReadyForQuery(t *testing.T) {
 }
 
 func TestRequiresSessionAffinityForSessionSettings(t *testing.T) {
-	for _, sql := range []string{"SET standard_conforming_strings = off", "RESET ALL", "DISCARD ALL"} {
+	for _, sql := range []string{
+		"SET standard_conforming_strings = off",
+		"RESET ALL",
+		"DISCARD ALL",
+		"LISTEN events",
+		"UNLISTEN events",
+		"PREPARE lookup AS SELECT 1",
+	} {
 		if !requiresSessionAffinity(sql) {
 			t.Fatalf("requiresSessionAffinity(%q) = false", sql)
 		}
 	}
 	if requiresSessionAffinity("SELECT 1") {
 		t.Fatal("ordinary query unexpectedly requires session affinity")
+	}
+}
+
+func TestPendingFleetWriteFailureReleasesGateOutsideTransaction(t *testing.T) {
+	manager, err := backend.New(t.Context(), emptyBackendConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	session, err := manager.NewSession(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := extendedState{pending: fleetWritePending(), statements: make(map[string]statementState), portals: make(map[string]portalState)}
+	frontend := pgproto3.NewBackend(bytes.NewReader(nil), io.Discard)
+	if (&Server{}).flushPendingExtended(frontend, session, &state, true) {
+		t.Fatal("failed pending fleet write reported success")
+	}
+
+	next, err := manager.NewSession(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if !next.LockFleetWritesContext(ctx) {
+		t.Fatal("fleet-write gate remained locked after non-transaction failure")
+	}
+	next.UnlockFleetWrites()
+}
+
+func TestPendingFleetWriteFailurePreservesGateDuringTransaction(t *testing.T) {
+	manager, err := backend.New(t.Context(), emptyBackendConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	session, err := manager.NewSession(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := extendedState{transaction: true, pending: fleetWritePending(), statements: make(map[string]statementState), portals: make(map[string]portalState)}
+	frontend := pgproto3.NewBackend(bytes.NewReader(nil), io.Discard)
+	if (&Server{}).flushPendingExtended(frontend, session, &state, true) {
+		t.Fatal("failed pending fleet write reported success")
+	}
+
+	next, err := manager.NewSession(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	if next.LockFleetWritesContext(ctx) {
+		next.UnlockFleetWrites()
+		t.Fatal("transactional fleet-write gate was released after pending failure")
+	}
+	session.UnlockFleetWrites()
+}
+
+func emptyBackendConfig() config.Config {
+	var cfg config.Config
+	cfg.Sharding.Unsharded.Mode = config.UnshardedReplicated
+	return cfg
+}
+
+func fleetWritePending() *pendingExtended {
+	return &pendingExtended{
+		targets: []string{"burrow-missing-01", "burrow-missing-02"},
+		bind:    &pgproto3.Bind{},
+		execute: &pgproto3.Execute{},
+		portal:  portalState{sql: "CREATE TABLE widgets (id bigint)"},
 	}
 }
 
