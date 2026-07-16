@@ -34,12 +34,55 @@ func TestNewSessionDoesNotAcquireHundredsOfBurrows(t *testing.T) {
 	for index := 0; index < 500; index++ {
 		manager.shards = append(manager.shards, &shard{name: fmt.Sprintf("burrow-%03d", index+1)})
 	}
-	session, err := manager.NewSession(t.Context())
+	session, err := manager.NewSession(t.Context(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if names := session.ConnectedNames(); len(names) != 0 {
 		t.Fatalf("new lazy session connected to %d Burrows: %#v", len(names), names)
+	}
+}
+
+func TestChangedRuntimeParamsOnlyReturnsNewOrChangedSettings(t *testing.T) {
+	manager := &Manager{}
+	key := preparedConnectionKey("burrow-01", 42)
+	manager.rememberRuntimeParamBaseline(key, "DateStyle", "ISO, MDY")
+	manager.rememberRuntimeParamBaseline(key, "application_name", "")
+	desired := map[string]string{"DateStyle": "Postgres, MDY", "application_name": "pg_regress"}
+	if got := manager.changedRuntimeParams(key, desired); !reflect.DeepEqual(got, desired) {
+		t.Fatalf("initial changed runtime params = %#v, want %#v", got, desired)
+	}
+	for name, value := range desired {
+		manager.rememberRuntimeParam(key, name, value)
+	}
+	if got := manager.changedRuntimeParams(key, desired); len(got) != 0 {
+		t.Fatalf("unchanged runtime params = %#v, want none", got)
+	}
+	changed := map[string]string{"DateStyle": "ISO, MDY", "application_name": "pg_regress"}
+	if got := manager.changedRuntimeParams(key, changed); !reflect.DeepEqual(got, map[string]string{"DateStyle": "ISO, MDY"}) {
+		t.Fatalf("changed runtime params = %#v, want only DateStyle", got)
+	}
+}
+
+func TestChangedRuntimeParamsResetsOmittedOverrideAfterRelease(t *testing.T) {
+	manager := &Manager{}
+	key := preparedConnectionKey("burrow-01", 42)
+	manager.rememberRuntimeParamBaseline(key, "application_name", "")
+	override := map[string]string{"application_name": "pg_regress"}
+	if got := manager.changedRuntimeParams(key, override); !reflect.DeepEqual(got, override) {
+		t.Fatalf("override runtime params = %#v, want %#v", got, override)
+	}
+	manager.rememberRuntimeParam(key, "application_name", "pg_regress")
+
+	// Releasing a reusable connection retains its tracked state. A subsequent
+	// session without the override must restore the Burrow baseline.
+	wantReset := map[string]string{"application_name": ""}
+	if got := manager.changedRuntimeParams(key, nil); !reflect.DeepEqual(got, wantReset) {
+		t.Fatalf("default-session runtime params = %#v, want reset %#v", got, wantReset)
+	}
+	manager.rememberRuntimeParam(key, "application_name", "")
+	if got := manager.changedRuntimeParams(key, nil); len(got) != 0 {
+		t.Fatalf("reset runtime params = %#v, want none", got)
 	}
 }
 

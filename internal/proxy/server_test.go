@@ -7,14 +7,108 @@ import (
 	"context"
 	"encoding/binary"
 	"io"
+	"reflect"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/jruszo/hamstergres/internal/backend"
 	"github.com/jruszo/hamstergres/internal/config"
 	"github.com/jruszo/hamstergres/internal/schema"
 )
+
+func TestStartupRuntimeParametersPreservePostgreSQLClientSettings(t *testing.T) {
+	startup := &pgproto3.StartupMessage{Parameters: map[string]string{
+		"user":             "hamster",
+		"database":         "regression",
+		"datestyle":        "Postgres, MDY",
+		"timezone":         "America/Los_Angeles",
+		"application_name": "direct_name",
+		"options":          "-c intervalstyle=postgres_verbose --search_path=public -ctimezone=UTC -capplication_name=options_name",
+		"unsupported":      "ignored",
+	}}
+	got := startupRuntimeParameters(startup)
+	want := map[string]string{
+		"DateStyle":        "Postgres, MDY",
+		"TimeZone":         "America/Los_Angeles",
+		"IntervalStyle":    "postgres_verbose",
+		"search_path":      "public",
+		"application_name": "direct_name",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("startup runtime parameters = %#v, want %#v", got, want)
+	}
+}
+
+func TestPostgresErrorResponsePreservesStructuredFields(t *testing.T) {
+	postgresError := &pgconn.PgError{
+		Severity: "ERROR", SeverityUnlocalized: "ERROR", Code: "42883",
+		Message: "function length(integer) does not exist", Detail: "detail", Hint: "hint",
+		Position: 15, InternalPosition: 4, InternalQuery: "SELECT 1", Where: "context",
+		SchemaName: "public", TableName: "items", ColumnName: "value", DataTypeName: "integer",
+		ConstraintName: "items_value_check", File: "parse_func.c", Line: 629, Routine: "ParseFuncOrColumn",
+	}
+	response := postgresErrorResponse(postgresError)
+	if response == nil || response.Code != postgresError.Code || response.Message != postgresError.Message ||
+		response.Detail != postgresError.Detail || response.Hint != postgresError.Hint || response.Position != postgresError.Position ||
+		response.InternalPosition != postgresError.InternalPosition || response.InternalQuery != postgresError.InternalQuery ||
+		response.Where != postgresError.Where || response.SchemaName != postgresError.SchemaName || response.TableName != postgresError.TableName ||
+		response.ColumnName != postgresError.ColumnName || response.DataTypeName != postgresError.DataTypeName ||
+		response.ConstraintName != postgresError.ConstraintName || response.File != postgresError.File || response.Line != postgresError.Line ||
+		response.Routine != postgresError.Routine || response.Severity != postgresError.Severity ||
+		response.SeverityUnlocalized != postgresError.SeverityUnlocalized {
+		t.Fatalf("structured PostgreSQL error changed: %#v", response)
+	}
+}
+
+func TestSendStartupReportsEffectiveRuntimeParameters(t *testing.T) {
+	var wire bytes.Buffer
+	frontend := pgproto3.NewBackend(bytes.NewReader(nil), &wire)
+	if err := (&Server{}).sendStartup(frontend, map[string]string{"standard_conforming_strings": "off"}); err != nil {
+		t.Fatal(err)
+	}
+
+	client := pgproto3.NewFrontend(bytes.NewReader(wire.Bytes()), io.Discard)
+	statuses := make(map[string]string)
+	statusCounts := make(map[string]int)
+	for {
+		message, err := client.Receive()
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch message := message.(type) {
+		case *pgproto3.ParameterStatus:
+			statusCounts[message.Name]++
+			if statusCounts[message.Name] > 1 {
+				t.Fatalf("ParameterStatus %s emitted %d times, want once", message.Name, statusCounts[message.Name])
+			}
+			statuses[message.Name] = message.Value
+		case *pgproto3.ReadyForQuery:
+			want := map[string]string{
+				"DateStyle":                   "ISO, MDY",
+				"IntervalStyle":               "postgres",
+				"TimeZone":                    "UTC",
+				"standard_conforming_strings": "off",
+			}
+			for name, value := range want {
+				if statuses[name] != value {
+					t.Fatalf("ParameterStatus %s = %q, want %q", name, statuses[name], value)
+				}
+			}
+			return
+		}
+	}
+}
+
+func TestStartupSessionAffinityIgnoresApplicationName(t *testing.T) {
+	if requiresStartupSessionAffinity(map[string]string{"application_name": "pg_regress"}) {
+		t.Fatal("application_name unexpectedly requires session affinity")
+	}
+	if !requiresStartupSessionAffinity(map[string]string{"DateStyle": "SQL, DMY"}) {
+		t.Fatal("formatting-sensitive DateStyle did not require session affinity")
+	}
+}
 
 func TestCloneFrontendMessageOwnsCopyAndBindBuffers(t *testing.T) {
 	copyData := &pgproto3.CopyData{Data: []byte("first frame")}
@@ -40,7 +134,7 @@ func TestCloneFrontendMessageOwnsCopyAndBindBuffers(t *testing.T) {
 
 func TestPendingExtendedFailureAtSyncEmitsReadyForQuery(t *testing.T) {
 	manager := &backend.Manager{}
-	session, err := manager.NewSession(t.Context())
+	session, err := manager.NewSession(t.Context(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +200,7 @@ func TestPendingFleetWriteFailureReleasesGateOutsideTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer manager.Close()
-	session, err := manager.NewSession(t.Context())
+	session, err := manager.NewSession(t.Context(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +210,7 @@ func TestPendingFleetWriteFailureReleasesGateOutsideTransaction(t *testing.T) {
 		t.Fatal("failed pending fleet write reported success")
 	}
 
-	next, err := manager.NewSession(t.Context())
+	next, err := manager.NewSession(t.Context(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +228,7 @@ func TestPendingFleetWriteFailurePreservesGateDuringTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer manager.Close()
-	session, err := manager.NewSession(t.Context())
+	session, err := manager.NewSession(t.Context(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +238,7 @@ func TestPendingFleetWriteFailurePreservesGateDuringTransaction(t *testing.T) {
 		t.Fatal("failed pending fleet write reported success")
 	}
 
-	next, err := manager.NewSession(t.Context())
+	next, err := manager.NewSession(t.Context(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,6 +319,13 @@ func TestBalancedBurrowUsesStableRoundRobin(t *testing.T) {
 	}
 	if got := server.balancedBurrow(nil); got != "" {
 		t.Fatalf("empty balanced selection = %q, want empty", got)
+	}
+}
+
+func TestParserFallbackUsesOneDeterministicBurrow(t *testing.T) {
+	server := &Server{backends: &backend.Manager{}}
+	if got := server.parserFallbackBurrow([]string{"burrow-02", "burrow-01"}); got != "burrow-01" {
+		t.Fatalf("parser fallback = %q, want burrow-01", got)
 	}
 }
 
