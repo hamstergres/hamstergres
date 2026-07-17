@@ -17,6 +17,8 @@ func main() {
 	schedulePath := flag.String("schedule", "", "PostgreSQL parallel_schedule")
 	outputDirectory := flag.String("output", "", "directory for results.json and compatibility-report.md")
 	baselinePath := flag.String("baseline", "", "optional prior results.json")
+	expectedDifferencesPath := flag.String("expected-differences", "", "optional reviewed intentional-differences policy")
+	testResultsDirectory := flag.String("test-results", "", "directory containing pg_regress per-test .out files")
 	postgresqlVersion := flag.String("postgresql-version", "", "tested PostgreSQL release")
 	proxyLogPath := flag.String("proxy-log", "", "Hamstergres Proxy log used to detect process crashes")
 	flag.Parse()
@@ -57,16 +59,36 @@ func main() {
 			regressions = pgcompat.FindRegressions(baseline, results)
 		}
 	}
+	var verifications []pgcompat.DifferenceVerification
+	if *expectedDifferencesPath != "" {
+		if *testResultsDirectory == "" {
+			fatalIf(fmt.Errorf("-test-results is required with -expected-differences"))
+		}
+		expected, err := pgcompat.ReadExpectedDifferences(*expectedDifferencesPath)
+		fatalIf(err)
+		if expected.PostgreSQLVersion != results.PostgreSQLVersion {
+			fatalIf(fmt.Errorf("expected differences target PostgreSQL %s while testing %s", expected.PostgreSQLVersion, results.PostgreSQLVersion))
+		}
+		verifications = pgcompat.VerifyExpectedDifferences(results, *testResultsDirectory, expected)
+	}
+	expectedRegressions, unexpectedRegressions := pgcompat.SeparateExpectedRegressions(regressions, verifications)
+	verificationProblems := pgcompat.DifferenceVerificationProblems(verifications)
 	fatalIf(os.MkdirAll(*outputDirectory, 0o755))
 	fatalIf(pgcompat.WriteResults(filepath.Join(*outputDirectory, "results.json"), results))
-	fatalIf(os.WriteFile(filepath.Join(*outputDirectory, "compatibility-report.md"), []byte(pgcompat.Markdown(results, regressions, baselineCompared)), 0o644))
+	fatalIf(os.WriteFile(filepath.Join(*outputDirectory, "compatibility-report.md"), []byte(pgcompat.Markdown(results, unexpectedRegressions, expectedRegressions, verifications, baselineCompared)), 0o644))
 	fatalIf(pgcompat.WriteBadgeEndpoint(filepath.Join(*outputDirectory, "badges", "overall.json"), results))
-	fmt.Printf("PostgreSQL %s compatibility: %d/%d passed, %d gaps, %d regressions\n", results.PostgreSQLVersion, results.PassedTests, results.ExpectedTests, results.FailedTests, len(regressions))
+	fmt.Printf("PostgreSQL %s compatibility: %d/%d passed, %d gaps, %d unexpected regressions, %d verified intentional differences\n", results.PostgreSQLVersion, results.PassedTests, results.ExpectedTests, results.FailedTests, len(unexpectedRegressions), len(verifications)-len(verificationProblems))
 	if completenessErr != nil {
 		fmt.Fprintln(os.Stderr, completenessErr)
 		os.Exit(2)
 	}
-	if len(regressions) > 0 {
+	if len(verificationProblems) > 0 {
+		for _, verification := range verificationProblems {
+			fmt.Fprintf(os.Stderr, "expected difference %s: %s\n", verification.Test, verification.Problem)
+		}
+		os.Exit(1)
+	}
+	if len(unexpectedRegressions) > 0 {
 		os.Exit(1)
 	}
 }

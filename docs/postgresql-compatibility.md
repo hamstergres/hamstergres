@@ -35,6 +35,17 @@ behavior, verified intentional rejection, unresolved gaps, regressions, and
 missing tests without inflating the upstream pass count. That reporting work is
 tracked in [#56](https://github.com/hamstergres/hamstergres/issues/56).
 
+Reviewed intentional differences for PostgreSQL 17.10 are recorded in
+`config/postgres-compatibility-expected-differences-17.10.json`. Each entry
+pins the SHA-256 digest of that test's complete `pg_regress` output. The raw
+test remains a compatibility gap, but its pass-to-fail transition is accepted
+only while the complete output matches exactly. A changed digest, missing
+output, or stale entry for a test that now passes fails CI and requires review;
+the policy therefore does not exempt an entire test from future regression
+detection. A policy entry may normalize a narrowly matched volatile value, such
+as a run-assigned transaction ID; the run fails unless each normalization
+matches its declared exact count.
+
 ## Compatibility levels
 
 | Level | Meaning |

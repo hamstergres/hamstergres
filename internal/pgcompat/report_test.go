@@ -85,6 +85,83 @@ func TestFindRegressionsTracksNewProxyCrashes(t *testing.T) {
 	}
 }
 
+func TestVerifyExpectedDifferencesRequiresExactOutput(t *testing.T) {
+	testResultsDirectory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(testResultsDirectory, "float4.out"), []byte("hello"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	expected := ExpectedDifferences{Differences: []ExpectedDifference{{
+		Test:         "float4",
+		OutputSHA256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+		Reason:       "reviewed rejection",
+	}}}
+	results := Results{Tests: []TestResult{{Name: "float4", Status: StatusFail}}}
+	verifications := VerifyExpectedDifferences(results, testResultsDirectory, expected)
+	if len(verifications) != 1 || !verifications[0].Matched || verifications[0].Problem != "" {
+		t.Fatalf("verifications = %#v", verifications)
+	}
+
+	if err := os.WriteFile(filepath.Join(testResultsDirectory, "float4.out"), []byte("changed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	verifications = VerifyExpectedDifferences(results, testResultsDirectory, expected)
+	if len(verifications) != 1 || verifications[0].Matched || !strings.Contains(verifications[0].Problem, "output changed") {
+		t.Fatalf("changed verifications = %#v", verifications)
+	}
+}
+
+func TestVerifyExpectedDifferencesRejectsStalePassingEntry(t *testing.T) {
+	expected := ExpectedDifferences{Differences: []ExpectedDifference{{Test: "float8", OutputSHA256: strings.Repeat("0", 64), Reason: "reviewed rejection"}}}
+	results := Results{Tests: []TestResult{{Name: "float8", Status: StatusPass}}}
+	verifications := VerifyExpectedDifferences(results, t.TempDir(), expected)
+	if len(verifications) != 1 || verifications[0].Matched || !strings.Contains(verifications[0].Problem, "stale") {
+		t.Fatalf("verifications = %#v", verifications)
+	}
+}
+
+func TestVerifyExpectedDifferencesNormalizesExactVolatileMatchCount(t *testing.T) {
+	testResultsDirectory := t.TempDir()
+	outputPath := filepath.Join(testResultsDirectory, "xid.out")
+	if err := os.WriteFile(outputPath, []byte("id=1234\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	expected := ExpectedDifferences{Differences: []ExpectedDifference{{
+		Test:         "xid",
+		OutputSHA256: "6712db25bf5c6ed7b442f2605fdfb6796597060ff57dfd7441388b0674fc5ac9",
+		Reason:       "reviewed rejection",
+		Normalizations: []OutputNormalization{{
+			Pattern:         `(?m)^id=[0-9]+$`,
+			Replacement:     "id=<xid>",
+			ExpectedMatches: 1,
+		}},
+	}}}
+	results := Results{Tests: []TestResult{{Name: "xid", Status: StatusFail}}}
+	verifications := VerifyExpectedDifferences(results, testResultsDirectory, expected)
+	if len(verifications) != 1 || !verifications[0].Matched {
+		t.Fatalf("verifications = %#v", verifications)
+	}
+
+	if err := os.WriteFile(outputPath, []byte("no volatile value\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	verifications = VerifyExpectedDifferences(results, testResultsDirectory, expected)
+	if len(verifications) != 1 || verifications[0].Matched || !strings.Contains(verifications[0].Problem, "matched 0 time") {
+		t.Fatalf("missing normalization match = %#v", verifications)
+	}
+}
+
+func TestSeparateExpectedRegressionsRequiresVerifiedSignature(t *testing.T) {
+	regressions := []Regression{{Name: "float4"}, {Name: "float8"}}
+	verifications := []DifferenceVerification{
+		{ExpectedDifference: ExpectedDifference{Test: "float4"}, Matched: true},
+		{ExpectedDifference: ExpectedDifference{Test: "float8"}, Problem: "output changed"},
+	}
+	expected, unexpected := SeparateExpectedRegressions(regressions, verifications)
+	if len(expected) != 1 || expected[0].Name != "float4" || len(unexpected) != 1 || unexpected[0].Name != "float8" {
+		t.Fatalf("expected = %#v, unexpected = %#v", expected, unexpected)
+	}
+}
+
 func TestCountProxyCrashes(t *testing.T) {
 	crashes, err := CountProxyCrashes(strings.NewReader("log line\npanic: first\nnot panic: ignored\npanic: second\n"))
 	if err != nil || crashes != 2 {
@@ -189,8 +266,8 @@ func TestMarkdownSeparatesGapsFromRegressions(t *testing.T) {
 			{Name: "char", Status: StatusFail, DurationMS: 20},
 		},
 	}
-	report := Markdown(results, []Regression{{Name: "char", Previous: StatusPass, Current: StatusFail}}, true)
-	for _, want := range []string{"1/2 passing", "1 compatibility gaps", "crashed 1 time", "1 regression(s)", "`char`: pass -> fail", "| `char` | GAP | 20 ms |"} {
+	report := Markdown(results, []Regression{{Name: "char", Previous: StatusPass, Current: StatusFail}}, nil, nil, true)
+	for _, want := range []string{"1/2 passing", "1 compatibility gaps", "crashed 1 time", "1 unexpected regression(s)", "`char`: pass -> fail", "| `char` | GAP | 20 ms |"} {
 		if !strings.Contains(report, want) {
 			t.Fatalf("report does not contain %q:\n%s", want, report)
 		}
@@ -198,7 +275,7 @@ func TestMarkdownSeparatesGapsFromRegressions(t *testing.T) {
 }
 
 func TestMarkdownExplainsMissingBaseline(t *testing.T) {
-	report := Markdown(Results{PostgreSQLVersion: "17.10"}, nil, false)
+	report := Markdown(Results{PostgreSQLVersion: "17.10"}, nil, nil, nil, false)
 	if !strings.Contains(report, "No compatible baseline was supplied") {
 		t.Fatalf("report did not explain missing baseline:\n%s", report)
 	}
@@ -216,10 +293,23 @@ func TestMarkdownReportsPartialInventory(t *testing.T) {
 			{Name: "foreign_key", Status: StatusMissing},
 		},
 	}
-	report := Markdown(results, nil, false)
+	report := Markdown(results, nil, nil, nil, false)
 	for _, want := range []string{"1/2 passing", "Harness incomplete", "`foreign_key`", "| `foreign_key` | MISSING | 0 ms |"} {
 		if !strings.Contains(report, want) {
 			t.Fatalf("partial report does not contain %q:\n%s", want, report)
+		}
+	}
+}
+
+func TestMarkdownReportsVerifiedIntentionalDifferences(t *testing.T) {
+	verification := DifferenceVerification{
+		ExpectedDifference: ExpectedDifference{Test: "float4", Reason: "reviewed rejection"},
+		Matched:            true,
+	}
+	report := Markdown(Results{PostgreSQLVersion: "17.10"}, nil, []Regression{{Name: "float4"}}, []DifferenceVerification{verification}, true)
+	for _, want := range []string{"No unexpected pass-to-fail", "1 pass-to-fail regression", "1 intentional PostgreSQL difference", "raw PostgreSQL score remains unchanged"} {
+		if !strings.Contains(report, want) {
+			t.Fatalf("report does not contain %q:\n%s", want, report)
 		}
 	}
 }
