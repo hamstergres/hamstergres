@@ -410,6 +410,7 @@ func appendShardKey(keys, types map[string][]string, namespace, table, column, d
 type Session struct {
 	shards           map[string]*sessionShard
 	runtimeParams    map[string]string
+	replaySQL        []string
 	fleetWriteGate   chan struct{}
 	fleetWriteLocked bool
 	ctx              context.Context
@@ -427,8 +428,12 @@ type sessionShard struct {
 // NewSession creates an empty affinity session. Connections are acquired on
 // first use by SendTo or SendBatchTo, so parsing, validation, and routed work do
 // not contact unrelated Burrows. The caller must close the returned session.
-func (m *Manager) NewSession(ctx context.Context, runtimeParams map[string]string) (*Session, error) {
-	return &Session{shards: make(map[string]*sessionShard), runtimeParams: runtimeParams, fleetWriteGate: m.fleetWriteGate, ctx: ctx, manager: m}, nil
+func (m *Manager) NewSession(ctx context.Context, runtimeParams map[string]string, replaySQL ...[]string) (*Session, error) {
+	var replay []string
+	if len(replaySQL) > 0 {
+		replay = append([]string(nil), replaySQL[0]...)
+	}
+	return &Session{shards: make(map[string]*sessionShard), runtimeParams: runtimeParams, replaySQL: replay, fleetWriteGate: m.fleetWriteGate, ctx: ctx, manager: m}, nil
 }
 
 func (s *Session) acquire(name string) (*sessionShard, error) {
@@ -454,17 +459,22 @@ func (s *Session) acquire(name string) (*sessionShard, error) {
 		slog.Error("Burrow session connection failed", "event", "backend_connection_failed", "component", "hamstergres-proxy", "burrow", target.name, "error_category", "burrow_unavailable", "error", err)
 		return nil, fmt.Errorf("connect session to Burrow %s: %w", target.name, err)
 	}
+	if err := s.manager.syncPreparedStatements(s.Context(), target.name, pooled.Conn()); err != nil {
+		s.manager.discardPooledConnection(target.name, pooled)
+		s.manager.RecordOperation("backend_connection", "failure")
+		return nil, fmt.Errorf("synchronize prepared statements on Burrow %s: %w", target.name, err)
+	}
+	// Reconcile prepared state while the Tunnel still has its clean pool
+	// baseline. Some frontend settings (notably standard_conforming_strings=off)
+	// make pgx's simple-protocol helpers intentionally unavailable.
 	if err := s.manager.applyRuntimeParams(s.Context(), target.name, pooled, s.runtimeParams); err != nil {
 		s.manager.RecordOperation("backend_connection", "failure")
 		return nil, err
 	}
-	if err := s.manager.syncPreparedStatements(s.Context(), target.name, pooled.Conn()); err != nil {
-		connection := pooled.Hijack()
-		s.manager.forgetPreparedConnection(target.name, connection.PgConn().PID())
-		s.manager.forgetRuntimeParams(target.name, connection.PgConn().PID())
-		_ = connection.Close(context.Background())
+	if err := replaySessionSettings(s.Context(), pooled.Conn().PgConn(), s.replaySQL); err != nil {
+		s.manager.discardPooledConnection(target.name, pooled)
 		s.manager.RecordOperation("backend_connection", "failure")
-		return nil, fmt.Errorf("synchronize prepared statements on Burrow %s: %w", target.name, err)
+		return nil, fmt.Errorf("replay frontend session state on Burrow %s: %w", target.name, err)
 	}
 	connection := &sessionShard{name: target.name, conn: pooled.Conn().PgConn(), pooled: pooled}
 	connection.watchCancellation(s.Context())
@@ -497,9 +507,23 @@ func (m *Manager) applyRuntimeParams(ctx context.Context, burrow string, connect
 }
 
 func (m *Manager) discardRuntimeParamConnection(burrow string, pooled *pgxpool.Conn) {
+	m.discardPooledConnection(burrow, pooled)
+}
+
+func (m *Manager) discardPooledConnection(burrow string, pooled *pgxpool.Conn) {
 	connection := pooled.Hijack()
+	m.forgetPreparedConnection(burrow, connection.PgConn().PID())
 	m.forgetRuntimeParams(burrow, connection.PgConn().PID())
 	_ = connection.Close(context.Background())
+}
+
+func replaySessionSettings(ctx context.Context, connection *pgconn.PgConn, statements []string) error {
+	for _, statement := range statements {
+		if _, err := connection.Exec(ctx, statement).ReadAll(); err != nil {
+			return fmt.Errorf("%s: %w", statement, err)
+		}
+	}
+	return nil
 }
 
 func (m *Manager) ensureRuntimeParamBaselines(ctx context.Context, connectionKey string, connection *pgxpool.Conn, desired map[string]string) error {
@@ -1018,10 +1042,18 @@ func cloneBackendMessage(message pgproto3.BackendMessage) pgproto3.BackendMessag
 	}
 }
 
-// Close releases every acquired affinity connection.
+const sessionResetTimeout = 5 * time.Second
+
+const pooledSessionResetSQL = "SET SESSION AUTHORIZATION DEFAULT; RESET ALL; CLOSE ALL; UNLISTEN *; SELECT pg_advisory_unlock_all(); DISCARD PLANS; DISCARD SEQUENCES; DISCARD TEMP"
+
+// Close releases every acquired affinity connection. Reusable connections are
+// returned only after PostgreSQL has discarded all frontend-owned state.
+// Proxy-owned canonical prepared statements survive the ordinary reset; SQL
+// PREPARE state requests a full DISCARD ALL and clears the matching pgx cache.
 func (s *Session) Close(ctx context.Context, reusable ...bool) {
 	s.UnlockFleetWrites()
 	release := len(reusable) > 0 && reusable[0]
+	discardPrepared := len(reusable) > 1 && reusable[1]
 	success := true
 	for _, shard := range s.connectedShards() {
 		shard.stopCancellationWatch()
@@ -1029,8 +1061,34 @@ func (s *Session) Close(ctx context.Context, reusable ...bool) {
 			release = false
 		}
 		if release {
-			shard.pooled.Release()
-			continue
+			resetContext, cancel := context.WithTimeout(ctx, sessionResetTimeout)
+			resetSQL := pooledSessionResetSQL
+			if discardPrepared {
+				resetSQL = "DISCARD ALL"
+			}
+			err := resetSessionState(
+				resetContext,
+				shard.conn.TxStatus(),
+				discardPrepared,
+				shard.pooled.Conn().DeallocateAll,
+				func(resetContext context.Context) error {
+					_, err := shard.conn.Exec(resetContext, resetSQL).ReadAll()
+					return err
+				},
+			)
+			cancel()
+			if err == nil {
+				if s.manager != nil {
+					if discardPrepared {
+						s.manager.forgetPreparedConnection(shard.name, shard.conn.PID())
+					}
+					s.manager.forgetRuntimeParams(shard.name, shard.conn.PID())
+				}
+				shard.pooled.Release()
+				continue
+			}
+			success = false
+			slog.Error("Burrow session reset failed", "event", "backend_session_reset_failed", "component", "hamstergres-proxy", "burrow", shard.name, "error_category", "pool_safety", "error", err)
 		}
 		key := preparedConnectionKey(shard.name, shard.conn.PID())
 		connection := shard.pooled.Hijack()
@@ -1052,6 +1110,21 @@ func (s *Session) Close(ctx context.Context, reusable ...bool) {
 		}
 		s.manager.RecordOperation("frontend_session_cleanup", outcome)
 	}
+}
+
+func resetSessionState(ctx context.Context, txStatus byte, discardPrepared bool, deallocate func(context.Context) error, discard func(context.Context) error) error {
+	if txStatus != 'I' {
+		return fmt.Errorf("Tunnel transaction status is %q, expected idle", txStatus)
+	}
+	if discardPrepared {
+		if err := deallocate(ctx); err != nil {
+			return fmt.Errorf("clear prepared statement caches: %w", err)
+		}
+	}
+	if err := discard(ctx); err != nil {
+		return fmt.Errorf("discard frontend session state: %w", err)
+	}
+	return nil
 }
 
 func (m *Manager) Close() {
