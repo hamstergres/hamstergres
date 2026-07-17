@@ -123,6 +123,12 @@ Hamstergres Proxy:
 make test-postgres-compatibility
 ```
 
+The supported target, temporary gaps, and deliberately rejected PostgreSQL
+features are defined in the
+[PostgreSQL compatibility contract](docs/postgresql-compatibility.md). The raw
+upstream pass count remains visible even when Hamstergres intentionally rejects
+a feature whose per-Burrow implementation would be unsafe.
+
 This is a long-running, Docker-backed compatibility inventory. It builds a
 pinned PostgreSQL 17.10 image from the official PostgreSQL source so the
 Burrows, `pg_regress`, its SQL and expected-output corpus, and the server-side
