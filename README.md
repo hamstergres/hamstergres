@@ -336,7 +336,10 @@ round trip per message. Equivalent Parse messages share a canonical backend name
 derived from SQL and parameter types; each Tunnel prepares that statement once
 and reuses it for frontend aliases. Clean idle Tunnels return to the per-Burrow
 connection pools after Sync and can be multiplexed across frontend sessions;
-transactions, COPY, and incomplete protocol batches remain pinned. Multi-Burrow
+transactions, COPY, and incomplete protocol batches remain pinned. The full
+[connection pooling and multiplexing contract](docs/connection-pooling.md)
+documents replayable settings, other pinning cases, destructive state, pool
+sizing, and observability. Multi-Burrow
 write transactions use PostgreSQL two-phase commit by default, while read-only
 and single-Burrow transactions use ordinary commit. DML transactions run
 concurrently without a Proxy-wide write lock. Two-phase commit makes commit
@@ -346,8 +349,9 @@ lock-timeout failures. The default `transactions.lock_timeout: 1s` prevents
 undetectable cross-Burrow lock cycles from blocking indefinitely. Operators who
 accept partial cross-Burrow commit risk may set
 `transactions.two_phase_commit: false` to use sequential ordinary commits.
-Prepared statements and portals are pinned to the frontend session and retain
-supplied text or binary parameter and result formats. Unsharded
+Frontend prepared-statement definitions remain virtual across Tunnel changes;
+active portals stay pinned and retain supplied text or binary parameter and
+result formats. Unsharded
 `COPY FROM STDIN` follows the configured table policy: `primary` sends each row
 only to the primary Burrow, while `replicated` sends it once to every Burrow.
 Unsharded `COPY TO STDOUT` likewise reads from one policy-selected Burrow.
@@ -509,9 +513,11 @@ bound values are deliberately never labels.
 | `hamstergres_proxy_backend_pool_acquire_duration_seconds_total` | seconds      | configured `burrow`                                        |
 | `hamstergres_proxy_operations_total`                            | operations   | bounded `operation` and `outcome` values below             |
 
-Operational values are fixed in code: `backend_connection`, `backend_query`,
-`copy`, `generated_id_allocation`, `nest_request`, `nest_registry_write`,
-`schema_registry_mismatch`, `schema_registry_refresh`, and `two_phase_commit`.
+Operational values are fixed in code: `backend_connection`,
+`backend_connection_multiplex`, `backend_query`, `copy`,
+`frontend_session_cleanup`, `generated_id_allocation`, `nest_request`,
+`nest_registry_write`, `prepared_statement_cache`, `schema_registry_mismatch`,
+`schema_registry_refresh`, `topology_reconcile`, and `two_phase_commit`.
 Outcomes are bounded values such as `success`, `failure`, `detected`,
 `prepare_failure`, or `uncertain`. Query failure categories are likewise fixed,
 including `sql_error`, `data_error`, `transaction_error`, `unsafe_routing`,

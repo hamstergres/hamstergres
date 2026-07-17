@@ -114,7 +114,10 @@ the Proxy reconciles its per-connection cache with `pg_prepared_statements`;
 frontend statement definitions remain virtual in the Proxy, and any missing
 canonical Parse is injected before Bind on the newly selected connection. A
 disconnect in an unsafe state closes the physical connections instead of
-returning uncertain transaction or protocol state to the pool.
+returning uncertain transaction or protocol state to the pool. The complete
+pooling safety contract, including session-state replay, conservative affinity,
+destructive cases, and capacity guidance, is documented in [Connection pooling
+and multiplexing](connection-pooling.md).
 
 Two-phase commit is enabled by default. Setting
 `transactions.two_phase_commit: false` selects best-effort sequential COMMIT
