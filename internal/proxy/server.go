@@ -2400,32 +2400,44 @@ func invalidatesPreparedStatements(sql string) bool {
 }
 
 func updateTransactionState(state *extendedState, sql string) {
-	kind := pg_query.TransactionStmtKind_TRANSACTION_STMT_KIND_UNDEFINED
-	if tree, err := pg_query.Parse(sql); err == nil && len(tree.Stmts) == 1 && tree.Stmts[0].Stmt != nil {
-		if transaction := tree.Stmts[0].Stmt.GetTransactionStmt(); transaction != nil {
-			kind = transaction.Kind
-		}
+	tree, err := pg_query.Parse(sql)
+	if err != nil {
+		return
 	}
-	switch kind {
-	case pg_query.TransactionStmtKind_TRANS_STMT_BEGIN, pg_query.TransactionStmtKind_TRANS_STMT_START:
-		state.transaction = true
-		state.transactionFailed = false
-		state.target = ""
-		state.mutated = false
-		clear(state.writeParticipants)
-	case pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK_TO:
-		state.transaction = true
-		state.transactionFailed = false
-	case pg_query.TransactionStmtKind_TRANS_STMT_COMMIT,
-		pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK,
-		pg_query.TransactionStmtKind_TRANS_STMT_PREPARE,
-		pg_query.TransactionStmtKind_TRANS_STMT_COMMIT_PREPARED,
-		pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK_PREPARED:
-		state.transaction = false
-		state.transactionFailed = false
-		state.target = ""
-		state.mutated = false
-		clear(state.writeParticipants)
+	for _, raw := range tree.Stmts {
+		if raw.Stmt == nil {
+			continue
+		}
+		transaction := raw.Stmt.GetTransactionStmt()
+		if transaction == nil {
+			continue
+		}
+		switch transaction.Kind {
+		case pg_query.TransactionStmtKind_TRANS_STMT_BEGIN, pg_query.TransactionStmtKind_TRANS_STMT_START:
+			state.transaction = true
+			state.transactionFailed = false
+			state.target = ""
+			state.mutated = false
+			clear(state.writeParticipants)
+		case pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK_TO:
+			state.transaction = true
+			state.transactionFailed = false
+		case pg_query.TransactionStmtKind_TRANS_STMT_COMMIT,
+			pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK:
+			state.transaction = transaction.Chain
+			state.transactionFailed = false
+			state.target = ""
+			state.mutated = false
+			clear(state.writeParticipants)
+		case pg_query.TransactionStmtKind_TRANS_STMT_PREPARE,
+			pg_query.TransactionStmtKind_TRANS_STMT_COMMIT_PREPARED,
+			pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK_PREPARED:
+			state.transaction = false
+			state.transactionFailed = false
+			state.target = ""
+			state.mutated = false
+			clear(state.writeParticipants)
+		}
 	}
 }
 
@@ -2603,8 +2615,14 @@ func classifyRawSessionState(raw *pg_query.RawStmt, replaySQL string) sessionSta
 	if statement.GetPrepareStmt() != nil {
 		return sessionStatePolicy{requiresBackend: true, pin: true, discardPrepared: true}
 	}
+	if update := statement.GetUpdateStmt(); update != nil && isPGSettingsRelation(update.Relation) {
+		return sessionStatePolicy{requiresBackend: true, pin: true}
+	}
 	if statement.GetListenStmt() != nil || statement.GetUnlistenStmt() != nil || statement.GetDeclareCursorStmt() != nil {
 		return sessionStatePolicy{requiresBackend: true, pin: true}
+	}
+	if statement.GetDoStmt() != nil {
+		return sessionStatePolicy{requiresBackend: true, pin: true, destroy: true}
 	}
 	if statement.GetLoadStmt() != nil {
 		return sessionStatePolicy{requiresBackend: true, pin: true, destroy: true}
@@ -2613,6 +2631,13 @@ func classifyRawSessionState(raw *pg_query.RawStmt, replaySQL string) sessionSta
 		return sessionStatePolicy{requiresBackend: true, pin: true}
 	}
 	return sessionStatePolicy{}
+}
+
+func isPGSettingsRelation(relation *pg_query.RangeVar) bool {
+	if relation == nil || !strings.EqualFold(relation.Relname, "pg_settings") {
+		return false
+	}
+	return relation.Schemaname == "" || strings.EqualFold(relation.Schemaname, "pg_catalog")
 }
 
 func protobufContainsSessionState(message protoreflect.Message) bool {

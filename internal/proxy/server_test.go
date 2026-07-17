@@ -183,6 +183,7 @@ func TestSessionStatePolicyReplaysSettingsAndPinsBackendState(t *testing.T) {
 		"SELECT 1; SET search_path = private, public",
 		"CREATE TEMP TABLE session_items (id bigint)",
 		"SELECT pg_advisory_lock(42)",
+		"UPDATE pg_settings SET setting = '64MB' WHERE name = 'work_mem'",
 	} {
 		if !requiresSessionAffinity(sql) {
 			t.Fatalf("requiresSessionAffinity(%q) = false", sql)
@@ -193,6 +194,13 @@ func TestSessionStatePolicyReplaysSettingsAndPinsBackendState(t *testing.T) {
 	}
 	if requiresSessionAffinity("SELECT 'SET ROLE application_user'") {
 		t.Fatal("affinity command text inside a literal required session affinity")
+	}
+	if requiresSessionBackend("UPDATE application_settings SET value = '64MB'") {
+		t.Fatal("ordinary UPDATE unexpectedly required a session backend")
+	}
+	doPolicy := classifySessionState("DO $$ BEGIN PERFORM set_config('work_mem', '64MB', false); END $$")
+	if !doPolicy.requiresBackend || !doPolicy.pin || !doPolicy.destroy {
+		t.Fatalf("DO policy = %#v, want pinned session backend destruction", doPolicy)
 	}
 }
 
@@ -268,6 +276,26 @@ func TestRollbackToSavepointKeepsTransactionPinned(t *testing.T) {
 	updateTransactionState(&state, "ROLLBACK")
 	if state.transaction {
 		t.Fatal("full ROLLBACK left the frontend transaction active")
+	}
+}
+
+func TestTransactionStateHandlesBatchesAndChainedCompletion(t *testing.T) {
+	state := extendedState{writeParticipants: make(map[string]struct{})}
+	updateTransactionState(&state, "BEGIN; INSERT INTO accounts (id) VALUES (1)")
+	if !state.transaction {
+		t.Fatal("BEGIN batch did not leave the frontend transaction active")
+	}
+
+	for _, sql := range []string{"COMMIT AND CHAIN", "ROLLBACK AND CHAIN"} {
+		state.transaction = true
+		state.transactionFailed = true
+		state.target = "burrow-01"
+		state.mutated = true
+		state.writeParticipants["burrow-01"] = struct{}{}
+		updateTransactionState(&state, sql)
+		if !state.transaction || state.transactionFailed || state.target != "" || state.mutated || len(state.writeParticipants) != 0 {
+			t.Fatalf("%s state = %#v, want a clean chained transaction", sql, state)
+		}
 	}
 }
 

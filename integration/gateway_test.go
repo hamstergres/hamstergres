@@ -1050,12 +1050,14 @@ func TestSessionSettingsDoNotLeakIntoExtendedQueries(t *testing.T) {
 		t.Fatal(err)
 	}
 	thirdConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
-	third, err := pgx.ConnectConfig(queryContext, thirdConfig)
+	thirdContext, thirdCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer thirdCancel()
+	third, err := pgx.ConnectConfig(thirdContext, thirdConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer third.Close(context.Background())
-	if err := third.QueryRow(queryContext, "SHOW TimeZone").Scan(&setting); err != nil || setting != "UTC" {
+	if err := third.QueryRow(thirdContext, "SHOW TimeZone").Scan(&setting); err != nil || setting != "UTC" {
 		t.Fatalf("new frontend TimeZone = %q, err = %v", setting, err)
 	}
 }
