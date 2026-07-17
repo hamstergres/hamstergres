@@ -235,7 +235,7 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend, runtimeParams map[stri
 		}
 	}()
 
-	state := extendedState{statements: make(map[string]statementState), portals: make(map[string]portalState), writeParticipants: make(map[string]struct{})}
+	state := extendedState{statements: make(map[string]statementState), portals: make(map[string]portalState), writeParticipants: make(map[string]struct{}), temporaryRelations: make(map[string]struct{})}
 	defer finishCopyTrace(&state, fmt.Errorf("frontend session ended during COPY"))
 	var session *backend.Session
 	defer func() {
@@ -275,6 +275,13 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend, runtimeParams map[stri
 					s.sendExtendedError(frontend, "42601", err.Error())
 					state.failed = true
 					break
+				}
+				if !state.referencesTemporaryDDL(prepared.sql) {
+					if err := s.validateAtomicFleetDDL(prepared.sql, len(s.backends.ShardNames())); err != nil {
+						s.sendExtendedError(frontend, "0A000", err.Error())
+						state.failed = true
+						break
+					}
 				}
 				decision, err := s.routePortal(prepared.routing, placeholderRoutingParameters(prepared.routing.MaxParameter()), s.backends.ShardNames())
 				if err != nil {
@@ -339,6 +346,10 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend, runtimeParams map[stri
 					state.failed = true
 					break
 				}
+				if requiresFleetWriteOrder(statement.sql, len(s.backends.ShardNames())) {
+					decision.target = ""
+					decision.routed = false
+				}
 				portal := portalState{
 					sql:        statement.sql,
 					parameters: parameters,
@@ -347,7 +358,7 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend, runtimeParams map[stri
 					routed:     decision.routed,
 					keyedWrite: decision.keyedWrite,
 				}
-				if state.pending == nil {
+				if state.pending == nil && !isTransactionControl(statement.sql) {
 					state.portals[message.DestinationPortal] = portal
 					targets := s.backends.ShardNames()
 					if decision.routed {
@@ -588,6 +599,7 @@ type extendedState struct {
 	sessionDestroy         bool
 	sessionDiscardPrepared bool
 	sessionSettings        []sessionSetting
+	temporaryRelations     map[string]struct{}
 }
 
 type sessionSetting struct {
@@ -673,13 +685,73 @@ type normalizedSQL struct {
 	schema bool
 }
 
+// validateTransactionalFleetDDL rejects schema commands that PostgreSQL
+// cannot safely execute inside the coordinated transaction used for a
+// multi-Burrow schema change. This check runs before a Session acquires any
+// Tunnel, so unsupported commands cannot partially mutate the fleet.
+func validateTransactionalFleetDDL(sql string) error {
+	tree, err := pg_query.Parse(sql)
+	if err != nil {
+		return fmt.Errorf("parse PostgreSQL statement: %w", err)
+	}
+	for _, raw := range tree.Stmts {
+		if raw.Stmt == nil {
+			continue
+		}
+		if raw.Stmt.GetTransactionStmt() != nil {
+			return fmt.Errorf("transaction control cannot be combined with fleet-wide DDL in one simple-query batch")
+		}
+		switch {
+		case raw.Stmt.GetCreatedbStmt() != nil,
+			raw.Stmt.GetDropdbStmt() != nil,
+			raw.Stmt.GetCreateTableSpaceStmt() != nil,
+			raw.Stmt.GetDropTableSpaceStmt() != nil,
+			raw.Stmt.GetAlterSystemStmt() != nil:
+			return fmt.Errorf("non-transactional fleet-wide DDL is not supported; use Hamstergres Migrations")
+		case raw.Stmt.GetCreateFunctionStmt() != nil:
+			return fmt.Errorf("user-defined functions and procedures are not supported across Burrows; use Hamstergres Migrations")
+		}
+		if index := raw.Stmt.GetIndexStmt(); index != nil && index.Concurrent {
+			return fmt.Errorf("concurrent index DDL is not supported across Burrows; use Hamstergres Migrations")
+		}
+		if drop := raw.Stmt.GetDropStmt(); drop != nil && drop.Concurrent {
+			return fmt.Errorf("concurrent index DDL is not supported across Burrows; use Hamstergres Migrations")
+		}
+	}
+	return nil
+}
+
+func (s *Server) validateAtomicFleetDDL(sql string, targetCount int) error {
+	// Function bodies can hide writes or dynamic DDL. Reject their creation
+	// even with one current Burrow so later topology growth cannot expose an
+	// uncoordinated executable catalog object.
+	tree, err := pg_query.Parse(sql)
+	if err == nil {
+		for _, raw := range tree.Stmts {
+			if raw.Stmt != nil && raw.Stmt.GetCreateFunctionStmt() != nil {
+				return fmt.Errorf("user-defined functions and procedures are not supported across Burrows; use Hamstergres Migrations")
+			}
+		}
+	}
+	if !requiresFleetWriteOrder(sql, targetCount) {
+		return nil
+	}
+	if err := validateTransactionalFleetDDL(sql); err != nil {
+		return err
+	}
+	if !s.twoPhaseCommit {
+		return fmt.Errorf("fleet-wide DDL requires two-phase commit")
+	}
+	return nil
+}
+
 func normalizeDDL(sql string) (normalizedSQL, error) {
 	keyword := firstSQLKeyword(sql)
 	if keyword == "COMMENT" || keyword == "DROP" {
 		return normalizedSQL{sql: sql, schema: true}, nil
 	}
 	if keyword != "CREATE" && keyword != "ALTER" {
-		return normalizedSQL{sql: sql}, nil
+		return normalizedSQL{sql: sql, schema: containsFleetDDL(sql)}, nil
 	}
 	result, err := ddl.Normalize(sql)
 	if err != nil {
@@ -1332,10 +1404,11 @@ func (s *Server) handleSync(frontend *pgproto3.Backend, session *backend.Session
 		s.sendExtendedError(frontend, "08006", err.Error())
 		return false
 	}
-	if state.schemaDirty {
+	if state.schemaDirty && !state.transaction {
 		if err := s.backends.RefreshSchema(context.Background()); err != nil {
 			frontend.Send(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "55000", Message: fmt.Sprintf("refresh schema registry after DDL: %v", err)})
 			frontend.Send(&pgproto3.ReadyForQuery{TxStatus: state.txStatus()})
+			session.UnlockFleetWrites()
 			return true
 		}
 		state.schemaDirty = false
@@ -1360,7 +1433,12 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 	}
 	state.pending = nil
 	fleetWriteGateAcquired := false
+	atomicDDLStarted := false
 	fail := func(code, message string) bool {
+		if atomicDDLStarted {
+			s.rollbackAtomicFleetDDL(context.Background(), session, pending.targets)
+			atomicDDLStarted = false
+		}
 		if fleetWriteGateAcquired && !state.transaction {
 			session.UnlockFleetWrites()
 			fleetWriteGateAcquired = false
@@ -1376,10 +1454,22 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 	if pending.execute != nil {
 		sessionPolicy = state.classifySessionState(pending.portal.sql)
 		state.beginSessionState(sessionPolicy)
+		temporaryDDL := state.referencesTemporaryDDL(pending.portal.sql)
+		if !temporaryDDL {
+			if err := s.validateAtomicFleetDDL(pending.portal.sql, len(pending.targets)); err != nil {
+				return fail("0A000", err.Error())
+			}
+		}
 		if requiresFleetWriteOrder(pending.portal.sql, len(pending.targets)) && !session.LockFleetWritesContext(session.Context()) {
 			return s.failPendingExtended(frontend, state, emitReady, "57014", "frontend session ended while waiting to execute a write")
 		}
 		fleetWriteGateAcquired = requiresFleetWriteOrder(pending.portal.sql, len(pending.targets))
+		if !state.transaction && fleetWriteGateAcquired && !temporaryDDL {
+			if response := s.beginAtomicFleetDDL(context.Background(), session, pending.targets); response != nil {
+				return fail(response.Code, response.Message)
+			}
+			atomicDDLStarted = true
+		}
 		messages = append(messages, pending.execute)
 	}
 	messages = append(messages, &pgproto3.Sync{})
@@ -1495,6 +1585,17 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 	} else if len(preparedMisses) == 0 && pending.statement.backendName != "" {
 		s.backends.RecordOperation("prepared_statement_cache", "hit")
 	}
+	if atomicDDLStarted {
+		if backendFailed {
+			s.rollbackAtomicFleetDDL(context.Background(), session, pending.targets)
+		} else if response := s.commitAtomicFleetDDL(context.Background(), session, pending.targets); response != nil {
+			frontend.Send(response)
+			backendFailed = true
+			success = false
+			errorCategory = postgresErrorCategory(response.Code)
+		}
+		atomicDDLStarted = false
+	}
 	if !backendFailed {
 		if invalidatesPreparedStatements(pending.portal.sql) {
 			s.backends.InvalidatePreparedStatements(pending.targets)
@@ -1509,15 +1610,22 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 	if pending.execute != nil && pending.portal.sql != "" {
 		s.backends.RecordQueryTargetsCategory(pending.portal.sql, success, time.Since(started), pending.targets, errorCategory)
 		if success {
-			recordWriteParticipants(state, pending.portal.sql, pending.targets)
-			if pending.portal.schema {
+			temporaryDDL := state.referencesTemporaryDDL(pending.portal.sql)
+			if !temporaryDDL {
+				recordWriteParticipants(state, pending.portal.sql, pending.targets)
+			}
+			if pending.portal.schema && !temporaryDDL {
 				state.schemaDirty = true
 			}
+			state.rememberTemporaryDDL(pending.portal.sql)
 			state.commitSessionState(sessionPolicy)
 			updateTransactionState(state, pending.portal.sql)
+			if !state.transaction && (firstSQLKeyword(pending.portal.sql) == "ROLLBACK" || firstSQLKeyword(pending.portal.sql) == "ABORT") {
+				state.schemaDirty = false
+			}
 		}
 	}
-	if state.schemaDirty && !backendFailed {
+	if state.schemaDirty && !backendFailed && !state.transaction {
 		if err := s.backends.RefreshSchema(context.Background()); err != nil {
 			frontend.Send(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "55000", Message: fmt.Sprintf("refresh schema registry after DDL: %v", err)})
 			backendFailed = true
@@ -1581,6 +1689,18 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 			frontend.Send(response)
 			return false
 		}
+		if state.schemaDirty {
+			if err := s.backends.RefreshSchema(context.Background()); err != nil {
+				s.sendExtendedError(frontend, "55000", fmt.Sprintf("refresh schema registry after DDL: %v", err))
+				state.transaction = false
+				state.mutated = false
+				state.schemaDirty = false
+				clear(state.writeParticipants)
+				session.UnlockFleetWrites()
+				return false
+			}
+			state.schemaDirty = false
+		}
 		frontend.Send(&pgproto3.CommandComplete{CommandTag: []byte("COMMIT")})
 		state.transaction = false
 		state.mutated = false
@@ -1602,10 +1722,27 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 	} else {
 		querySpan.SetAttributes(attribute.String("hamstergres.route", "scatter"))
 	}
+	temporaryDDL := state.referencesTemporaryDDL(portal.sql)
+	if !temporaryDDL {
+		if err := s.validateAtomicFleetDDL(portal.sql, len(targets)); err != nil {
+			errorCategory = "unsupported_ddl"
+			s.sendExtendedError(frontend, "0A000", err.Error())
+			return false
+		}
+	}
+	atomicDDL := !state.transaction && requiresFleetWriteOrder(portal.sql, len(targets)) && !temporaryDDL
 	if requiresFleetWriteOrder(portal.sql, len(targets)) && !session.LockFleetWritesContext(session.Context()) {
 		errorCategory = "client_disconnect"
 		s.sendExtendedError(frontend, "57014", "frontend session ended while waiting to execute a write")
 		return false
+	}
+	if atomicDDL {
+		if response := s.beginAtomicFleetDDL(traceContext, session, targets); response != nil {
+			errorCategory = postgresErrorCategory(response.Code)
+			frontend.Send(response)
+			session.UnlockFleetWrites()
+			return false
+		}
 	}
 	tunnelSpans := startTunnelSpans(traceContext, targets)
 	if len(targets) == 1 {
@@ -1616,16 +1753,32 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 	if err != nil {
 		errorCategory = "burrow_transport"
 		endTunnelSpans(tunnelSpans, err)
+		if atomicDDL {
+			s.rollbackAtomicFleetDDL(traceContext, session, targets)
+			session.UnlockFleetWrites()
+		}
 		s.sendExtendedError(frontend, "08006", err.Error())
 		return false
 	}
 	if response := firstError(responses); response != nil {
 		errorCategory = postgresErrorCategory(response.Code)
 		endTunnelSpans(tunnelSpans, fmt.Errorf("PostgreSQL error %s", response.Code))
+		if atomicDDL {
+			s.rollbackAtomicFleetDDL(traceContext, session, targets)
+			session.UnlockFleetWrites()
+		}
 		frontend.Send(response)
 		return false
 	}
 	endTunnelSpans(tunnelSpans, nil)
+	if atomicDDL {
+		if response := s.commitAtomicFleetDDL(traceContext, session, targets); response != nil {
+			errorCategory = postgresErrorCategory(response.Code)
+			frontend.Send(response)
+			session.UnlockFleetWrites()
+			return false
+		}
+	}
 
 	var description *pgproto3.RowDescription
 	var rows []*pgproto3.DataRow
@@ -1680,12 +1833,18 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 	if invalidatesPreparedStatements(portal.sql) {
 		s.backends.InvalidatePreparedStatements(targets)
 	}
-	if portal.schema {
+	if portal.schema && !temporaryDDL {
 		state.schemaDirty = true
 	}
 	state.commitSessionState(sessionPolicy)
-	recordWriteParticipants(state, portal.sql, targets)
+	if !temporaryDDL {
+		recordWriteParticipants(state, portal.sql, targets)
+	}
+	state.rememberTemporaryDDL(portal.sql)
 	updateTransactionState(state, portal.sql)
+	if !state.transaction && (firstSQLKeyword(portal.sql) == "ROLLBACK" || firstSQLKeyword(portal.sql) == "ABORT") {
+		state.schemaDirty = false
+	}
 	return true
 }
 
@@ -1953,6 +2112,13 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 		return false
 	}
 	sql = normalized.sql
+	temporaryDDL := state.referencesTemporaryDDL(sql)
+	if !temporaryDDL {
+		if err := s.validateAtomicFleetDDL(sql, len(s.backends.ShardNames())); err != nil {
+			s.sendSessionError(frontend, state.txStatus(), "0A000", err.Error())
+			return false
+		}
+	}
 	var generationErr error
 	registry := s.backends.Schema()
 	routing, err := router.Prepare(sql)
@@ -2019,16 +2185,35 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 		s.sendSessionError(frontend, state.txStatus(), "0A000", "write to a sharded table must include its annotated shard key")
 		return false
 	}
-	if routed && !isTransactionControl(sql) {
+	if requiresFleetWriteOrder(sql, len(targets)) {
+		routed = false
+	} else if routed && !isTransactionControl(sql) {
 		targets = []string{target}
 		querySpan.SetAttributes(attribute.String("hamstergres.route", "single_burrow"))
 	} else {
 		querySpan.SetAttributes(attribute.String("hamstergres.route", "scatter"))
 	}
+	if !temporaryDDL {
+		if err := s.validateAtomicFleetDDL(sql, len(targets)); err != nil {
+			errorCategory = "unsupported_ddl"
+			s.sendSessionError(frontend, state.txStatus(), "0A000", err.Error())
+			return false
+		}
+	}
+	atomicDDL := !state.transaction && requiresFleetWriteOrder(sql, len(targets)) && !temporaryDDL
 	if requiresFleetWriteOrder(sql, len(targets)) && !session.LockFleetWritesContext(session.Context()) {
 		errorCategory = "client_disconnect"
 		s.sendSessionError(frontend, state.txStatus(), "57014", "frontend session ended while waiting to execute a write")
 		return false
+	}
+	if atomicDDL {
+		if response := s.beginAtomicFleetDDL(traceContext, session, targets); response != nil {
+			errorCategory = postgresErrorCategory(response.Code)
+			frontend.Send(response)
+			frontend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+			session.UnlockFleetWrites()
+			return false
+		}
 	}
 	tunnelSpans = startTunnelSpans(traceContext, targets)
 	if len(targets) == 1 {
@@ -2039,6 +2224,10 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 	if err != nil {
 		errorCategory = "burrow_transport"
 		endTunnelSpans(tunnelSpans, err)
+		if atomicDDL {
+			s.rollbackAtomicFleetDDL(traceContext, session, targets)
+			session.UnlockFleetWrites()
+		}
 		s.sendError(frontend, "08006", err.Error())
 		return false
 	}
@@ -2046,14 +2235,27 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 	if response := firstError(responses); response != nil {
 		errorCategory = postgresErrorCategory(response.Code)
 		endTunnelSpans(tunnelSpans, fmt.Errorf("PostgreSQL error %s", response.Code))
+		if atomicDDL {
+			s.rollbackAtomicFleetDDL(traceContext, session, targets)
+			status = 'I'
+		}
 		frontend.Send(response)
 		frontend.Send(&pgproto3.ReadyForQuery{TxStatus: status})
-		if status == 'I' {
+		if status == 'I' || atomicDDL {
 			session.UnlockFleetWrites()
 		}
 		return false
 	}
 	endTunnelSpans(tunnelSpans, nil)
+	if atomicDDL {
+		if response := s.commitAtomicFleetDDL(traceContext, session, targets); response != nil {
+			errorCategory = postgresErrorCategory(response.Code)
+			frontend.Send(response)
+			frontend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+			session.UnlockFleetWrites()
+			return false
+		}
+	}
 
 	var description *pgproto3.RowDescription
 	var rows []*pgproto3.DataRow
@@ -2099,11 +2301,16 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 			}
 		}
 	}
-	if normalized.schema {
+	if normalized.schema && !temporaryDDL && !state.transaction {
 		if err := s.backends.RefreshSchema(context.Background()); err != nil {
 			s.sendSessionError(frontend, state.txStatus(), "55000", fmt.Sprintf("refresh schema registry after DDL: %v", err))
+			if atomicDDL {
+				session.UnlockFleetWrites()
+			}
 			return false
 		}
+	} else if normalized.schema && !temporaryDDL {
+		state.schemaDirty = true
 	}
 	for _, notice := range notices {
 		frontend.Send(notice)
@@ -2122,12 +2329,26 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 	} else {
 		frontend.Send(&pgproto3.EmptyQueryResponse{})
 	}
-	if routed {
-		recordWriteParticipants(state, sql, []string{target})
-	} else {
-		recordWriteParticipants(state, sql, targets)
+	if !temporaryDDL {
+		if routed {
+			recordWriteParticipants(state, sql, []string{target})
+		} else {
+			recordWriteParticipants(state, sql, targets)
+		}
 	}
+	state.rememberTemporaryDDL(sql)
 	updateTransactionState(state, sql)
+	if state.schemaDirty && !state.transaction {
+		if firstSQLKeyword(sql) == "ROLLBACK" || firstSQLKeyword(sql) == "ABORT" {
+			state.schemaDirty = false
+		} else if err := s.backends.RefreshSchema(context.Background()); err != nil {
+			s.sendSessionError(frontend, state.txStatus(), "55000", fmt.Sprintf("refresh schema registry after DDL: %v", err))
+			session.UnlockFleetWrites()
+			return false
+		} else {
+			state.schemaDirty = false
+		}
+	}
 	if invalidatesPreparedStatements(sql) {
 		s.backends.InvalidatePreparedStatements(targets)
 	}
@@ -2196,6 +2417,20 @@ func (s *Server) handleTwoPhaseCommit(frontend *pgproto3.Backend, session *backe
 		session.UnlockFleetWrites()
 		return false
 	}
+	if state.schemaDirty {
+		if err := s.backends.RefreshSchema(context.Background()); err != nil {
+			span.SetStatus(codes.Error, "schema registry refresh failed")
+			s.sendSessionError(frontend, 'I', "55000", fmt.Sprintf("refresh schema registry after DDL: %v", err))
+			state.transaction = false
+			state.mutated = false
+			state.schemaDirty = false
+			state.target = ""
+			clear(state.writeParticipants)
+			session.UnlockFleetWrites()
+			return false
+		}
+		state.schemaDirty = false
+	}
 	span.SetStatus(codes.Ok, "")
 	state.transaction = false
 	state.mutated = false
@@ -2205,6 +2440,49 @@ func (s *Server) handleTwoPhaseCommit(frontend *pgproto3.Backend, session *backe
 	frontend.Send(&pgproto3.CommandComplete{CommandTag: []byte("COMMIT")})
 	frontend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 	return true
+}
+
+// beginAtomicFleetDDL opens one transaction on every target before the DDL is
+// sent. If any BEGIN fails, every participant reached so far is rolled back.
+func (s *Server) beginAtomicFleetDDL(ctx context.Context, session *backend.Session, burrows []string) *pgproto3.ErrorResponse {
+	begun := make([]string, 0, len(burrows))
+	for _, name := range burrows {
+		if response := runTransactionCommandTraced(ctx, session, name, "BEGIN"); response != nil {
+			s.rollbackAtomicFleetDDL(ctx, session, begun)
+			s.backends.RecordOperation("fleet_ddl", "begin_failure")
+			return response
+		}
+		begun = append(begun, name)
+	}
+	return nil
+}
+
+// rollbackAtomicFleetDDL is best-effort because the original PostgreSQL error
+// is the deterministic application-visible failure. Cleanup failures remain
+// operational evidence and force the affected Session connections closed.
+func (s *Server) rollbackAtomicFleetDDL(ctx context.Context, session *backend.Session, burrows []string) {
+	failed := false
+	for _, name := range burrows {
+		if response := runTransactionCommandTraced(ctx, session, name, "ROLLBACK"); response != nil {
+			failed = true
+			s.logger.Error("fleet-wide DDL rollback failed", "event", "fleet_ddl_rollback_failed", "component", "hamstergres-proxy", "burrow", name, "error_category", "rollback_failure", "error", response.Message)
+		}
+	}
+	outcome := "rolled_back"
+	if failed {
+		outcome = "rollback_failure"
+	}
+	s.backends.RecordOperation("fleet_ddl", outcome)
+}
+
+func (s *Server) commitAtomicFleetDDL(ctx context.Context, session *backend.Session, burrows []string) *pgproto3.ErrorResponse {
+	response := s.commitTwoPhase(ctx, session, burrows)
+	if response != nil {
+		s.backends.RecordOperation("fleet_ddl", "commit_failure")
+		return response
+	}
+	s.backends.RecordOperation("fleet_ddl", "committed")
+	return nil
 }
 
 func (s *Server) commitTwoPhase(ctx context.Context, session *backend.Session, burrows []string) *pgproto3.ErrorResponse {
@@ -2381,7 +2659,7 @@ func requiresRoutedWrite(sql string) bool {
 }
 
 func recordWriteParticipants(state *extendedState, sql string, targets []string) {
-	if !state.transaction || !requiresRoutedWrite(sql) {
+	if !state.transaction || (!requiresRoutedWrite(sql) && !requiresFleetWriteOrder(sql, len(targets))) {
 		return
 	}
 	for _, target := range targets {
@@ -2482,12 +2760,88 @@ func requiresFleetWriteOrder(sql string, targetCount int) bool {
 	if targetCount < 2 {
 		return false
 	}
-	switch firstSQLKeyword(sql) {
-	case "CREATE", "ALTER", "COMMENT", "DROP", "TRUNCATE":
-		return true
-	default:
+	return containsFleetDDL(sql) && !isTemporaryDDL(sql) && !isServerLocalDDL(sql)
+}
+
+// containsFleetDDL classifies top-level statements from PostgreSQL's AST.
+// SELECT INTO is schema DDL despite beginning with SELECT. The cases below
+// are data, transaction, session, or maintenance commands; other top-level
+// utility statements change a shared catalog and require coordination.
+func containsFleetDDL(sql string) bool {
+	tree, err := pg_query.Parse(sql)
+	if err != nil {
 		return false
 	}
+	for _, raw := range tree.Stmts {
+		if raw.Stmt == nil {
+			continue
+		}
+		switch statement := raw.Stmt.GetNode().(type) {
+		case *pg_query.Node_SelectStmt:
+			if statement.SelectStmt.IntoClause != nil {
+				return true
+			}
+		case *pg_query.Node_InsertStmt,
+			*pg_query.Node_UpdateStmt,
+			*pg_query.Node_DeleteStmt,
+			*pg_query.Node_MergeStmt,
+			*pg_query.Node_CopyStmt,
+			*pg_query.Node_VariableSetStmt,
+			*pg_query.Node_VariableShowStmt,
+			*pg_query.Node_DeclareCursorStmt,
+			*pg_query.Node_ClosePortalStmt,
+			*pg_query.Node_FetchStmt,
+			*pg_query.Node_NotifyStmt,
+			*pg_query.Node_ListenStmt,
+			*pg_query.Node_UnlistenStmt,
+			*pg_query.Node_TransactionStmt,
+			*pg_query.Node_VacuumStmt,
+			*pg_query.Node_ExplainStmt,
+			*pg_query.Node_CheckPointStmt,
+			*pg_query.Node_DiscardStmt,
+			*pg_query.Node_LockStmt,
+			*pg_query.Node_ConstraintsSetStmt,
+			*pg_query.Node_PrepareStmt,
+			*pg_query.Node_ExecuteStmt,
+			*pg_query.Node_DeallocateStmt,
+			*pg_query.Node_CallStmt:
+			// Not schema DDL.
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+func isTemporaryDDL(sql string) bool {
+	tree, err := pg_query.Parse(sql)
+	if err != nil {
+		return false
+	}
+	for _, raw := range tree.Stmts {
+		if raw.Stmt != nil && protobufContainsTemporaryRelation(raw.Stmt.ProtoReflect()) {
+			return true
+		}
+	}
+	return false
+}
+
+func isServerLocalDDL(sql string) bool {
+	tree, err := pg_query.Parse(sql)
+	if err != nil {
+		return false
+	}
+	for _, raw := range tree.Stmts {
+		if raw.Stmt == nil {
+			continue
+		}
+		if raw.Stmt.GetCreatedbStmt() != nil || raw.Stmt.GetDropdbStmt() != nil ||
+			raw.Stmt.GetCreateTableSpaceStmt() != nil || raw.Stmt.GetDropTableSpaceStmt() != nil ||
+			raw.Stmt.GetAlterSystemStmt() != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func firstSQLKeyword(sql string) string {
@@ -2678,6 +3032,171 @@ func protobufContainsSessionState(message protoreflect.Message) bool {
 		return !found
 	})
 	return found
+}
+
+func protobufContainsTemporaryRelation(message protoreflect.Message) bool {
+	if !message.IsValid() {
+		return false
+	}
+	if value, ok := message.Interface().(*pg_query.RangeVar); ok && value.Relpersistence == "t" {
+		return true
+	}
+	found := false
+	message.Range(func(field protoreflect.FieldDescriptor, value protoreflect.Value) bool {
+		switch {
+		case field.IsList() && field.Message() != nil:
+			list := value.List()
+			for index := 0; index < list.Len(); index++ {
+				if protobufContainsTemporaryRelation(list.Get(index).Message()) {
+					found = true
+					return false
+				}
+			}
+		case field.IsMap() && field.MapValue().Message() != nil:
+			value.Map().Range(func(_ protoreflect.MapKey, mapValue protoreflect.Value) bool {
+				found = protobufContainsTemporaryRelation(mapValue.Message())
+				return !found
+			})
+		case field.Message() != nil:
+			found = protobufContainsTemporaryRelation(value.Message())
+		}
+		return !found
+	})
+	return found
+}
+
+func (state *extendedState) referencesTemporaryDDL(sql string) bool {
+	if isTemporaryDDL(sql) {
+		return true
+	}
+	tree, err := pg_query.Parse(sql)
+	if err != nil || len(state.temporaryRelations) == 0 {
+		return false
+	}
+	for _, raw := range tree.Stmts {
+		if raw.Stmt == nil {
+			continue
+		}
+		if protobufReferencesRelation(raw.Stmt.ProtoReflect(), state.temporaryRelations) {
+			return true
+		}
+		if drop := raw.Stmt.GetDropStmt(); drop != nil {
+			for _, name := range dropObjectNames(drop) {
+				if _, ok := state.temporaryRelations[name]; ok {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func (state *extendedState) rememberTemporaryDDL(sql string) {
+	if state.temporaryRelations == nil {
+		state.temporaryRelations = make(map[string]struct{})
+	}
+	tree, err := pg_query.Parse(sql)
+	if err != nil {
+		return
+	}
+	for _, raw := range tree.Stmts {
+		if raw.Stmt == nil {
+			continue
+		}
+		if create := raw.Stmt.GetCreateStmt(); create != nil && create.Relation != nil && create.Relation.Relpersistence == "t" {
+			rememberRangeVar(state.temporaryRelations, create.Relation)
+		}
+		if createAs := raw.Stmt.GetCreateTableAsStmt(); createAs != nil && createAs.Into != nil && createAs.Into.Rel != nil && createAs.Into.Rel.Relpersistence == "t" {
+			rememberRangeVar(state.temporaryRelations, createAs.Into.Rel)
+		}
+		if selectStatement := raw.Stmt.GetSelectStmt(); selectStatement != nil && selectStatement.IntoClause != nil && selectStatement.IntoClause.Rel != nil && selectStatement.IntoClause.Rel.Relpersistence == "t" {
+			rememberRangeVar(state.temporaryRelations, selectStatement.IntoClause.Rel)
+		}
+		if index := raw.Stmt.GetIndexStmt(); index != nil && index.Relation != nil && relationSetContains(state.temporaryRelations, index.Relation) && index.Idxname != "" {
+			state.temporaryRelations[index.Idxname] = struct{}{}
+		}
+		if drop := raw.Stmt.GetDropStmt(); drop != nil {
+			for _, name := range dropObjectNames(drop) {
+				delete(state.temporaryRelations, name)
+			}
+		}
+	}
+}
+
+func rememberRangeVar(relations map[string]struct{}, relation *pg_query.RangeVar) {
+	if relation == nil || relation.Relname == "" {
+		return
+	}
+	relations[relation.Relname] = struct{}{}
+	if relation.Schemaname != "" {
+		relations[relation.Schemaname+"."+relation.Relname] = struct{}{}
+	}
+}
+
+func relationSetContains(relations map[string]struct{}, relation *pg_query.RangeVar) bool {
+	if relation == nil {
+		return false
+	}
+	if _, ok := relations[relation.Relname]; ok {
+		return true
+	}
+	_, ok := relations[relation.Schemaname+"."+relation.Relname]
+	return relation.Schemaname != "" && ok
+}
+
+func protobufReferencesRelation(message protoreflect.Message, relations map[string]struct{}) bool {
+	if !message.IsValid() {
+		return false
+	}
+	if value, ok := message.Interface().(*pg_query.RangeVar); ok && relationSetContains(relations, value) {
+		return true
+	}
+	found := false
+	message.Range(func(field protoreflect.FieldDescriptor, value protoreflect.Value) bool {
+		switch {
+		case field.IsList() && field.Message() != nil:
+			list := value.List()
+			for index := 0; index < list.Len(); index++ {
+				if protobufReferencesRelation(list.Get(index).Message(), relations) {
+					found = true
+					return false
+				}
+			}
+		case field.IsMap() && field.MapValue().Message() != nil:
+			value.Map().Range(func(_ protoreflect.MapKey, mapValue protoreflect.Value) bool {
+				found = protobufReferencesRelation(mapValue.Message(), relations)
+				return !found
+			})
+		case field.Message() != nil:
+			found = protobufReferencesRelation(value.Message(), relations)
+		}
+		return !found
+	})
+	return found
+}
+
+func dropObjectNames(drop *pg_query.DropStmt) []string {
+	var names []string
+	for _, object := range drop.Objects {
+		list := object.GetList()
+		if list == nil || len(list.Items) == 0 {
+			continue
+		}
+		parts := make([]string, 0, len(list.Items))
+		for _, item := range list.Items {
+			if value := item.GetString_(); value != nil {
+				parts = append(parts, value.Sval)
+			}
+		}
+		if len(parts) == 0 {
+			continue
+		}
+		names = append(names, parts[len(parts)-1])
+		if len(parts) > 1 {
+			names = append(names, parts[len(parts)-2]+"."+parts[len(parts)-1])
+		}
+	}
+	return names
 }
 
 func functionName(call *pg_query.FuncCall) string {
