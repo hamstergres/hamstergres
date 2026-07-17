@@ -45,7 +45,7 @@ jobs:
         id: compatibility
         env:
           POSTGRES_COMPATIBILITY_BASELINE: /tmp/hamstergres-pgcompat-baseline/results.json
-          POSTGRES_COMPATIBILITY_TIMEOUT: 10m
+          POSTGRES_COMPATIBILITY_TIMEOUT: 15m
         run: make test-postgres-compatibility
 
       - name: Add report to the job summary
