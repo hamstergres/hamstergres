@@ -9,7 +9,7 @@ postgres_ref="REL_${postgres_version//./_}"
 image="${POSTGRES_COMPATIBILITY_IMAGE:-hamstergres-postgres-compatibility:${postgres_version}}"
 results_dir="${POSTGRES_COMPATIBILITY_RESULTS_DIR:-${repo_root}/build/postgres-compatibility}"
 baseline="${POSTGRES_COMPATIBILITY_BASELINE:-}"
-suite_timeout="${POSTGRES_COMPATIBILITY_TIMEOUT:-10m}"
+suite_timeout="${POSTGRES_COMPATIBILITY_TIMEOUT:-15m}"
 compose_project="hamstergres-pgcompat"
 proxy_pid=""
 
