@@ -18,6 +18,23 @@ import (
 	"github.com/jruszo/hamstergres/internal/schema"
 )
 
+func TestBeginSchemaCommitMarksBarrierBeforePhysicalCommit(t *testing.T) {
+	server := &Server{}
+	finish := server.beginSchemaCommit(true)
+	if !server.schemaRefreshPending.Load() {
+		t.Fatal("schema refresh barrier was not marked pending")
+	}
+	if server.schemaRefreshMu.TryLock() {
+		server.schemaRefreshMu.Unlock()
+		t.Fatal("schema refresh was not blocked at the physical commit boundary")
+	}
+	finish()
+	if !server.schemaRefreshMu.TryLock() {
+		t.Fatal("schema refresh barrier remained locked after physical commit")
+	}
+	server.schemaRefreshMu.Unlock()
+}
+
 func TestStartupRuntimeParametersPreservePostgreSQLClientSettings(t *testing.T) {
 	startup := &pgproto3.StartupMessage{Parameters: map[string]string{
 		"user":             "hamster",
@@ -491,6 +508,43 @@ func TestNormalizeDDLMarksSelectIntoAsSchemaChange(t *testing.T) {
 	}
 }
 
+func TestExplainAnalyzeCTASRequiresAtomicFleetDDL(t *testing.T) {
+	for _, sql := range []string{
+		"EXPLAIN ANALYZE CREATE TABLE explained_items AS SELECT 1 AS id",
+		"EXPLAIN (ANALYZE true, COSTS off) CREATE TABLE explained_items AS SELECT 1 AS id",
+	} {
+		normalized, err := normalizeDDL(sql)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !normalized.schema {
+			t.Fatalf("normalizeDDL(%q) did not mark executing CTAS as schema DDL", sql)
+		}
+		if !requiresFleetWriteOrder(sql, 2) {
+			t.Fatalf("requiresFleetWriteOrder(%q) = false, want true", sql)
+		}
+		if err := (&Server{}).validateAtomicFleetDDL(sql, 2); err == nil {
+			t.Fatalf("validateAtomicFleetDDL(%q) accepted execution without two-phase commit", sql)
+		}
+	}
+
+	for _, sql := range []string{
+		"EXPLAIN CREATE TABLE explained_items AS SELECT 1 AS id",
+		"EXPLAIN (ANALYZE false) CREATE TABLE explained_items AS SELECT 1 AS id",
+	} {
+		normalized, err := normalizeDDL(sql)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if normalized.schema {
+			t.Fatalf("normalizeDDL(%q) marked non-executing EXPLAIN as schema DDL", sql)
+		}
+		if requiresFleetWriteOrder(sql, 2) {
+			t.Fatalf("requiresFleetWriteOrder(%q) = true, want false", sql)
+		}
+	}
+}
+
 func TestValidateTransactionalFleetDDLRejectsUnsafeCommands(t *testing.T) {
 	for _, sql := range []string{
 		"CREATE DATABASE application",
@@ -678,6 +732,23 @@ func TestExtendedStateRejectsMixedTemporaryAndDurableDDL(t *testing.T) {
 	state.rememberTemporaryDDL("CREATE TEMP TABLE session_items (id bigint)")
 	if _, err := state.validateAtomicFleetDDL(server, "ALTER TABLE session_items ADD COLUMN note text; CREATE FUNCTION hidden_write() RETURNS void LANGUAGE SQL AS $$ SELECT 1 $$", 2); err == nil {
 		t.Fatal("tracked temporary DDL hid a following function definition")
+	}
+	for _, sql := range []string{
+		"CREATE TABLE durable_copy AS SELECT * FROM session_items",
+		"CREATE TABLE durable_like (LIKE session_items INCLUDING ALL)",
+	} {
+		if _, err := state.validateAtomicFleetDDL(server, sql, 2); err == nil {
+			t.Fatalf("durable DDL reading a tracked temporary relation was accepted: %q", sql)
+		}
+	}
+	for _, sql := range []string{
+		"CREATE TEMP TABLE temporary_copy AS SELECT * FROM session_items",
+		"CREATE TEMP TABLE temporary_like (LIKE session_items INCLUDING ALL)",
+	} {
+		temporary, err := state.validateAtomicFleetDDL(server, sql, 2)
+		if err != nil || !temporary {
+			t.Fatalf("temporary target %q = temporary %t, error %v", sql, temporary, err)
+		}
 	}
 }
 

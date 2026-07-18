@@ -271,8 +271,9 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend, runtimeParams map[stri
 		}
 		message := next.message
 		if _, terminate := message.(*pgproto3.Terminate); !terminate {
-			if _, syncMessage := message.(*pgproto3.Sync); !syncMessage && (state.schemaDirty || s.schemaRefreshPending.Load()) {
-				if err := s.refreshSchemaBarrier(context.Background(), state.schemaDirty); err != nil {
+			localSchemaRefresh := state.schemaDirty && !state.transaction
+			if _, syncMessage := message.(*pgproto3.Sync); !syncMessage && (localSchemaRefresh || s.schemaRefreshPending.Load()) {
+				if err := s.refreshSchemaBarrier(context.Background(), localSchemaRefresh); err != nil {
 					if _, simpleQuery := message.(*pgproto3.Query); simpleQuery {
 						s.sendSessionError(frontend, state.txStatus(), "55000", fmt.Sprintf("refresh schema registry after DDL: %v", err))
 					} else {
@@ -284,7 +285,9 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend, runtimeParams map[stri
 					}
 					continue
 				}
-				state.schemaDirty = false
+				if localSchemaRefresh {
+					state.schemaDirty = false
+				}
 			}
 		}
 		switch message := message.(type) {
@@ -1433,6 +1436,18 @@ func (s *Server) refreshSchemaAfterDDL(ctx context.Context) error {
 	return s.refreshSchemaIfPending(ctx)
 }
 
+// beginSchemaCommit makes the stale-schema barrier visible before a physical
+// commit can publish DDL. Refreshers wait for the commit boundary before they
+// rebuild routing state.
+func (s *Server) beginSchemaCommit(required bool) func() {
+	if !required {
+		return func() {}
+	}
+	s.schemaRefreshMu.Lock()
+	s.schemaRefreshPending.Store(true)
+	return s.schemaRefreshMu.Unlock
+}
+
 func (s *Server) refreshSchemaIfPending(ctx context.Context) error {
 	if !s.schemaRefreshPending.Load() {
 		return nil
@@ -1497,7 +1512,15 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 	state.pending = nil
 	fleetWriteGateAcquired := false
 	atomicDDLStarted := false
+	var releaseSchemaCommit func()
+	finishSchemaCommit := func() {
+		if releaseSchemaCommit != nil {
+			releaseSchemaCommit()
+			releaseSchemaCommit = nil
+		}
+	}
 	fail := func(code, message string) bool {
+		finishSchemaCommit()
 		if atomicDDLStarted {
 			s.rollbackAtomicFleetDDL(context.Background(), session, pending.targets)
 			atomicDDLStarted = false
@@ -1511,13 +1534,15 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 
 	messages := []pgproto3.FrontendMessage{pending.bind}
 	sessionPolicy := sessionStatePolicy{}
+	temporaryDDL := false
 	if pending.describe != nil {
 		messages = append(messages, pending.describe)
 	}
 	if pending.execute != nil {
 		sessionPolicy = state.classifySessionState(pending.portal.sql)
 		state.beginSessionState(sessionPolicy)
-		temporaryDDL, err := state.validateAtomicFleetDDL(s, pending.portal.sql, len(pending.targets))
+		var err error
+		temporaryDDL, err = state.validateAtomicFleetDDL(s, pending.portal.sql, len(pending.targets))
 		if err != nil {
 			return fail("0A000", err.Error())
 		}
@@ -1530,6 +1555,9 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 				return fail(response.Code, response.Message)
 			}
 			atomicDDLStarted = true
+		}
+		if !atomicDDLStarted && (pending.portal.schema && !temporaryDDL && !state.transaction || state.schemaDirty && state.transaction && isTransactionCommit(pending.portal.sql)) {
+			releaseSchemaCommit = s.beginSchemaCommit(true)
 		}
 		messages = append(messages, pending.execute)
 	}
@@ -1641,6 +1669,7 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 			return fail("08006", err.Error())
 		}
 	}
+	finishSchemaCommit()
 	if preparedMaterialized {
 		s.backends.RecordOperation("prepared_statement_cache", "miss")
 	} else if len(preparedMisses) == 0 && pending.statement.backendName != "" {
@@ -1745,7 +1774,10 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 		}
 	}()
 	if state.transaction && state.mutated && len(state.writeParticipants) > 1 && s.twoPhaseCommit && (firstSQLKeyword(portal.sql) == "COMMIT" || firstSQLKeyword(portal.sql) == "END") {
-		if response := s.commitTwoPhase(traceContext, session, participantNames(state.writeParticipants)); response != nil {
+		finishSchemaCommit := s.beginSchemaCommit(state.schemaDirty)
+		response := s.commitTwoPhase(traceContext, session, participantNames(state.writeParticipants))
+		finishSchemaCommit()
+		if response != nil {
 			frontend.Send(response)
 			return false
 		}
@@ -1802,12 +1834,14 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 			return false
 		}
 	}
+	finishSchemaCommit := s.beginSchemaCommit(!atomicDDL && (portal.schema && !temporaryDDL && !state.transaction || state.schemaDirty && state.transaction && isTransactionCommit(portal.sql)))
 	tunnelSpans := startTunnelSpans(traceContext, targets)
 	if len(targets) == 1 {
 		responses, err = exchangeOne(session, targets[0], message, isExecuteDone)
 	} else {
 		responses, err = exchange(session, targets, message, isExecuteDone)
 	}
+	finishSchemaCommit()
 	if err != nil {
 		errorCategory = "burrow_transport"
 		endTunnelSpans(tunnelSpans, err)
@@ -2270,12 +2304,14 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 			return false
 		}
 	}
+	finishSchemaCommit := s.beginSchemaCommit(!atomicDDL && (normalized.schema && !temporaryDDL && !state.transaction || state.schemaDirty && state.transaction && isTransactionCommit(sql)))
 	tunnelSpans = startTunnelSpans(traceContext, targets)
 	if len(targets) == 1 {
 		responses, err = exchangeOne(session, targets[0], &pgproto3.Query{String: sql}, isQueryDone)
 	} else {
 		responses, err = exchange(session, targets, &pgproto3.Query{String: sql}, isQueryDone)
 	}
+	finishSchemaCommit()
 	if err != nil {
 		errorCategory = "burrow_transport"
 		endTunnelSpans(tunnelSpans, err)
@@ -2464,7 +2500,10 @@ func (s *Server) handleTwoPhaseCommit(frontend *pgproto3.Backend, session *backe
 	ctx, span := otel.Tracer("github.com/jruszo/hamstergres/proxy").Start(context.Background(), "proxy.query", trace.WithAttributes(
 		attribute.String("db.operation.name", "COMMIT"), attribute.String("hamstergres.route", "scatter")))
 	defer span.End()
-	if response := s.commitTwoPhase(ctx, session, participantNames(state.writeParticipants)); response != nil {
+	finishSchemaCommit := s.beginSchemaCommit(state.schemaDirty)
+	response := s.commitTwoPhase(ctx, session, participantNames(state.writeParticipants))
+	finishSchemaCommit()
+	if response != nil {
 		span.SetStatus(codes.Error, "two-phase commit failed")
 		frontend.Send(response)
 		frontend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
@@ -2532,7 +2571,9 @@ func (s *Server) rollbackAtomicFleetDDL(ctx context.Context, session *backend.Se
 }
 
 func (s *Server) commitAtomicFleetDDL(ctx context.Context, session *backend.Session, burrows []string) *pgproto3.ErrorResponse {
+	finishSchemaCommit := s.beginSchemaCommit(true)
 	response := s.commitTwoPhase(ctx, session, burrows)
+	finishSchemaCommit()
 	if response != nil {
 		s.backends.RecordOperation("fleet_ddl", "commit_failure")
 		return response
@@ -2822,6 +2863,11 @@ func isTransactionControl(sql string) bool {
 	return keyword == "BEGIN" || keyword == "START" || keyword == "COMMIT" || keyword == "END" || keyword == "ROLLBACK" || keyword == "ABORT"
 }
 
+func isTransactionCommit(sql string) bool {
+	keyword := firstSQLKeyword(sql)
+	return keyword == "COMMIT" || keyword == "END"
+}
+
 func requiresFleetWriteOrder(sql string, targetCount int) bool {
 	if targetCount < 2 {
 		return false
@@ -2864,6 +2910,8 @@ func isFleetDDLStatement(statement *pg_query.Node) bool {
 		if node.SelectStmt.IntoClause != nil {
 			return true
 		}
+	case *pg_query.Node_ExplainStmt:
+		return explainAnalyze(node.ExplainStmt) && isFleetDDLStatement(node.ExplainStmt.Query)
 	case *pg_query.Node_InsertStmt,
 		*pg_query.Node_UpdateStmt,
 		*pg_query.Node_DeleteStmt,
@@ -2879,7 +2927,6 @@ func isFleetDDLStatement(statement *pg_query.Node) bool {
 		*pg_query.Node_UnlistenStmt,
 		*pg_query.Node_TransactionStmt,
 		*pg_query.Node_VacuumStmt,
-		*pg_query.Node_ExplainStmt,
 		*pg_query.Node_CheckPointStmt,
 		*pg_query.Node_DiscardStmt,
 		*pg_query.Node_LockStmt,
@@ -2890,6 +2937,32 @@ func isFleetDDLStatement(statement *pg_query.Node) bool {
 		*pg_query.Node_CallStmt:
 		// Not schema DDL.
 	default:
+		return true
+	}
+	return false
+}
+
+func explainAnalyze(statement *pg_query.ExplainStmt) bool {
+	if statement == nil {
+		return false
+	}
+	for _, optionNode := range statement.Options {
+		option := optionNode.GetDefElem()
+		if option == nil || !strings.EqualFold(option.Defname, "analyze") {
+			continue
+		}
+		if option.Arg == nil {
+			return true
+		}
+		if value := option.Arg.GetBoolean(); value != nil {
+			return value.Boolval
+		}
+		if value := option.Arg.GetString_(); value != nil {
+			switch strings.ToLower(value.Sval) {
+			case "false", "off", "no", "0":
+				return false
+			}
+		}
 		return true
 	}
 	return false
@@ -3189,16 +3262,44 @@ func (state *extendedState) classifyTemporaryDDL(sql string) (temporaryOnly, mix
 				continue
 			}
 		}
-		statementTemporary := protobufContainsTemporaryRelation(raw.Stmt.ProtoReflect()) || protobufReferencesRelation(raw.Stmt.ProtoReflect(), working.temporaryRelations)
-		if statementTemporary {
-			hasTemporary = true
-		}
-		if isFleetDDLStatement(raw.Stmt) && !statementTemporary {
-			hasDurableFleetDDL = true
+		if isFleetDDLStatement(raw.Stmt) {
+			temporaryReference := protobufContainsTemporaryRelation(raw.Stmt.ProtoReflect()) || protobufReferencesRelation(raw.Stmt.ProtoReflect(), working.temporaryRelations)
+			temporaryTarget, targetKnown := temporaryDDLTarget(raw.Stmt, working.temporaryRelations)
+			if !targetKnown {
+				temporaryTarget = temporaryReference
+			}
+			if temporaryTarget || temporaryReference {
+				hasTemporary = true
+			}
+			if !temporaryTarget {
+				hasDurableFleetDDL = true
+			}
 		}
 		working.rememberTemporaryStatement(raw.Stmt)
 	}
 	return hasTemporary && !hasDurableFleetDDL, hasTemporary && hasDurableFleetDDL
+}
+
+func temporaryDDLTarget(statement *pg_query.Node, relations map[string]struct{}) (temporary, known bool) {
+	var relation *pg_query.RangeVar
+	switch {
+	case statement.GetExplainStmt() != nil && explainAnalyze(statement.GetExplainStmt()):
+		return temporaryDDLTarget(statement.GetExplainStmt().Query, relations)
+	case statement.GetCreateStmt() != nil:
+		relation = statement.GetCreateStmt().Relation
+	case statement.GetCreateTableAsStmt() != nil && statement.GetCreateTableAsStmt().Into != nil:
+		relation = statement.GetCreateTableAsStmt().Into.Rel
+	case statement.GetSelectStmt() != nil && statement.GetSelectStmt().IntoClause != nil:
+		relation = statement.GetSelectStmt().IntoClause.Rel
+	case statement.GetViewStmt() != nil:
+		relation = statement.GetViewStmt().View
+	default:
+		return false, false
+	}
+	if relation == nil {
+		return false, false
+	}
+	return relation.Relpersistence == "t" || strings.EqualFold(relation.Schemaname, "pg_temp") || relationSetContains(relations, relation), true
 }
 
 func (state *extendedState) referencesTemporaryDDL(sql string) bool {
@@ -3768,12 +3869,14 @@ func (s *Server) handleQuery(frontend *pgproto3.Backend, sql string) {
 	} else {
 		querySpan.SetAttributes(attribute.String("hamstergres.route", "scatter"))
 	}
+	finishSchemaCommit := s.beginSchemaCommit(normalized.schema)
 	tunnelSpans := startTunnelSpans(traceContext, targets)
 	if routed {
 		result, err = s.backends.QueryOne(context.Background(), sql, target)
 	} else {
 		result, err = s.backends.QueryAll(context.Background(), sql)
 	}
+	finishSchemaCommit()
 	if err != nil {
 		errorCategory = classifyProxyError(err)
 		endTunnelSpans(tunnelSpans, err)

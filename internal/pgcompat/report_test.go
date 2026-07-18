@@ -150,6 +150,28 @@ func TestVerifyExpectedDifferencesNormalizesExactVolatileMatchCount(t *testing.T
 	}
 }
 
+func TestVerifyExpectedDifferencesReportsMalformedNormalization(t *testing.T) {
+	testResultsDirectory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(testResultsDirectory, "xid.out"), []byte("id=1234\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	expected := ExpectedDifferences{Differences: []ExpectedDifference{{
+		Test:         "xid",
+		OutputSHA256: strings.Repeat("0", 64),
+		Reason:       "direct-call validation",
+		Normalizations: []OutputNormalization{{
+			Pattern:         "[",
+			ExpectedMatches: 1,
+		}},
+	}}}
+	results := Results{Tests: []TestResult{{Name: "xid", Status: StatusFail}}}
+
+	verifications := VerifyExpectedDifferences(results, testResultsDirectory, expected)
+	if len(verifications) != 1 || verifications[0].Matched || !strings.Contains(verifications[0].Problem, "invalid normalization") {
+		t.Fatalf("verifications = %#v", verifications)
+	}
+}
+
 func TestSeparateExpectedRegressionsRequiresVerifiedSignature(t *testing.T) {
 	regressions := []Regression{{Name: "float4"}, {Name: "float8"}}
 	verifications := []DifferenceVerification{

@@ -137,8 +137,19 @@ func explainAnalyze(statement *pg_query.ExplainStmt) bool {
 		if option == nil || !strings.EqualFold(option.Defname, "analyze") {
 			continue
 		}
-		value := option.Arg.GetBoolean()
-		return value == nil || value.Boolval
+		if option.Arg == nil {
+			return true
+		}
+		if value := option.Arg.GetBoolean(); value != nil {
+			return value.Boolval
+		}
+		if value := option.Arg.GetString_(); value != nil {
+			switch strings.ToLower(value.Sval) {
+			case "false", "off", "no", "0":
+				return false
+			}
+		}
+		return true
 	}
 	return false
 }

@@ -320,6 +320,13 @@ func TestAnalyzeExplainReturnsOneLogicalPlan(t *testing.T) {
 	if !plan.SingleBurrow || plan.Routed {
 		t.Fatalf("EXPLAIN plan = %#v, want one topology-transparent Burrow", plan)
 	}
+	nonExecutingWrite, err := Analyze("EXPLAIN (ANALYZE false) INSERT INTO accounts (tenant_id) VALUES (42)", nil, schema.Registry{}, burrows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !nonExecutingWrite.SingleBurrow {
+		t.Fatalf("EXPLAIN (ANALYZE false) plan = %#v, want one topology-transparent Burrow", nonExecutingWrite)
+	}
 
 	registry := schema.New(map[string][]string{"accounts": {"tenant_id"}})
 	keyedWrite, err := Analyze("EXPLAIN ANALYZE INSERT INTO accounts (tenant_id) VALUES (42)", nil, registry, burrows)

@@ -288,7 +288,11 @@ func VerifyExpectedDifferences(results Results, testResultsDirectory string, exp
 			}
 			normalized := string(contents)
 			for _, normalization := range difference.Normalizations {
-				pattern := regexp.MustCompile(normalization.Pattern)
+				pattern, err := regexp.Compile(normalization.Pattern)
+				if err != nil {
+					verification.Problem = fmt.Sprintf("invalid normalization %q: %v", normalization.Pattern, err)
+					break
+				}
 				matches := pattern.FindAllStringIndex(normalized, -1)
 				if len(matches) != normalization.ExpectedMatches {
 					verification.Problem = fmt.Sprintf("normalization %q matched %d time(s), want %d", normalization.Pattern, len(matches), normalization.ExpectedMatches)

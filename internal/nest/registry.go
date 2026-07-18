@@ -76,6 +76,9 @@ func (s *RegistryStore) ReplaceVersioned(ctx context.Context, live schema.Regist
 	}
 	revision := uint64(1)
 	if found {
+		if stored.EqualSchema(live) == nil {
+			return live.WithRevision(stored.Revision()), nil
+		}
 		revision = stored.Revision() + 1
 	}
 	live = live.WithRevision(revision)
