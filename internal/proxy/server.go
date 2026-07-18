@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -38,13 +39,15 @@ import (
 
 // Server exposes the PostgreSQL frontend protocol for Hamstergres.
 type Server struct {
-	backends       *backend.Manager
-	logger         *slog.Logger
-	twoPhaseCommit bool
+	backends        *backend.Manager
+	logger          *slog.Logger
+	twoPhaseCommit  bool
+	schemaRefreshMu sync.Mutex
 
-	connections       atomic.Int64
-	activeConnections atomic.Int64
-	topologyReadIndex atomic.Uint64
+	connections          atomic.Int64
+	activeConnections    atomic.Int64
+	topologyReadIndex    atomic.Uint64
+	schemaRefreshPending atomic.Bool
 }
 
 func New(backends *backend.Manager, logger *slog.Logger, twoPhaseCommit ...bool) *Server {
@@ -267,6 +270,23 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend, runtimeParams map[stri
 			return next.err
 		}
 		message := next.message
+		if _, terminate := message.(*pgproto3.Terminate); !terminate {
+			if _, syncMessage := message.(*pgproto3.Sync); !syncMessage && (state.schemaDirty || s.schemaRefreshPending.Load()) {
+				if err := s.refreshSchemaBarrier(context.Background(), state.schemaDirty); err != nil {
+					if _, simpleQuery := message.(*pgproto3.Query); simpleQuery {
+						s.sendSessionError(frontend, state.txStatus(), "55000", fmt.Sprintf("refresh schema registry after DDL: %v", err))
+					} else {
+						s.sendExtendedError(frontend, "55000", fmt.Sprintf("refresh schema registry after DDL: %v", err))
+						state.failed = true
+					}
+					if flushErr := frontend.Flush(); flushErr != nil {
+						return flushErr
+					}
+					continue
+				}
+				state.schemaDirty = false
+			}
+		}
 		switch message := message.(type) {
 		case *pgproto3.Parse:
 			if !state.failed {
@@ -276,12 +296,10 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend, runtimeParams map[stri
 					state.failed = true
 					break
 				}
-				if !state.referencesTemporaryDDL(prepared.sql) {
-					if err := s.validateAtomicFleetDDL(prepared.sql, len(s.backends.ShardNames())); err != nil {
-						s.sendExtendedError(frontend, "0A000", err.Error())
-						state.failed = true
-						break
-					}
+				if _, err := state.validateAtomicFleetDDL(s, prepared.sql, len(s.backends.ShardNames())); err != nil {
+					s.sendExtendedError(frontend, "0A000", err.Error())
+					state.failed = true
+					break
 				}
 				decision, err := s.routePortal(prepared.routing, placeholderRoutingParameters(prepared.routing.MaxParameter()), s.backends.ShardNames())
 				if err != nil {
@@ -313,7 +331,7 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend, runtimeParams map[stri
 					}
 				} else if containsCopyStatement(message.String) {
 					s.sendSessionError(frontend, state.txStatus(), "0A000", "COPY in a multi-statement query is not supported; send COPY as a standalone statement")
-				} else if session != nil || len(runtimeParams) > 0 || len(state.sessionSettings) > 0 || requiresSessionBackend(message.String) || isTransactionControl(message.String) || requiresFleetWriteOrder(message.String, len(s.backends.ShardNames())) {
+				} else if session != nil || len(runtimeParams) > 0 || len(state.sessionSettings) > 0 || requiresSessionBackend(message.String) || isTransactionControl(message.String) || isServerLocalDDL(message.String) || requiresFleetWriteOrder(message.String, len(s.backends.ShardNames())) {
 					if active, ok := ensureSession(); ok {
 						s.handleSessionQuery(frontend, active, message.String, &state)
 					}
@@ -346,7 +364,8 @@ func (s *Server) serveQueries(frontend *pgproto3.Backend, runtimeParams map[stri
 					state.failed = true
 					break
 				}
-				if requiresFleetWriteOrder(statement.sql, len(s.backends.ShardNames())) {
+				temporaryDDL := state.referencesTemporaryDDL(statement.sql)
+				if requiresFleetWriteOrder(statement.sql, len(s.backends.ShardNames())) && !temporaryDDL {
 					decision.target = ""
 					decision.routed = false
 				}
@@ -600,6 +619,16 @@ type extendedState struct {
 	sessionDiscardPrepared bool
 	sessionSettings        []sessionSetting
 	temporaryRelations     map[string]struct{}
+	temporaryOnCommitDrop  map[string]struct{}
+	temporaryIndexParents  map[string]string
+	temporarySnapshots     []temporaryRelationSnapshot
+}
+
+type temporaryRelationSnapshot struct {
+	name         string
+	relations    map[string]struct{}
+	onCommitDrop map[string]struct{}
+	indexParents map[string]string
 }
 
 type sessionSetting struct {
@@ -707,15 +736,15 @@ func validateTransactionalFleetDDL(sql string) error {
 			raw.Stmt.GetCreateTableSpaceStmt() != nil,
 			raw.Stmt.GetDropTableSpaceStmt() != nil,
 			raw.Stmt.GetAlterSystemStmt() != nil:
-			return fmt.Errorf("non-transactional fleet-wide DDL is not supported; use Hamstergres Migrations")
+			return fmt.Errorf("non-transactional fleet-wide DDL is not supported; use hamstergres-migrations")
 		case raw.Stmt.GetCreateFunctionStmt() != nil:
-			return fmt.Errorf("user-defined functions and procedures are not supported across Burrows; use Hamstergres Migrations")
+			return fmt.Errorf("user-defined functions and procedures are not supported across Burrows; use hamstergres-migrations")
 		}
 		if index := raw.Stmt.GetIndexStmt(); index != nil && index.Concurrent {
-			return fmt.Errorf("concurrent index DDL is not supported across Burrows; use Hamstergres Migrations")
+			return fmt.Errorf("concurrent index DDL is not supported across Burrows; use hamstergres-migrations")
 		}
 		if drop := raw.Stmt.GetDropStmt(); drop != nil && drop.Concurrent {
-			return fmt.Errorf("concurrent index DDL is not supported across Burrows; use Hamstergres Migrations")
+			return fmt.Errorf("concurrent index DDL is not supported across Burrows; use hamstergres-migrations")
 		}
 	}
 	return nil
@@ -729,9 +758,12 @@ func (s *Server) validateAtomicFleetDDL(sql string, targetCount int) error {
 	if err == nil {
 		for _, raw := range tree.Stmts {
 			if raw.Stmt != nil && raw.Stmt.GetCreateFunctionStmt() != nil {
-				return fmt.Errorf("user-defined functions and procedures are not supported across Burrows; use Hamstergres Migrations")
+				return fmt.Errorf("user-defined functions and procedures are not supported across Burrows; use hamstergres-migrations")
 			}
 		}
+	}
+	if isServerLocalDDL(sql) {
+		return validateTransactionalFleetDDL(sql)
 	}
 	if !requiresFleetWriteOrder(sql, targetCount) {
 		return nil
@@ -1393,7 +1425,47 @@ func finishCopyTrace(state *extendedState, err error) {
 	state.copyTunnelSpans = nil
 }
 
+// refreshSchemaAfterDDL marks the process-wide routing registry stale before
+// attempting publication. The pending bit survives frontend disconnects and
+// is cleared only after a successful refresh.
+func (s *Server) refreshSchemaAfterDDL(ctx context.Context) error {
+	s.schemaRefreshPending.Store(true)
+	return s.refreshSchemaIfPending(ctx)
+}
+
+func (s *Server) refreshSchemaIfPending(ctx context.Context) error {
+	if !s.schemaRefreshPending.Load() {
+		return nil
+	}
+	s.schemaRefreshMu.Lock()
+	defer s.schemaRefreshMu.Unlock()
+	if !s.schemaRefreshPending.Load() {
+		return nil
+	}
+	if err := s.backends.RefreshSchema(ctx); err != nil {
+		return err
+	}
+	s.schemaRefreshPending.Store(false)
+	return nil
+}
+
+func (s *Server) refreshSchemaBarrier(ctx context.Context, localDirty bool) error {
+	if localDirty {
+		return s.refreshSchemaAfterDDL(ctx)
+	}
+	return s.refreshSchemaIfPending(ctx)
+}
+
 func (s *Server) handleSync(frontend *pgproto3.Backend, session *backend.Session, state *extendedState) bool {
+	if !state.transaction && (state.schemaDirty || s.schemaRefreshPending.Load()) {
+		if err := s.refreshSchemaBarrier(context.Background(), state.schemaDirty); err != nil {
+			frontend.Send(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "55000", Message: fmt.Sprintf("refresh schema registry after DDL: %v", err)})
+			frontend.Send(&pgproto3.ReadyForQuery{TxStatus: state.txStatus()})
+			session.UnlockFleetWrites()
+			return true
+		}
+		state.schemaDirty = false
+	}
 	targets := session.ConnectedNames()
 	if len(targets) == 0 {
 		frontend.Send(&pgproto3.ReadyForQuery{TxStatus: state.txStatus()})
@@ -1403,15 +1475,6 @@ func (s *Server) handleSync(frontend *pgproto3.Backend, session *backend.Session
 	if err != nil {
 		s.sendExtendedError(frontend, "08006", err.Error())
 		return false
-	}
-	if state.schemaDirty && !state.transaction {
-		if err := s.backends.RefreshSchema(context.Background()); err != nil {
-			frontend.Send(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "55000", Message: fmt.Sprintf("refresh schema registry after DDL: %v", err)})
-			frontend.Send(&pgproto3.ReadyForQuery{TxStatus: state.txStatus()})
-			session.UnlockFleetWrites()
-			return true
-		}
-		state.schemaDirty = false
 	}
 	if !s.relaySync(frontend, responses, state.txStatus()) {
 		return false
@@ -1454,16 +1517,14 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 	if pending.execute != nil {
 		sessionPolicy = state.classifySessionState(pending.portal.sql)
 		state.beginSessionState(sessionPolicy)
-		temporaryDDL := state.referencesTemporaryDDL(pending.portal.sql)
-		if !temporaryDDL {
-			if err := s.validateAtomicFleetDDL(pending.portal.sql, len(pending.targets)); err != nil {
-				return fail("0A000", err.Error())
-			}
+		temporaryDDL, err := state.validateAtomicFleetDDL(s, pending.portal.sql, len(pending.targets))
+		if err != nil {
+			return fail("0A000", err.Error())
 		}
-		if requiresFleetWriteOrder(pending.portal.sql, len(pending.targets)) && !session.LockFleetWritesContext(session.Context()) {
+		if requiresFleetWriteOrder(pending.portal.sql, len(pending.targets)) && !temporaryDDL && !session.LockFleetWritesContext(session.Context()) {
 			return s.failPendingExtended(frontend, state, emitReady, "57014", "frontend session ended while waiting to execute a write")
 		}
-		fleetWriteGateAcquired = requiresFleetWriteOrder(pending.portal.sql, len(pending.targets))
+		fleetWriteGateAcquired = requiresFleetWriteOrder(pending.portal.sql, len(pending.targets)) && !temporaryDDL
 		if !state.transaction && fleetWriteGateAcquired && !temporaryDDL {
 			if response := s.beginAtomicFleetDDL(context.Background(), session, pending.targets); response != nil {
 				return fail(response.Code, response.Message)
@@ -1617,16 +1678,15 @@ func (s *Server) flushPendingExtended(frontend *pgproto3.Backend, session *backe
 			if pending.portal.schema && !temporaryDDL {
 				state.schemaDirty = true
 			}
-			state.rememberTemporaryDDL(pending.portal.sql)
+			state.applySuccessfulSQLState(pending.portal.sql)
 			state.commitSessionState(sessionPolicy)
-			updateTransactionState(state, pending.portal.sql)
 			if !state.transaction && (firstSQLKeyword(pending.portal.sql) == "ROLLBACK" || firstSQLKeyword(pending.portal.sql) == "ABORT") {
 				state.schemaDirty = false
 			}
 		}
 	}
 	if state.schemaDirty && !backendFailed && !state.transaction {
-		if err := s.backends.RefreshSchema(context.Background()); err != nil {
+		if err := s.refreshSchemaAfterDDL(context.Background()); err != nil {
 			frontend.Send(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "55000", Message: fmt.Sprintf("refresh schema registry after DDL: %v", err)})
 			backendFailed = true
 		} else {
@@ -1690,11 +1750,10 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 			return false
 		}
 		if state.schemaDirty {
-			if err := s.backends.RefreshSchema(context.Background()); err != nil {
+			if err := s.refreshSchemaAfterDDL(context.Background()); err != nil {
 				s.sendExtendedError(frontend, "55000", fmt.Sprintf("refresh schema registry after DDL: %v", err))
 				state.transaction = false
 				state.mutated = false
-				state.schemaDirty = false
 				clear(state.writeParticipants)
 				session.UnlockFleetWrites()
 				return false
@@ -1702,6 +1761,7 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 			state.schemaDirty = false
 		}
 		frontend.Send(&pgproto3.CommandComplete{CommandTag: []byte("COMMIT")})
+		state.finishTemporaryTransaction(true, false)
 		state.transaction = false
 		state.mutated = false
 		clear(state.writeParticipants)
@@ -1722,16 +1782,14 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 	} else {
 		querySpan.SetAttributes(attribute.String("hamstergres.route", "scatter"))
 	}
-	temporaryDDL := state.referencesTemporaryDDL(portal.sql)
-	if !temporaryDDL {
-		if err := s.validateAtomicFleetDDL(portal.sql, len(targets)); err != nil {
-			errorCategory = "unsupported_ddl"
-			s.sendExtendedError(frontend, "0A000", err.Error())
-			return false
-		}
+	temporaryDDL, err := state.validateAtomicFleetDDL(s, portal.sql, len(targets))
+	if err != nil {
+		errorCategory = "unsupported_ddl"
+		s.sendExtendedError(frontend, "0A000", err.Error())
+		return false
 	}
 	atomicDDL := !state.transaction && requiresFleetWriteOrder(portal.sql, len(targets)) && !temporaryDDL
-	if requiresFleetWriteOrder(portal.sql, len(targets)) && !session.LockFleetWritesContext(session.Context()) {
+	if requiresFleetWriteOrder(portal.sql, len(targets)) && !temporaryDDL && !session.LockFleetWritesContext(session.Context()) {
 		errorCategory = "client_disconnect"
 		s.sendExtendedError(frontend, "57014", "frontend session ended while waiting to execute a write")
 		return false
@@ -1840,8 +1898,7 @@ func (s *Server) handleExecute(frontend *pgproto3.Backend, session *backend.Sess
 	if !temporaryDDL {
 		recordWriteParticipants(state, portal.sql, targets)
 	}
-	state.rememberTemporaryDDL(portal.sql)
-	updateTransactionState(state, portal.sql)
+	state.applySuccessfulSQLState(portal.sql)
 	if !state.transaction && (firstSQLKeyword(portal.sql) == "ROLLBACK" || firstSQLKeyword(portal.sql) == "ABORT") {
 		state.schemaDirty = false
 	}
@@ -2112,12 +2169,10 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 		return false
 	}
 	sql = normalized.sql
-	temporaryDDL := state.referencesTemporaryDDL(sql)
-	if !temporaryDDL {
-		if err := s.validateAtomicFleetDDL(sql, len(s.backends.ShardNames())); err != nil {
-			s.sendSessionError(frontend, state.txStatus(), "0A000", err.Error())
-			return false
-		}
+	temporaryDDL, err := state.validateAtomicFleetDDL(s, sql, len(s.backends.ShardNames()))
+	if err != nil {
+		s.sendSessionError(frontend, state.txStatus(), "0A000", err.Error())
+		return false
 	}
 	var generationErr error
 	registry := s.backends.Schema()
@@ -2185,7 +2240,7 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 		s.sendSessionError(frontend, state.txStatus(), "0A000", "write to a sharded table must include its annotated shard key")
 		return false
 	}
-	if requiresFleetWriteOrder(sql, len(targets)) {
+	if requiresFleetWriteOrder(sql, len(targets)) && !temporaryDDL {
 		routed = false
 	} else if routed && !isTransactionControl(sql) {
 		targets = []string{target}
@@ -2201,7 +2256,7 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 		}
 	}
 	atomicDDL := !state.transaction && requiresFleetWriteOrder(sql, len(targets)) && !temporaryDDL
-	if requiresFleetWriteOrder(sql, len(targets)) && !session.LockFleetWritesContext(session.Context()) {
+	if requiresFleetWriteOrder(sql, len(targets)) && !temporaryDDL && !session.LockFleetWritesContext(session.Context()) {
 		errorCategory = "client_disconnect"
 		s.sendSessionError(frontend, state.txStatus(), "57014", "frontend session ended while waiting to execute a write")
 		return false
@@ -2302,13 +2357,15 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 		}
 	}
 	if normalized.schema && !temporaryDDL && !state.transaction {
-		if err := s.backends.RefreshSchema(context.Background()); err != nil {
+		state.schemaDirty = true
+		if err := s.refreshSchemaAfterDDL(context.Background()); err != nil {
 			s.sendSessionError(frontend, state.txStatus(), "55000", fmt.Sprintf("refresh schema registry after DDL: %v", err))
 			if atomicDDL {
 				session.UnlockFleetWrites()
 			}
 			return false
 		}
+		state.schemaDirty = false
 	} else if normalized.schema && !temporaryDDL {
 		state.schemaDirty = true
 	}
@@ -2336,12 +2393,11 @@ func (s *Server) handleSessionQuery(frontend *pgproto3.Backend, session *backend
 			recordWriteParticipants(state, sql, targets)
 		}
 	}
-	state.rememberTemporaryDDL(sql)
-	updateTransactionState(state, sql)
+	state.applySuccessfulSQLState(sql)
 	if state.schemaDirty && !state.transaction {
 		if firstSQLKeyword(sql) == "ROLLBACK" || firstSQLKeyword(sql) == "ABORT" {
 			state.schemaDirty = false
-		} else if err := s.backends.RefreshSchema(context.Background()); err != nil {
+		} else if err := s.refreshSchemaAfterDDL(context.Background()); err != nil {
 			s.sendSessionError(frontend, state.txStatus(), "55000", fmt.Sprintf("refresh schema registry after DDL: %v", err))
 			session.UnlockFleetWrites()
 			return false
@@ -2418,12 +2474,11 @@ func (s *Server) handleTwoPhaseCommit(frontend *pgproto3.Backend, session *backe
 		return false
 	}
 	if state.schemaDirty {
-		if err := s.backends.RefreshSchema(context.Background()); err != nil {
+		if err := s.refreshSchemaAfterDDL(context.Background()); err != nil {
 			span.SetStatus(codes.Error, "schema registry refresh failed")
 			s.sendSessionError(frontend, 'I', "55000", fmt.Sprintf("refresh schema registry after DDL: %v", err))
 			state.transaction = false
 			state.mutated = false
-			state.schemaDirty = false
 			state.target = ""
 			clear(state.writeParticipants)
 			session.UnlockFleetWrites()
@@ -2432,6 +2487,7 @@ func (s *Server) handleTwoPhaseCommit(frontend *pgproto3.Backend, session *backe
 		state.schemaDirty = false
 	}
 	span.SetStatus(codes.Ok, "")
+	state.finishTemporaryTransaction(true, false)
 	state.transaction = false
 	state.mutated = false
 	state.target = ""
@@ -2686,36 +2742,46 @@ func updateTransactionState(state *extendedState, sql string) {
 		if raw.Stmt == nil {
 			continue
 		}
-		transaction := raw.Stmt.GetTransactionStmt()
-		if transaction == nil {
-			continue
-		}
-		switch transaction.Kind {
-		case pg_query.TransactionStmtKind_TRANS_STMT_BEGIN, pg_query.TransactionStmtKind_TRANS_STMT_START:
-			state.transaction = true
-			state.transactionFailed = false
-			state.target = ""
-			state.mutated = false
-			clear(state.writeParticipants)
-		case pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK_TO:
-			state.transaction = true
-			state.transactionFailed = false
-		case pg_query.TransactionStmtKind_TRANS_STMT_COMMIT,
-			pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK:
-			state.transaction = transaction.Chain
-			state.transactionFailed = false
-			state.target = ""
-			state.mutated = false
-			clear(state.writeParticipants)
-		case pg_query.TransactionStmtKind_TRANS_STMT_PREPARE,
-			pg_query.TransactionStmtKind_TRANS_STMT_COMMIT_PREPARED,
-			pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK_PREPARED:
-			state.transaction = false
-			state.transactionFailed = false
-			state.target = ""
-			state.mutated = false
-			clear(state.writeParticipants)
-		}
+		state.updateTransactionStatement(raw.Stmt.GetTransactionStmt())
+	}
+}
+
+func (state *extendedState) updateTransactionStatement(transaction *pg_query.TransactionStmt) {
+	if transaction == nil {
+		return
+	}
+	switch transaction.Kind {
+	case pg_query.TransactionStmtKind_TRANS_STMT_BEGIN, pg_query.TransactionStmtKind_TRANS_STMT_START:
+		state.beginTemporaryTransaction()
+		state.transaction = true
+		state.transactionFailed = false
+		state.target = ""
+		state.mutated = false
+		clear(state.writeParticipants)
+	case pg_query.TransactionStmtKind_TRANS_STMT_SAVEPOINT:
+		state.rememberTemporarySavepoint(transaction.SavepointName)
+	case pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK_TO:
+		state.restoreTemporarySavepoint(transaction.SavepointName)
+		state.transaction = true
+		state.transactionFailed = false
+	case pg_query.TransactionStmtKind_TRANS_STMT_RELEASE:
+		state.releaseTemporarySavepoint(transaction.SavepointName)
+	case pg_query.TransactionStmtKind_TRANS_STMT_COMMIT,
+		pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK:
+		state.finishTemporaryTransaction(transaction.Kind == pg_query.TransactionStmtKind_TRANS_STMT_COMMIT, transaction.Chain)
+		state.transaction = transaction.Chain
+		state.transactionFailed = false
+		state.target = ""
+		state.mutated = false
+		clear(state.writeParticipants)
+	case pg_query.TransactionStmtKind_TRANS_STMT_PREPARE,
+		pg_query.TransactionStmtKind_TRANS_STMT_COMMIT_PREPARED,
+		pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK_PREPARED:
+		state.transaction = false
+		state.transactionFailed = false
+		state.target = ""
+		state.mutated = false
+		clear(state.writeParticipants)
 	}
 }
 
@@ -2760,7 +2826,16 @@ func requiresFleetWriteOrder(sql string, targetCount int) bool {
 	if targetCount < 2 {
 		return false
 	}
-	return containsFleetDDL(sql) && !isTemporaryDDL(sql) && !isServerLocalDDL(sql)
+	tree, err := pg_query.Parse(sql)
+	if err != nil {
+		return false
+	}
+	for _, raw := range tree.Stmts {
+		if raw.Stmt != nil && isFleetDDLStatement(raw.Stmt) && !protobufContainsTemporaryRelation(raw.Stmt.ProtoReflect()) && !isServerLocalDDLStatement(raw.Stmt) {
+			return true
+		}
+	}
+	return false
 }
 
 // containsFleetDDL classifies top-level statements from PostgreSQL's AST.
@@ -2773,44 +2848,57 @@ func containsFleetDDL(sql string) bool {
 		return false
 	}
 	for _, raw := range tree.Stmts {
-		if raw.Stmt == nil {
-			continue
-		}
-		switch statement := raw.Stmt.GetNode().(type) {
-		case *pg_query.Node_SelectStmt:
-			if statement.SelectStmt.IntoClause != nil {
-				return true
-			}
-		case *pg_query.Node_InsertStmt,
-			*pg_query.Node_UpdateStmt,
-			*pg_query.Node_DeleteStmt,
-			*pg_query.Node_MergeStmt,
-			*pg_query.Node_CopyStmt,
-			*pg_query.Node_VariableSetStmt,
-			*pg_query.Node_VariableShowStmt,
-			*pg_query.Node_DeclareCursorStmt,
-			*pg_query.Node_ClosePortalStmt,
-			*pg_query.Node_FetchStmt,
-			*pg_query.Node_NotifyStmt,
-			*pg_query.Node_ListenStmt,
-			*pg_query.Node_UnlistenStmt,
-			*pg_query.Node_TransactionStmt,
-			*pg_query.Node_VacuumStmt,
-			*pg_query.Node_ExplainStmt,
-			*pg_query.Node_CheckPointStmt,
-			*pg_query.Node_DiscardStmt,
-			*pg_query.Node_LockStmt,
-			*pg_query.Node_ConstraintsSetStmt,
-			*pg_query.Node_PrepareStmt,
-			*pg_query.Node_ExecuteStmt,
-			*pg_query.Node_DeallocateStmt,
-			*pg_query.Node_CallStmt:
-			// Not schema DDL.
-		default:
+		if raw.Stmt != nil && isFleetDDLStatement(raw.Stmt) {
 			return true
 		}
 	}
 	return false
+}
+
+func isFleetDDLStatement(statement *pg_query.Node) bool {
+	if statement == nil {
+		return false
+	}
+	switch node := statement.GetNode().(type) {
+	case *pg_query.Node_SelectStmt:
+		if node.SelectStmt.IntoClause != nil {
+			return true
+		}
+	case *pg_query.Node_InsertStmt,
+		*pg_query.Node_UpdateStmt,
+		*pg_query.Node_DeleteStmt,
+		*pg_query.Node_MergeStmt,
+		*pg_query.Node_CopyStmt,
+		*pg_query.Node_VariableSetStmt,
+		*pg_query.Node_VariableShowStmt,
+		*pg_query.Node_DeclareCursorStmt,
+		*pg_query.Node_ClosePortalStmt,
+		*pg_query.Node_FetchStmt,
+		*pg_query.Node_NotifyStmt,
+		*pg_query.Node_ListenStmt,
+		*pg_query.Node_UnlistenStmt,
+		*pg_query.Node_TransactionStmt,
+		*pg_query.Node_VacuumStmt,
+		*pg_query.Node_ExplainStmt,
+		*pg_query.Node_CheckPointStmt,
+		*pg_query.Node_DiscardStmt,
+		*pg_query.Node_LockStmt,
+		*pg_query.Node_ConstraintsSetStmt,
+		*pg_query.Node_PrepareStmt,
+		*pg_query.Node_ExecuteStmt,
+		*pg_query.Node_DeallocateStmt,
+		*pg_query.Node_CallStmt:
+		// Not schema DDL.
+	default:
+		return true
+	}
+	return false
+}
+
+func isServerLocalDDLStatement(statement *pg_query.Node) bool {
+	return statement != nil && (statement.GetCreatedbStmt() != nil || statement.GetDropdbStmt() != nil ||
+		statement.GetCreateTableSpaceStmt() != nil || statement.GetDropTableSpaceStmt() != nil ||
+		statement.GetAlterSystemStmt() != nil)
 }
 
 func isTemporaryDDL(sql string) bool {
@@ -2835,9 +2923,7 @@ func isServerLocalDDL(sql string) bool {
 		if raw.Stmt == nil {
 			continue
 		}
-		if raw.Stmt.GetCreatedbStmt() != nil || raw.Stmt.GetDropdbStmt() != nil ||
-			raw.Stmt.GetCreateTableSpaceStmt() != nil || raw.Stmt.GetDropTableSpaceStmt() != nil ||
-			raw.Stmt.GetAlterSystemStmt() != nil {
+		if isServerLocalDDLStatement(raw.Stmt) {
 			return true
 		}
 	}
@@ -3065,36 +3151,85 @@ func protobufContainsTemporaryRelation(message protoreflect.Message) bool {
 	return found
 }
 
-func (state *extendedState) referencesTemporaryDDL(sql string) bool {
-	if isTemporaryDDL(sql) {
-		return true
-	}
+func (state *extendedState) classifyTemporaryDDL(sql string) (temporaryOnly, mixed bool) {
 	tree, err := pg_query.Parse(sql)
-	if err != nil || len(state.temporaryRelations) == 0 {
-		return false
+	if err != nil {
+		return false, false
 	}
+	working := extendedState{
+		// A simple-query batch is one implicit transaction, so ON COMMIT DROP
+		// relations remain addressable by later statements in the same batch.
+		transaction:           true,
+		temporaryRelations:    cloneStringSet(state.temporaryRelations),
+		temporaryOnCommitDrop: cloneStringSet(state.temporaryOnCommitDrop),
+		temporaryIndexParents: cloneStringMap(state.temporaryIndexParents),
+	}
+	hasTemporary := false
+	hasDurableFleetDDL := false
 	for _, raw := range tree.Stmts {
 		if raw.Stmt == nil {
 			continue
 		}
-		if protobufReferencesRelation(raw.Stmt.ProtoReflect(), state.temporaryRelations) {
-			return true
+		if discard := raw.Stmt.GetDiscardStmt(); discard != nil && (discard.Target == pg_query.DiscardMode_DISCARD_TEMP || discard.Target == pg_query.DiscardMode_DISCARD_ALL) {
+			hasTemporary = true
+			working.rememberTemporaryStatement(raw.Stmt)
+			continue
 		}
-		if drop := raw.Stmt.GetDropStmt(); drop != nil {
-			for _, name := range dropObjectNames(drop) {
-				if _, ok := state.temporaryRelations[name]; ok {
-					return true
+		if drop := raw.Stmt.GetDropStmt(); drop != nil && dropTargetsTemporaryRelations(drop) {
+			names := dropObjectNames(drop)
+			if len(names) > 0 {
+				for _, name := range names {
+					if temporaryNameSetContains(working.temporaryRelations, name) {
+						hasTemporary = true
+					} else {
+						hasDurableFleetDDL = true
+					}
 				}
+				working.rememberTemporaryStatement(raw.Stmt)
+				continue
 			}
 		}
+		statementTemporary := protobufContainsTemporaryRelation(raw.Stmt.ProtoReflect()) || protobufReferencesRelation(raw.Stmt.ProtoReflect(), working.temporaryRelations)
+		if statementTemporary {
+			hasTemporary = true
+		}
+		if isFleetDDLStatement(raw.Stmt) && !statementTemporary {
+			hasDurableFleetDDL = true
+		}
+		working.rememberTemporaryStatement(raw.Stmt)
 	}
-	return false
+	return hasTemporary && !hasDurableFleetDDL, hasTemporary && hasDurableFleetDDL
+}
+
+func (state *extendedState) referencesTemporaryDDL(sql string) bool {
+	temporaryOnly, _ := state.classifyTemporaryDDL(sql)
+	return temporaryOnly
+}
+
+func (state *extendedState) validateAtomicFleetDDL(server *Server, sql string, targetCount int) (bool, error) {
+	temporaryDDL, mixed := state.classifyTemporaryDDL(sql)
+	if mixed {
+		return false, fmt.Errorf("temporary and durable fleet DDL cannot be combined in one simple-query batch")
+	}
+	if temporaryDDL {
+		return true, nil
+	}
+	return false, server.validateAtomicFleetDDL(sql, targetCount)
 }
 
 func (state *extendedState) rememberTemporaryDDL(sql string) {
-	if state.temporaryRelations == nil {
-		state.temporaryRelations = make(map[string]struct{})
+	state.ensureTemporaryState()
+	tree, err := pg_query.Parse(sql)
+	if err != nil {
+		return
 	}
+	for _, raw := range tree.Stmts {
+		state.rememberTemporaryStatement(raw.Stmt)
+	}
+}
+
+func (state *extendedState) applySuccessfulSQLState(sql string) {
+	state.ensureTemporaryState()
 	tree, err := pg_query.Parse(sql)
 	if err != nil {
 		return
@@ -3103,45 +3238,176 @@ func (state *extendedState) rememberTemporaryDDL(sql string) {
 		if raw.Stmt == nil {
 			continue
 		}
-		if create := raw.Stmt.GetCreateStmt(); create != nil && create.Relation != nil && create.Relation.Relpersistence == "t" {
-			rememberRangeVar(state.temporaryRelations, create.Relation)
+		if transaction := raw.Stmt.GetTransactionStmt(); transaction != nil {
+			state.updateTransactionStatement(transaction)
+			continue
 		}
-		if createAs := raw.Stmt.GetCreateTableAsStmt(); createAs != nil && createAs.Into != nil && createAs.Into.Rel != nil && createAs.Into.Rel.Relpersistence == "t" {
-			rememberRangeVar(state.temporaryRelations, createAs.Into.Rel)
+		state.rememberTemporaryStatement(raw.Stmt)
+	}
+}
+
+func (state *extendedState) rememberTemporaryStatement(statement *pg_query.Node) {
+	if statement == nil {
+		return
+	}
+	if create := statement.GetCreateStmt(); create != nil && create.Relation != nil && create.Relation.Relpersistence == "t" {
+		state.rememberTemporaryRelation(create.Relation, create.Oncommit)
+	}
+	if createAs := statement.GetCreateTableAsStmt(); createAs != nil && createAs.Into != nil && createAs.Into.Rel != nil && createAs.Into.Rel.Relpersistence == "t" {
+		state.rememberTemporaryRelation(createAs.Into.Rel, createAs.Into.OnCommit)
+	}
+	if selectStatement := statement.GetSelectStmt(); selectStatement != nil && selectStatement.IntoClause != nil && selectStatement.IntoClause.Rel != nil && selectStatement.IntoClause.Rel.Relpersistence == "t" {
+		state.rememberTemporaryRelation(selectStatement.IntoClause.Rel, selectStatement.IntoClause.OnCommit)
+	}
+	if index := statement.GetIndexStmt(); index != nil && index.Relation != nil && relationSetContains(state.temporaryRelations, index.Relation) && index.Idxname != "" {
+		state.rememberTemporaryIndex(index)
+	}
+	if rename := statement.GetRenameStmt(); rename != nil {
+		state.renameTemporaryRelation(rename)
+	}
+	if drop := statement.GetDropStmt(); drop != nil && dropTargetsTemporaryRelations(drop) {
+		cascade := drop.RemoveType != pg_query.ObjectType_OBJECT_INDEX
+		for _, name := range dropObjectNames(drop) {
+			state.forgetTemporaryName(name, cascade)
 		}
-		if selectStatement := raw.Stmt.GetSelectStmt(); selectStatement != nil && selectStatement.IntoClause != nil && selectStatement.IntoClause.Rel != nil && selectStatement.IntoClause.Rel.Relpersistence == "t" {
-			rememberRangeVar(state.temporaryRelations, selectStatement.IntoClause.Rel)
+	}
+	if discard := statement.GetDiscardStmt(); discard != nil && (discard.Target == pg_query.DiscardMode_DISCARD_TEMP || discard.Target == pg_query.DiscardMode_DISCARD_ALL) {
+		clear(state.temporaryRelations)
+		clear(state.temporaryOnCommitDrop)
+		clear(state.temporaryIndexParents)
+	}
+}
+
+func (state *extendedState) ensureTemporaryState() {
+	if state.temporaryRelations == nil {
+		state.temporaryRelations = make(map[string]struct{})
+	}
+	if state.temporaryOnCommitDrop == nil {
+		state.temporaryOnCommitDrop = make(map[string]struct{})
+	}
+	if state.temporaryIndexParents == nil {
+		state.temporaryIndexParents = make(map[string]string)
+	}
+}
+
+func (state *extendedState) rememberTemporaryRelation(relation *pg_query.RangeVar, onCommit pg_query.OnCommitAction) {
+	if relation == nil || relation.Relname == "" || onCommit == pg_query.OnCommitAction_ONCOMMIT_DROP && !state.transaction {
+		return
+	}
+	keys := temporaryRelationKeys(relation)
+	for _, key := range keys {
+		state.temporaryRelations[key] = struct{}{}
+		if onCommit == pg_query.OnCommitAction_ONCOMMIT_DROP {
+			state.temporaryOnCommitDrop[key] = struct{}{}
 		}
-		if index := raw.Stmt.GetIndexStmt(); index != nil && index.Relation != nil && relationSetContains(state.temporaryRelations, index.Relation) && index.Idxname != "" {
-			state.temporaryRelations[index.Idxname] = struct{}{}
+	}
+}
+
+func (state *extendedState) rememberTemporaryIndex(index *pg_query.IndexStmt) {
+	name := temporaryObjectName{name: index.Idxname}
+	if strings.EqualFold(index.Relation.Schemaname, "pg_temp") {
+		name.schema = "pg_temp"
+	}
+	parent := temporaryRelationCanonicalName(index.Relation)
+	for _, key := range temporaryNameKeys(name) {
+		state.temporaryRelations[key] = struct{}{}
+		state.temporaryIndexParents[key] = parent
+	}
+}
+
+func (state *extendedState) renameTemporaryRelation(rename *pg_query.RenameStmt) {
+	if rename.Relation == nil || rename.Newname == "" || !renameTargetsRelation(rename.RenameType) || !relationSetContains(state.temporaryRelations, rename.Relation) {
+		return
+	}
+	oldKeys := temporaryRelationKeys(rename.Relation)
+	newRelation := *rename.Relation
+	newRelation.Relname = rename.Newname
+	newKeys := temporaryRelationKeys(&newRelation)
+	indexParent := ""
+	for _, key := range oldKeys {
+		if parent, ok := state.temporaryIndexParents[key]; ok {
+			indexParent = parent
 		}
-		if drop := raw.Stmt.GetDropStmt(); drop != nil {
-			for _, name := range dropObjectNames(drop) {
-				delete(state.temporaryRelations, name)
+		delete(state.temporaryRelations, key)
+		delete(state.temporaryIndexParents, key)
+	}
+	if indexParent != "" {
+		for _, key := range newKeys {
+			state.temporaryRelations[key] = struct{}{}
+			state.temporaryIndexParents[key] = indexParent
+		}
+		return
+	}
+	oldCanonical := temporaryRelationCanonicalName(rename.Relation)
+	newCanonical := temporaryRelationCanonicalName(&newRelation)
+	onCommitDrop := false
+	for _, key := range oldKeys {
+		if _, ok := state.temporaryOnCommitDrop[key]; ok {
+			onCommitDrop = true
+		}
+		delete(state.temporaryOnCommitDrop, key)
+	}
+	for key, parent := range state.temporaryIndexParents {
+		if parent == oldCanonical {
+			state.temporaryIndexParents[key] = newCanonical
+		}
+	}
+	for _, key := range newKeys {
+		state.temporaryRelations[key] = struct{}{}
+		if onCommitDrop {
+			state.temporaryOnCommitDrop[key] = struct{}{}
+		}
+	}
+}
+
+func (state *extendedState) forgetTemporaryName(name temporaryObjectName, cascade bool) {
+	canonical := temporaryNameCanonical(name)
+	for _, key := range temporaryNameKeys(name) {
+		delete(state.temporaryRelations, key)
+		delete(state.temporaryOnCommitDrop, key)
+		delete(state.temporaryIndexParents, key)
+	}
+	if cascade {
+		for key, parent := range state.temporaryIndexParents {
+			if parent == canonical {
+				delete(state.temporaryRelations, key)
+				delete(state.temporaryIndexParents, key)
 			}
 		}
 	}
 }
 
-func rememberRangeVar(relations map[string]struct{}, relation *pg_query.RangeVar) {
-	if relation == nil || relation.Relname == "" {
-		return
-	}
-	relations[relation.Relname] = struct{}{}
-	if relation.Schemaname != "" {
-		relations[relation.Schemaname+"."+relation.Relname] = struct{}{}
-	}
-}
-
 func relationSetContains(relations map[string]struct{}, relation *pg_query.RangeVar) bool {
-	if relation == nil {
+	if relation == nil || relation.Relname == "" {
 		return false
 	}
-	if _, ok := relations[relation.Relname]; ok {
-		return true
+	if relation.Schemaname == "" {
+		_, ok := relations[relation.Relname]
+		return ok
+	}
+	if strings.EqualFold(relation.Schemaname, "pg_temp") {
+		if _, ok := relations["pg_temp."+relation.Relname]; ok {
+			return true
+		}
+		_, ok := relations[relation.Relname]
+		return ok
 	}
 	_, ok := relations[relation.Schemaname+"."+relation.Relname]
-	return relation.Schemaname != "" && ok
+	return ok
+}
+
+func temporaryRelationKeys(relation *pg_query.RangeVar) []string {
+	if relation == nil {
+		return nil
+	}
+	return temporaryNameKeys(temporaryObjectName{schema: relation.Schemaname, name: relation.Relname})
+}
+
+func temporaryRelationCanonicalName(relation *pg_query.RangeVar) string {
+	if relation == nil {
+		return ""
+	}
+	return temporaryNameCanonical(temporaryObjectName{schema: relation.Schemaname, name: relation.Relname})
 }
 
 func protobufReferencesRelation(message protoreflect.Message, relations map[string]struct{}) bool {
@@ -3175,8 +3441,13 @@ func protobufReferencesRelation(message protoreflect.Message, relations map[stri
 	return found
 }
 
-func dropObjectNames(drop *pg_query.DropStmt) []string {
-	var names []string
+type temporaryObjectName struct {
+	schema string
+	name   string
+}
+
+func dropObjectNames(drop *pg_query.DropStmt) []temporaryObjectName {
+	var names []temporaryObjectName
 	for _, object := range drop.Objects {
 		list := object.GetList()
 		if list == nil || len(list.Items) == 0 {
@@ -3191,12 +3462,166 @@ func dropObjectNames(drop *pg_query.DropStmt) []string {
 		if len(parts) == 0 {
 			continue
 		}
-		names = append(names, parts[len(parts)-1])
+		name := temporaryObjectName{name: parts[len(parts)-1]}
 		if len(parts) > 1 {
-			names = append(names, parts[len(parts)-2]+"."+parts[len(parts)-1])
+			name.schema = parts[len(parts)-2]
 		}
+		names = append(names, name)
 	}
 	return names
+}
+
+func temporaryNameKeys(name temporaryObjectName) []string {
+	if name.name == "" {
+		return nil
+	}
+	if name.schema == "" || strings.EqualFold(name.schema, "pg_temp") {
+		return []string{name.name, "pg_temp." + name.name}
+	}
+	return []string{name.schema + "." + name.name}
+}
+
+func temporaryNameCanonical(name temporaryObjectName) string {
+	if name.schema == "" || strings.EqualFold(name.schema, "pg_temp") {
+		return "pg_temp." + name.name
+	}
+	return name.schema + "." + name.name
+}
+
+func temporaryNameSetContains(relations map[string]struct{}, name temporaryObjectName) bool {
+	for _, key := range temporaryNameKeys(name) {
+		if _, ok := relations[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func dropTargetsTemporaryRelations(drop *pg_query.DropStmt) bool {
+	if drop == nil {
+		return false
+	}
+	switch drop.RemoveType {
+	case pg_query.ObjectType_OBJECT_TABLE,
+		pg_query.ObjectType_OBJECT_INDEX,
+		pg_query.ObjectType_OBJECT_SEQUENCE,
+		pg_query.ObjectType_OBJECT_VIEW,
+		pg_query.ObjectType_OBJECT_MATVIEW,
+		pg_query.ObjectType_OBJECT_FOREIGN_TABLE:
+		return true
+	default:
+		return false
+	}
+}
+
+func renameTargetsRelation(objectType pg_query.ObjectType) bool {
+	switch objectType {
+	case pg_query.ObjectType_OBJECT_TABLE,
+		pg_query.ObjectType_OBJECT_INDEX,
+		pg_query.ObjectType_OBJECT_SEQUENCE,
+		pg_query.ObjectType_OBJECT_VIEW,
+		pg_query.ObjectType_OBJECT_MATVIEW,
+		pg_query.ObjectType_OBJECT_FOREIGN_TABLE:
+		return true
+	default:
+		return false
+	}
+}
+
+func cloneStringSet(source map[string]struct{}) map[string]struct{} {
+	clone := make(map[string]struct{}, len(source))
+	for key := range source {
+		clone[key] = struct{}{}
+	}
+	return clone
+}
+
+func cloneStringMap(source map[string]string) map[string]string {
+	clone := make(map[string]string, len(source))
+	for key, value := range source {
+		clone[key] = value
+	}
+	return clone
+}
+
+func (state *extendedState) temporarySnapshot(name string) temporaryRelationSnapshot {
+	state.ensureTemporaryState()
+	return temporaryRelationSnapshot{
+		name:         name,
+		relations:    cloneStringSet(state.temporaryRelations),
+		onCommitDrop: cloneStringSet(state.temporaryOnCommitDrop),
+		indexParents: cloneStringMap(state.temporaryIndexParents),
+	}
+}
+
+func (state *extendedState) beginTemporaryTransaction() {
+	if len(state.temporarySnapshots) == 0 {
+		state.temporarySnapshots = append(state.temporarySnapshots, state.temporarySnapshot(""))
+	}
+}
+
+func (state *extendedState) rememberTemporarySavepoint(name string) {
+	state.beginTemporaryTransaction()
+	state.temporarySnapshots = append(state.temporarySnapshots, state.temporarySnapshot(name))
+}
+
+func (state *extendedState) restoreTemporarySavepoint(name string) {
+	for index := len(state.temporarySnapshots) - 1; index >= 1; index-- {
+		if state.temporarySnapshots[index].name != name {
+			continue
+		}
+		state.restoreTemporarySnapshot(state.temporarySnapshots[index])
+		state.temporarySnapshots = state.temporarySnapshots[:index+1]
+		return
+	}
+}
+
+func (state *extendedState) releaseTemporarySavepoint(name string) {
+	for index := len(state.temporarySnapshots) - 1; index >= 1; index-- {
+		if state.temporarySnapshots[index].name == name {
+			state.temporarySnapshots = state.temporarySnapshots[:index]
+			return
+		}
+	}
+}
+
+func (state *extendedState) restoreTemporarySnapshot(snapshot temporaryRelationSnapshot) {
+	state.temporaryRelations = cloneStringSet(snapshot.relations)
+	state.temporaryOnCommitDrop = cloneStringSet(snapshot.onCommitDrop)
+	state.temporaryIndexParents = cloneStringMap(snapshot.indexParents)
+}
+
+func (state *extendedState) finishTemporaryTransaction(commit, chain bool) {
+	state.ensureTemporaryState()
+	if commit {
+		state.applyTemporaryOnCommitDrop()
+	} else if len(state.temporarySnapshots) > 0 {
+		state.restoreTemporarySnapshot(state.temporarySnapshots[0])
+	}
+	state.temporarySnapshots = nil
+	if chain {
+		state.beginTemporaryTransaction()
+	}
+}
+
+func (state *extendedState) applyTemporaryOnCommitDrop() {
+	parents := make(map[string]struct{})
+	for key := range state.temporaryOnCommitDrop {
+		delete(state.temporaryRelations, key)
+		delete(state.temporaryIndexParents, key)
+		if strings.Contains(key, ".") {
+			parents[key] = struct{}{}
+		} else {
+			parents["pg_temp."+key] = struct{}{}
+		}
+	}
+	clear(state.temporaryOnCommitDrop)
+	for key, parent := range state.temporaryIndexParents {
+		if _, drop := parents[parent]; drop {
+			delete(state.temporaryRelations, key)
+			delete(state.temporaryIndexParents, key)
+		}
+	}
 }
 
 func functionName(call *pg_query.FuncCall) string {
@@ -3361,7 +3786,7 @@ func (s *Server) handleQuery(frontend *pgproto3.Backend, sql string) {
 	}
 	endTunnelSpans(tunnelSpans, nil)
 	if normalized.schema {
-		if err := s.backends.RefreshSchema(context.Background()); err != nil {
+		if err := s.refreshSchemaAfterDDL(context.Background()); err != nil {
 			errorCategory = "schema_registry"
 			s.sendError(frontend, "55000", fmt.Sprintf("refresh schema registry after DDL: %v", err))
 			return

@@ -254,6 +254,30 @@ func TestReadResultsRejectsIncompatibleFormatVersion(t *testing.T) {
 	}
 }
 
+func TestReadExpectedDifferencesRejectsUnknownAndMissingFields(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		contents string
+		want     string
+	}{
+		{name: "unknown", contents: `{"format_version":1,"postgresql_version":"17.10","difference":[]}`, want: "unknown field"},
+		{name: "missing", contents: `{"format_version":1,"postgresql_version":"17.10"}`, want: "omit differences"},
+		{name: "null", contents: `{"format_version":1,"postgresql_version":"17.10","differences":null}`, want: "omit differences"},
+		{name: "trailing", contents: `{"format_version":1,"postgresql_version":"17.10","differences":[]} {}`, want: "multiple JSON values"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "expected.json")
+			if err := os.WriteFile(path, []byte(test.contents), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := ReadExpectedDifferences(path)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestMarkdownSeparatesGapsFromRegressions(t *testing.T) {
 	results := Results{
 		PostgreSQLVersion: "17.10",

@@ -6,6 +6,7 @@ package pgcompat
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -216,11 +217,22 @@ func ReadExpectedDifferences(path string) (ExpectedDifferences, error) {
 		return ExpectedDifferences{}, err
 	}
 	var expected ExpectedDifferences
-	if err := json.Unmarshal(contents, &expected); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(contents))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&expected); err != nil {
+		return ExpectedDifferences{}, fmt.Errorf("decode expected differences %s: %w", path, err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("multiple JSON values")
+		}
 		return ExpectedDifferences{}, fmt.Errorf("decode expected differences %s: %w", path, err)
 	}
 	if expected.FormatVersion != ExpectedDifferencesFormatVersion {
 		return ExpectedDifferences{}, fmt.Errorf("expected differences %s use format version %d, want %d", path, expected.FormatVersion, ExpectedDifferencesFormatVersion)
+	}
+	if expected.Differences == nil {
+		return ExpectedDifferences{}, fmt.Errorf("expected differences %s omit differences", path)
 	}
 	seen := make(map[string]struct{}, len(expected.Differences))
 	for _, difference := range expected.Differences {

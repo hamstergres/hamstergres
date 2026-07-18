@@ -550,17 +550,9 @@ func TestFleetDDLFailureRollsBackEveryBurrow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer connection.Close(context.Background())
 	t.Cleanup(func() {
 		_, _ = connection.Exec(context.Background(), fmt.Sprintf("DROP FUNCTION IF EXISTS %s(); DROP TABLE IF EXISTS %s, %s, %s, %s CASCADE", dynamicFunction, dynamicTable, selected, after, parent)).ReadAll()
-		for _, port := range []string{"5541", "5542"} {
-			direct, err := pgx.Connect(context.Background(), "postgres://hamster:hamster@localhost:"+port+"/hamstergres?sslmode=disable")
-			if err != nil {
-				continue
-			}
-			_, _ = direct.Exec(context.Background(), fmt.Sprintf("DROP FUNCTION IF EXISTS %s(); DROP TABLE IF EXISTS %s, %s, %s, %s CASCADE", dynamicFunction, dynamicTable, selected, after, parent))
-			direct.Close(context.Background())
-		}
+		_ = connection.Close(context.Background())
 	})
 
 	for _, setup := range []string{
@@ -643,7 +635,7 @@ func TestFleetDDLFailureRollsBackEveryBurrow(t *testing.T) {
 	}
 	dynamicDefinition := fmt.Sprintf("CREATE FUNCTION %s() RETURNS void AS $$ BEGIN EXECUTE 'CREATE TABLE %s (id bigint)'; END $$ LANGUAGE plpgsql", dynamicFunction, dynamicTable)
 	dynamicError := postgresExecError(t, connection, dynamicDefinition)
-	if dynamicError.Code != "0A000" || !strings.Contains(dynamicError.Message, "Hamstergres Migrations") {
+	if dynamicError.Code != "0A000" || !strings.Contains(dynamicError.Message, "hamstergres-migrations") {
 		t.Fatalf("function creation error = %#v, want fail-closed 0A000", dynamicError)
 	}
 	for _, port := range []string{"5541", "5542"} {
@@ -1665,26 +1657,19 @@ func TestCrossBurrowTransactionCanDisableTwoPhaseCommit(t *testing.T) {
 	if err := os.WriteFile(configPath, contents, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	for _, port := range []string{"5541", "5542"} {
-		direct, err := pgx.Connect(context.Background(), "postgres://hamster:hamster@localhost:"+port+"/hamstergres?sslmode=disable")
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, err = direct.Exec(context.Background(), "DROP TABLE IF EXISTS no_two_pc_e2e; CREATE TABLE no_two_pc_e2e (id bigint PRIMARY KEY, value text); COMMENT ON COLUMN no_two_pc_e2e.id IS 'hamstergres.shard_key'")
-		direct.Close(context.Background())
-		if err != nil {
-			t.Fatalf("prepare no-2PC table on Burrow %s: %v", port, err)
-		}
+	setupFrontendAddress, setupStatusAddress := availableAddress(t), availableAddress(t)
+	setupLogs := startGateway(t, binary, writeGatewayConfig(t, setupFrontendAddress, setupStatusAddress))
+	waitForHealthyGateway(t, "http://"+setupStatusAddress, setupLogs)
+	setupConnection, err := pgx.Connect(context.Background(), "postgres://any-user@"+setupFrontendAddress+"/any-database?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := setupConnection.Exec(context.Background(), "DROP TABLE IF EXISTS no_two_pc_e2e; CREATE TABLE no_two_pc_e2e (id bigint PRIMARY KEY, value text); COMMENT ON COLUMN no_two_pc_e2e.id IS 'hamstergres.shard_key'"); err != nil {
+		t.Fatalf("prepare no-2PC table through setup gateway: %v\ngateway logs:\n%s", err, setupLogs.String())
 	}
 	t.Cleanup(func() {
-		for _, port := range []string{"5541", "5542"} {
-			direct, err := pgx.Connect(context.Background(), "postgres://hamster:hamster@localhost:"+port+"/hamstergres?sslmode=disable")
-			if err != nil {
-				continue
-			}
-			_, _ = direct.Exec(context.Background(), "DROP TABLE IF EXISTS no_two_pc_e2e")
-			direct.Close(context.Background())
-		}
+		_, _ = setupConnection.Exec(context.Background(), "DROP TABLE IF EXISTS no_two_pc_e2e")
+		setupConnection.Close(context.Background())
 	})
 	logs := startGateway(t, binary, configPath)
 	statusURL := "http://" + statusAddress

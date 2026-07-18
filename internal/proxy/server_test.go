@@ -526,14 +526,27 @@ func TestValidateTransactionalFleetDDLAllowsTransactionalSchemaChanges(t *testin
 
 func TestAtomicFleetDDLRequiresTwoPhaseCommit(t *testing.T) {
 	server := &Server{}
-	if err := server.validateAtomicFleetDDL("CREATE FUNCTION hidden_write() RETURNS void LANGUAGE SQL AS $$ SELECT 1 $$", 1); err == nil {
-		t.Fatal("function creation was accepted for a single current Burrow")
+	if err := server.validateAtomicFleetDDL("CREATE FUNCTION hidden_write() RETURNS void LANGUAGE SQL AS $$ SELECT 1 $$", 1); err == nil || err.Error() != "user-defined functions and procedures are not supported across Burrows; use hamstergres-migrations" {
+		t.Fatalf("function validation error = %v", err)
 	}
 	if err := server.validateAtomicFleetDDL("CREATE TABLE widgets (id bigint)", 2); err == nil {
 		t.Fatal("multi-Burrow DDL was accepted with two-phase commit disabled")
 	}
 	if err := server.validateAtomicFleetDDL("CREATE TABLE widgets (id bigint)", 1); err != nil {
 		t.Fatalf("single-Burrow DDL unexpectedly required two-phase commit: %v", err)
+	}
+}
+
+func TestAtomicFleetDDLRejectsServerLocalDDLBeforeFleetOrdering(t *testing.T) {
+	server := &Server{twoPhaseCommit: true}
+	for _, sql := range []string{
+		"CREATE DATABASE isolated_database",
+		"CREATE TABLESPACE regress_tblspace LOCATION ''",
+		"ALTER SYSTEM SET work_mem = '64MB'",
+	} {
+		if err := server.validateAtomicFleetDDL(sql, 2); err == nil || err.Error() != "non-transactional fleet-wide DDL is not supported; use hamstergres-migrations" {
+			t.Fatalf("validateAtomicFleetDDL(%q) error = %v", sql, err)
+		}
 	}
 }
 
@@ -607,6 +620,21 @@ func TestRequiresFleetWriteOrderLeavesDMLReadsAndTransactionsUnlocked(t *testing
 	}
 }
 
+func TestRequiresFleetWriteOrderClassifiesMixedBatchesPerStatement(t *testing.T) {
+	if !requiresFleetWriteOrder("CREATE TEMP TABLE session_items (id bigint); CREATE TABLE durable_items (id bigint)", 2) {
+		t.Fatal("temporary statement hid durable fleet DDL from ordering")
+	}
+	state := extendedState{}
+	temporary, err := state.validateAtomicFleetDDL(&Server{twoPhaseCommit: true}, "CREATE TEMP TABLE session_items (id bigint); ALTER TABLE session_items ADD COLUMN note text", 2)
+	if err != nil || !temporary {
+		t.Fatalf("wholly temporary batch classification = temporary %t, error %v", temporary, err)
+	}
+	temporary, err = state.validateAtomicFleetDDL(&Server{twoPhaseCommit: true}, "CREATE TEMP TABLE commit_drop_items (id bigint) ON COMMIT DROP; ALTER TABLE commit_drop_items ADD COLUMN note text", 2)
+	if err != nil || !temporary {
+		t.Fatalf("ON COMMIT DROP batch classification = temporary %t, error %v", temporary, err)
+	}
+}
+
 func TestExtendedStateTracksTemporaryRelationsAcrossDropStatements(t *testing.T) {
 	state := extendedState{}
 	create := "CREATE TEMP TABLE session_items (id bigint)"
@@ -632,6 +660,74 @@ func TestExtendedStateTracksTemporaryRelationsAcrossDropStatements(t *testing.T)
 	state.rememberTemporaryDDL(createAs)
 	if !state.referencesTemporaryDDL("CREATE INDEX selected_items_id_idx ON selected_items (id)") {
 		t.Fatal("index on a temporary CREATE TABLE AS relation was not recognized as temporary DDL")
+	}
+}
+
+func TestExtendedStateRejectsMixedTemporaryAndDurableDDL(t *testing.T) {
+	state := extendedState{}
+	server := &Server{twoPhaseCommit: true}
+	for _, sql := range []string{
+		"CREATE TEMP TABLE session_items (id bigint); CREATE TABLE durable_items (id bigint)",
+		"CREATE TEMP TABLE session_items (id bigint); CREATE FUNCTION hidden_write() RETURNS void LANGUAGE SQL AS $$ SELECT 1 $$",
+	} {
+		if _, err := state.validateAtomicFleetDDL(server, sql, 2); err == nil {
+			t.Fatalf("mixed batch %q was accepted", sql)
+		}
+	}
+
+	state.rememberTemporaryDDL("CREATE TEMP TABLE session_items (id bigint)")
+	if _, err := state.validateAtomicFleetDDL(server, "ALTER TABLE session_items ADD COLUMN note text; CREATE FUNCTION hidden_write() RETURNS void LANGUAGE SQL AS $$ SELECT 1 $$", 2); err == nil {
+		t.Fatal("tracked temporary DDL hid a following function definition")
+	}
+}
+
+func TestTemporaryRelationMatchingRespectsSchemaQualification(t *testing.T) {
+	state := extendedState{}
+	state.rememberTemporaryDDL("CREATE TEMP TABLE session_items (id bigint)")
+	if state.referencesTemporaryDDL("ALTER TABLE public.session_items ADD COLUMN note text") {
+		t.Fatal("qualified durable relation matched an unqualified temporary relation")
+	}
+	state.rememberTemporaryDDL("DROP TABLE public.session_items")
+	if !state.referencesTemporaryDDL("ALTER TABLE session_items ADD COLUMN note text") {
+		t.Fatal("qualified drop removed the unqualified temporary relation")
+	}
+	state.rememberTemporaryDDL("DROP TABLE pg_temp.session_items")
+	if state.referencesTemporaryDDL("ALTER TABLE session_items ADD COLUMN note text") {
+		t.Fatal("pg_temp-qualified drop left the temporary relation tracked")
+	}
+}
+
+func TestTemporaryRelationStateFollowsTransactionLifecycle(t *testing.T) {
+	state := extendedState{}
+	state.applySuccessfulSQLState("CREATE TEMP TABLE existing_items (id bigint)")
+	state.applySuccessfulSQLState("BEGIN; DROP TABLE existing_items; CREATE TEMP TABLE rolled_back_items (id bigint); ROLLBACK")
+	if !state.referencesTemporaryDDL("ALTER TABLE existing_items ADD COLUMN note text") {
+		t.Fatal("transaction rollback did not restore a dropped temporary relation")
+	}
+	if state.referencesTemporaryDDL("ALTER TABLE rolled_back_items ADD COLUMN note text") {
+		t.Fatal("transaction rollback retained a created temporary relation")
+	}
+
+	state.applySuccessfulSQLState("BEGIN; SAVEPOINT before_rename; ALTER TABLE existing_items RENAME TO renamed_items")
+	if !state.referencesTemporaryDDL("ALTER TABLE renamed_items ADD COLUMN note text") {
+		t.Fatal("temporary relation rename was not tracked")
+	}
+	state.applySuccessfulSQLState("ROLLBACK TO SAVEPOINT before_rename; COMMIT")
+	if !state.referencesTemporaryDDL("ALTER TABLE existing_items ADD COLUMN note text") || state.referencesTemporaryDDL("ALTER TABLE renamed_items ADD COLUMN note text") {
+		t.Fatal("savepoint rollback did not restore temporary relation names")
+	}
+
+	state.applySuccessfulSQLState("BEGIN; CREATE TEMP TABLE commit_drop_items (id bigint) ON COMMIT DROP; CREATE TEMP TABLE committed_items (id bigint); COMMIT")
+	if state.referencesTemporaryDDL("ALTER TABLE commit_drop_items ADD COLUMN note text") {
+		t.Fatal("ON COMMIT DROP relation remained tracked after commit")
+	}
+	if !state.referencesTemporaryDDL("ALTER TABLE committed_items ADD COLUMN note text") {
+		t.Fatal("committed temporary relation was not retained")
+	}
+
+	state.applySuccessfulSQLState("DISCARD TEMP")
+	if state.referencesTemporaryDDL("ALTER TABLE committed_items ADD COLUMN note text") || state.referencesTemporaryDDL("ALTER TABLE existing_items ADD COLUMN note text") {
+		t.Fatal("DISCARD TEMP left temporary relations tracked")
 	}
 }
 
