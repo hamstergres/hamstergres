@@ -530,6 +530,128 @@ func operationTotal(snapshot status.Snapshot, operation string) int64 {
 	return total
 }
 
+func TestFleetDDLFailureRollsBackEveryBurrow(t *testing.T) {
+	repoRoot := repositoryRoot(t)
+	ensureDockerBurrows(t, repoRoot)
+	frontendAddress, statusAddress := availableAddress(t), availableAddress(t)
+	logs := startGateway(t, buildGateway(t, repoRoot), writeGatewayConfig(t, frontendAddress, statusAddress))
+	statusURL := "http://" + statusAddress
+	waitForHealthyGateway(t, statusURL, logs)
+
+	suffix := strings.ReplaceAll(gatewayTestKey(frontendAddress), "-", "_")
+	parent := "atomic_parent_" + suffix
+	defaultPartition := "atomic_default_" + suffix
+	overlap := "atomic_overlap_" + suffix
+	after := "atomic_after_" + suffix
+	selected := "atomic_selected_" + suffix
+	dynamicFunction := "atomic_dynamic_" + suffix
+	dynamicTable := "atomic_dynamic_table_" + suffix
+	connection, err := pgconn.Connect(context.Background(), "postgres://any-user@"+frontendAddress+"/any-database?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = connection.Exec(context.Background(), fmt.Sprintf("DROP FUNCTION IF EXISTS %s(); DROP TABLE IF EXISTS %s, %s, %s, %s CASCADE", dynamicFunction, dynamicTable, selected, after, parent)).ReadAll()
+		_ = connection.Close(context.Background())
+	})
+
+	for _, setup := range []string{
+		fmt.Sprintf("CREATE TABLE %s (value integer) PARTITION BY RANGE (value)", parent),
+		fmt.Sprintf("CREATE TABLE %s PARTITION OF %s DEFAULT", defaultPartition, parent),
+		fmt.Sprintf("INSERT INTO %s VALUES (5)", parent),
+	} {
+		if _, err := connection.Exec(context.Background(), setup).ReadAll(); err != nil {
+			t.Fatalf("prepare data-dependent partition DDL: %v\ngateway logs:\n%s", err, logs.String())
+		}
+	}
+	before := gatewaySnapshot(t, statusURL+"/api/v1/status")
+
+	failingDDL := fmt.Sprintf("CREATE TABLE %s PARTITION OF %s FOR VALUES FROM (0) TO (10)", overlap, parent)
+	postgresError := postgresExecError(t, connection, failingDDL)
+	if postgresError.Code != "23514" || strings.Contains(postgresError.Message, "burrow-") {
+		t.Fatalf("data-dependent DDL error = %#v, want topology-free check violation", postgresError)
+	}
+	afterFailure := gatewaySnapshot(t, statusURL+"/api/v1/status")
+	if afterFailure.Sharding.SchemaRevision != before.Sharding.SchemaRevision || afterFailure.Sharding.TopologyRevision != before.Sharding.TopologyRevision {
+		t.Fatalf("rejected DDL advanced registry revisions from schema/topology %d/%d to %d/%d", before.Sharding.SchemaRevision, before.Sharding.TopologyRevision, afterFailure.Sharding.SchemaRevision, afterFailure.Sharding.TopologyRevision)
+	}
+
+	for _, port := range []string{"5541", "5542"} {
+		direct, err := pgx.Connect(context.Background(), "postgres://hamster:hamster@localhost:"+port+"/hamstergres?sslmode=disable")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var exists bool
+		err = direct.QueryRow(context.Background(), "SELECT to_regclass($1) IS NOT NULL", "public."+overlap).Scan(&exists)
+		direct.Close(context.Background())
+		if err != nil || exists {
+			t.Fatalf("rejected partition exists on Burrow %s: exists=%t err=%v", port, exists, err)
+		}
+	}
+
+	extended, err := pgx.Connect(context.Background(), "postgres://any-user@"+frontendAddress+"/any-database?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = extended.Exec(context.Background(), failingDDL)
+	extended.Close(context.Background())
+	if !errors.As(err, &postgresError) || postgresError.Code != "23514" || strings.Contains(postgresError.Message, "burrow-") {
+		t.Fatalf("extended data-dependent DDL error = %v, want topology-free check violation", err)
+	}
+	afterExtendedFailure := gatewaySnapshot(t, statusURL+"/api/v1/status")
+	if afterExtendedFailure.Sharding.SchemaRevision != before.Sharding.SchemaRevision || afterExtendedFailure.Sharding.TopologyRevision != before.Sharding.TopologyRevision {
+		t.Fatalf("extended rejected DDL advanced registry revisions from schema/topology %d/%d to %d/%d", before.Sharding.SchemaRevision, before.Sharding.TopologyRevision, afterExtendedFailure.Sharding.SchemaRevision, afterExtendedFailure.Sharding.TopologyRevision)
+	}
+	for _, port := range []string{"5541", "5542"} {
+		direct, err := pgx.Connect(context.Background(), "postgres://hamster:hamster@localhost:"+port+"/hamstergres?sslmode=disable")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var exists bool
+		err = direct.QueryRow(context.Background(), "SELECT to_regclass($1) IS NOT NULL", "public."+overlap).Scan(&exists)
+		direct.Close(context.Background())
+		if err != nil || exists {
+			t.Fatalf("extended rejected partition exists on Burrow %s: exists=%t err=%v", port, exists, err)
+		}
+	}
+
+	if _, err := connection.Exec(context.Background(), fmt.Sprintf("CREATE TABLE %s (id bigint)", after)).ReadAll(); err != nil {
+		t.Fatalf("schema registry did not recover after rolled-back DDL: %v\ngateway logs:\n%s", err, logs.String())
+	}
+	if _, err := connection.Exec(context.Background(), fmt.Sprintf("SELECT 1 AS id INTO %s", selected)).ReadAll(); err != nil {
+		t.Fatalf("SELECT INTO was not coordinated as fleet DDL: %v\ngateway logs:\n%s", err, logs.String())
+	}
+	for _, port := range []string{"5541", "5542"} {
+		direct, err := pgx.Connect(context.Background(), "postgres://hamster:hamster@localhost:"+port+"/hamstergres?sslmode=disable")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var count int
+		err = direct.QueryRow(context.Background(), fmt.Sprintf("SELECT count(*) FROM %s", selected)).Scan(&count)
+		direct.Close(context.Background())
+		if err != nil || count != 1 {
+			t.Fatalf("SELECT INTO result on Burrow %s: count=%d err=%v", port, count, err)
+		}
+	}
+	dynamicDefinition := fmt.Sprintf("CREATE FUNCTION %s() RETURNS void AS $$ BEGIN EXECUTE 'CREATE TABLE %s (id bigint)'; END $$ LANGUAGE plpgsql", dynamicFunction, dynamicTable)
+	dynamicError := postgresExecError(t, connection, dynamicDefinition)
+	if dynamicError.Code != "0A000" || !strings.Contains(dynamicError.Message, "hamstergres-migrations") {
+		t.Fatalf("function creation error = %#v, want fail-closed 0A000", dynamicError)
+	}
+	for _, port := range []string{"5541", "5542"} {
+		direct, err := pgx.Connect(context.Background(), "postgres://hamster:hamster@localhost:"+port+"/hamstergres?sslmode=disable")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var functionExists, tableExists bool
+		err = direct.QueryRow(context.Background(), "SELECT to_regprocedure($1) IS NOT NULL, to_regclass($2) IS NOT NULL", dynamicFunction+"()", "public."+dynamicTable).Scan(&functionExists, &tableExists)
+		direct.Close(context.Background())
+		if err != nil || functionExists || tableExists {
+			t.Fatalf("rejected function creation mutated Burrow %s: function=%t table=%t err=%v", port, functionExists, tableExists, err)
+		}
+	}
+}
+
 func TestReplicatedUnshardedTablesEndToEnd(t *testing.T) {
 	repoRoot := repositoryRoot(t)
 	ensureDockerBurrows(t, repoRoot)
@@ -1535,6 +1657,20 @@ func TestCrossBurrowTransactionCanDisableTwoPhaseCommit(t *testing.T) {
 	if err := os.WriteFile(configPath, contents, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	setupFrontendAddress, setupStatusAddress := availableAddress(t), availableAddress(t)
+	setupLogs := startGateway(t, binary, writeGatewayConfig(t, setupFrontendAddress, setupStatusAddress))
+	waitForHealthyGateway(t, "http://"+setupStatusAddress, setupLogs)
+	setupConnection, err := pgx.Connect(context.Background(), "postgres://any-user@"+setupFrontendAddress+"/any-database?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := setupConnection.Exec(context.Background(), "DROP TABLE IF EXISTS no_two_pc_e2e; CREATE TABLE no_two_pc_e2e (id bigint PRIMARY KEY, value text); COMMENT ON COLUMN no_two_pc_e2e.id IS 'hamstergres.shard_key'"); err != nil {
+		t.Fatalf("prepare no-2PC table through setup gateway: %v\ngateway logs:\n%s", err, setupLogs.String())
+	}
+	t.Cleanup(func() {
+		_, _ = setupConnection.Exec(context.Background(), "DROP TABLE IF EXISTS no_two_pc_e2e")
+		setupConnection.Close(context.Background())
+	})
 	logs := startGateway(t, binary, configPath)
 	statusURL := "http://" + statusAddress
 	waitForHealthyGateway(t, statusURL, logs)
@@ -1550,12 +1686,6 @@ func TestCrossBurrowTransactionCanDisableTwoPhaseCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer connection.Close(context.Background())
-	if _, err := connection.Exec(context.Background(), "DROP TABLE IF EXISTS no_two_pc_e2e"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := connection.Exec(context.Background(), "CREATE TABLE no_two_pc_e2e (id bigint PRIMARY KEY, value text); COMMENT ON COLUMN no_two_pc_e2e.id IS 'hamstergres.shard_key'"); err != nil {
-		t.Fatal(err)
-	}
 	transaction, err := connection.Begin(context.Background())
 	if err != nil {
 		t.Fatal(err)

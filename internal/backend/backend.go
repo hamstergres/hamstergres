@@ -1286,6 +1286,10 @@ func (m *Manager) RefreshSchema(ctx context.Context) error {
 		m.recordSchemaRefreshFailure(err)
 		return err
 	}
+	if m.schemaUnchanged(registry) {
+		m.RecordOperation("schema_registry_refresh", "success")
+		return nil
+	}
 	if m.registryStore != nil {
 		registry, err = m.registryStore.ReplaceVersioned(ctx, registry)
 		if err != nil {
@@ -1320,6 +1324,12 @@ func (m *Manager) RefreshSchema(ctx context.Context) error {
 	m.schemaMu.Unlock()
 	m.RecordOperation("schema_registry_refresh", "success")
 	return nil
+}
+
+func (m *Manager) schemaUnchanged(registry schema.Registry) bool {
+	m.schemaMu.RLock()
+	defer m.schemaMu.RUnlock()
+	return m.schema.EqualSchema(registry) == nil
 }
 
 func (m *Manager) recordSchemaRefreshFailure(err error) {

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
+	"github.com/jruszo/hamstergres/internal/schema"
 	"github.com/jruszo/hamstergres/internal/statistics"
 )
 
@@ -137,6 +138,20 @@ func TestSchemaMismatchHasDedicatedOperationalSignal(t *testing.T) {
 	operations := m.QueryMetrics().Operations
 	if len(operations) != 2 || operations[0].Operation != "schema_registry_mismatch" || operations[0].Outcome != "detected" {
 		t.Fatalf("operations = %#v", operations)
+	}
+}
+
+func TestSchemaUnchangedIgnoresRoutingProjectionAndRevision(t *testing.T) {
+	manager := &Manager{schema: schema.New(map[string][]string{"accounts": {"tenant_id"}}).
+		WithAllTables([]string{"public.accounts"}).WithRevision(7).
+		WithTableVShards(map[string][]string{"public.accounts": {"burrow-01", "burrow-02"}})}
+	live := schema.New(map[string][]string{"accounts": {"tenant_id"}}).
+		WithAllTables([]string{"public.accounts"})
+	if !manager.schemaUnchanged(live) {
+		t.Fatal("identical live schema was classified as a registry transition")
+	}
+	if manager.schemaUnchanged(live.WithAllTables([]string{"public.accounts", "public.widgets"})) {
+		t.Fatal("changed table inventory was classified as unchanged")
 	}
 }
 

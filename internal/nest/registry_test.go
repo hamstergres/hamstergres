@@ -62,3 +62,32 @@ func TestVerifyOrSeedSeedsThenRejectsDrift(t *testing.T) {
 		t.Fatal("schema drift was accepted")
 	}
 }
+
+func TestReplaceVersionedSkipsUnchangedRegistryWrite(t *testing.T) {
+	stored, err := json.Marshal(schema.New(map[string][]string{"accounts": {"tenant_id"}}).WithRevision(7))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded := base64.StdEncoding.EncodeToString(stored)
+	putCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/v3/kv/range":
+			_, _ = writer.Write([]byte(`{"kvs":[{"value":"` + encoded + `"}]}`))
+		case "/v3/kv/put":
+			putCount++
+			_, _ = writer.Write([]byte(`{}`))
+		default:
+			writer.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	registry, err := NewRegistryStore(server.URL, "/registry").ReplaceVersioned(t.Context(), schema.New(map[string][]string{"accounts": {"tenant_id"}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if registry.Revision() != 7 || putCount != 0 {
+		t.Fatalf("unchanged replacement revision = %d, writes = %d; want revision 7 and no write", registry.Revision(), putCount)
+	}
+}

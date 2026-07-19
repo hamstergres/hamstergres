@@ -1,0 +1,105 @@
+{
+  "format_version": 1,
+  "postgresql_version": "17.10",
+  "differences": [
+    {
+      "test": "create_function_c",
+      "output_sha256": "c7eb6f7ad61d32a7d935c9f274d43e24ff9a4a0562a30733bdd69b75c5db81a5",
+      "reason": "Hamstergres Proxy intentionally rejects user-defined functions and procedures before they can create unknown fleet-wide side effects."
+    },
+    {
+      "test": "create_role",
+      "output_sha256": "5983537b4884882d9d46f590f84fa3c0306ff4ca99289755e8296c007986d57b",
+      "reason": "Hamstergres Proxy intentionally rejects server-local CREATE DATABASE before backend privilege checks because it cannot guarantee fleet-atomic execution."
+    },
+    {
+      "test": "database",
+      "output_sha256": "df41407f0ae0f1dd2b5e0a1be562e43e5e0010e9cf0d7fec1753932daf5f1bb1",
+      "reason": "Server-local database DDL and ALTER DATABASE SET TABLESPACE cannot be executed failure-atomically across Burrows and are intentionally rejected."
+    },
+    {
+      "test": "encoding",
+      "output_sha256": "ab21b1e94a4628a04db77575956756a67003690131d674af293180debd288bee",
+      "reason": "Hamstergres Proxy intentionally rejects user-defined functions and procedures before they can create unknown fleet-wide side effects."
+    },
+    {
+      "test": "enum",
+      "output_sha256": "341c9941ecf607bd136c53f5d2a433900e2cba2eba017a4576d9c325cb3c5240",
+      "reason": "Hamstergres Proxy intentionally rejects user-defined functions and procedures before they can create unknown fleet-wide side effects."
+    },
+    {
+      "test": "expressions",
+      "output_sha256": "98fe9b0bd11e88c045807096b24b659fdfb8ba458da2768792e3eb2e03392078",
+      "reason": "Hamstergres Proxy intentionally rejects user-defined functions and procedures before they can create unknown fleet-wide side effects."
+    },
+    {
+      "test": "float4",
+      "output_sha256": "ff713ec7b389c37ea21098279d26e547b00f69dfead283fb58cbad72fa0b0cee",
+      "reason": "The bit-pattern tests require user-defined internal-language functions, which Hamstergres Proxy intentionally rejects."
+    },
+    {
+      "test": "float8",
+      "output_sha256": "5287af0d5177c0e6b1b9790c00143247ef278e6180fff6f6c1efbed1d4be0b8e",
+      "reason": "The bit-pattern tests require user-defined internal-language functions, which Hamstergres Proxy intentionally rejects."
+    },
+    {
+      "test": "infinite_recurse",
+      "output_sha256": "38c5fab6b287855f8a5028439a3cd989f87c2ab12bb43064dbe5dc14b673b028",
+      "reason": "Hamstergres Proxy intentionally rejects user-defined functions and procedures before they can create unknown fleet-wide side effects."
+    },
+    {
+      "test": "insert_conflict",
+      "output_sha256": "862ca402ebf13fe1bbab07a8a5f19d17251d14cadd3124602b57785ab0909622",
+      "reason": "Hamstergres Proxy intentionally rejects user-defined functions and procedures before they can create unknown fleet-wide side effects."
+    },
+    {
+      "test": "interval",
+      "output_sha256": "876d44cb289fb5dbe7a9ab4a0da2f9e5c69fd3a225f6304a8120366784db3309",
+      "reason": "Hamstergres Proxy intentionally rejects user-defined functions and procedures before they can create unknown fleet-wide side effects."
+    },
+    {
+      "test": "multirangetypes",
+      "output_sha256": "4f9359835c38757e98413540ced49cdb7c8b537e277663aeeedcff9aca6db4b5",
+      "reason": "Hamstergres Proxy intentionally rejects user-defined functions and procedures before they can create unknown fleet-wide side effects."
+    },
+    {
+      "test": "opr_sanity",
+      "output_sha256": "1580f09deba47761996a3caee6f51acef2d4a90a9fb0e09a63297eb5efeba256",
+      "reason": "This test depends on helper functions rejected during the shared PostgreSQL test setup."
+    },
+    {
+      "test": "random",
+      "output_sha256": "9579ebeb253a8d71d8af0683f5d842465f3153b4f77003c8891698539d874d34",
+      "reason": "The distribution checks require user-defined PL/pgSQL helper functions, which Hamstergres Proxy intentionally rejects."
+    },
+    {
+      "test": "test_setup",
+      "output_sha256": "9acaff1275579d07bf167176ec008cd3c6cee0de9fdc3e697436d42122b3a6dd",
+      "reason": "PostgreSQL's shared regression setup creates a server-local tablespace and helper functions that Hamstergres Proxy intentionally rejects."
+    },
+    {
+      "test": "txid",
+      "output_sha256": "5027c3b813189bf8158bcbaa28188af8d7b304d9d0d15ca4170e72ff7af5795d",
+      "reason": "Hamstergres Proxy intentionally rejects the user-defined helper function used by the future transaction ID checks.",
+      "normalizations": [
+        {
+          "pattern": "(?m)^LINE 1: SELECT test_future_xid_status\\([0-9]+ \\+ 10000\\);$",
+          "replacement": "LINE 1: SELECT test_future_xid_status(<xid> + 10000);",
+          "expected_matches": 1
+        }
+      ]
+    },
+    {
+      "test": "xid",
+      "output_sha256": "b130e523ef0f9bfea19139a556193afa8f7b0a422e175115bbf5310fedbd7db3",
+      "reason": "Hamstergres Proxy intentionally rejects the user-defined helper function used by the future transaction ID checks.",
+      "normalizations": [
+        {
+          "pattern": "(?m)^LINE 1: SELECT test_future_xid_status\\(\\([0-9]+ \\+ 10000\\)::text::xid8\\);$",
+          "replacement": "LINE 1: SELECT test_future_xid_status((<xid> + 10000)::text::xid8);",
+          "expected_matches": 1
+        }
+      ]
+    }
+  ]
+}

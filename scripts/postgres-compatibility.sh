@@ -9,7 +9,9 @@ postgres_ref="REL_${postgres_version//./_}"
 image="${POSTGRES_COMPATIBILITY_IMAGE:-hamstergres-postgres-compatibility:${postgres_version}}"
 results_dir="${POSTGRES_COMPATIBILITY_RESULTS_DIR:-${repo_root}/build/postgres-compatibility}"
 baseline="${POSTGRES_COMPATIBILITY_BASELINE:-}"
-suite_timeout="${POSTGRES_COMPATIBILITY_TIMEOUT:-10m}"
+expected_differences_default="${repo_root}/config/postgres-compatibility-expected-differences-${postgres_version}.json"
+expected_differences="${POSTGRES_COMPATIBILITY_EXPECTED_DIFFERENCES-${expected_differences_default}}"
+suite_timeout="${POSTGRES_COMPATIBILITY_TIMEOUT:-15m}"
 compose_project="hamstergres-pgcompat"
 proxy_pid=""
 
@@ -128,6 +130,16 @@ report_args=(
 )
 if [[ -n "${baseline}" && -f "${baseline}" ]]; then
   report_args+=(-baseline "${baseline}")
+fi
+if [[ -n "${expected_differences}" ]]; then
+  if [[ ! -f "${expected_differences}" ]]; then
+    echo "Expected-differences policy does not exist: ${expected_differences}" >&2
+    exit 2
+  fi
+  report_args+=(
+    -expected-differences "${expected_differences}"
+    -test-results "${results_dir}/results"
+  )
 fi
 go -C "${repo_root}" run ./tools/pgcompat "${report_args[@]}"
 

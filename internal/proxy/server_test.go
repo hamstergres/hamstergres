@@ -18,6 +18,23 @@ import (
 	"github.com/jruszo/hamstergres/internal/schema"
 )
 
+func TestBeginSchemaCommitMarksBarrierBeforePhysicalCommit(t *testing.T) {
+	server := &Server{}
+	finish := server.beginSchemaCommit(true)
+	if !server.schemaRefreshPending.Load() {
+		t.Fatal("schema refresh barrier was not marked pending")
+	}
+	if server.schemaRefreshMu.TryLock() {
+		server.schemaRefreshMu.Unlock()
+		t.Fatal("schema refresh was not blocked at the physical commit boundary")
+	}
+	finish()
+	if !server.schemaRefreshMu.TryLock() {
+		t.Fatal("schema refresh barrier remained locked after physical commit")
+	}
+	server.schemaRefreshMu.Unlock()
+}
+
 func TestStartupRuntimeParametersPreservePostgreSQLClientSettings(t *testing.T) {
 	startup := &pgproto3.StartupMessage{Parameters: map[string]string{
 		"user":             "hamster",
@@ -136,7 +153,7 @@ func TestPendingExtendedFailureAtSyncEmitsReadyForQuery(t *testing.T) {
 	}}
 	var wire bytes.Buffer
 	frontend := pgproto3.NewBackend(bytes.NewReader(nil), &wire)
-	if (&Server{}).flushPendingExtended(frontend, session, &state, true) {
+	if (&Server{backends: manager, twoPhaseCommit: true}).flushPendingExtended(frontend, session, &state, true) {
 		t.Fatal("failed pending request reported success")
 	}
 	if err := frontend.Flush(); err != nil {
@@ -311,7 +328,7 @@ func TestPendingFleetWriteFailureReleasesGateOutsideTransaction(t *testing.T) {
 	}
 	state := extendedState{pending: fleetWritePending(), statements: make(map[string]statementState), portals: make(map[string]portalState)}
 	frontend := pgproto3.NewBackend(bytes.NewReader(nil), io.Discard)
-	if (&Server{}).flushPendingExtended(frontend, session, &state, true) {
+	if (&Server{backends: manager, twoPhaseCommit: true}).flushPendingExtended(frontend, session, &state, true) {
 		t.Fatal("failed pending fleet write reported success")
 	}
 
@@ -339,7 +356,7 @@ func TestPendingFleetWriteFailurePreservesGateDuringTransaction(t *testing.T) {
 	}
 	state := extendedState{transaction: true, pending: fleetWritePending(), statements: make(map[string]statementState), portals: make(map[string]portalState)}
 	frontend := pgproto3.NewBackend(bytes.NewReader(nil), io.Discard)
-	if (&Server{}).flushPendingExtended(frontend, session, &state, true) {
+	if (&Server{backends: manager, twoPhaseCommit: true}).flushPendingExtended(frontend, session, &state, true) {
 		t.Fatal("failed pending fleet write reported success")
 	}
 
@@ -481,6 +498,112 @@ func TestNormalizeDDLMarksDropAsSchemaChange(t *testing.T) {
 	}
 }
 
+func TestNormalizeDDLMarksSelectIntoAsSchemaChange(t *testing.T) {
+	got, err := normalizeDDL("SELECT 1 AS id INTO created_from_select")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.schema {
+		t.Fatalf("normalized SELECT INTO = %#v, want schema DDL", got)
+	}
+}
+
+func TestExplainAnalyzeCTASRequiresAtomicFleetDDL(t *testing.T) {
+	for _, sql := range []string{
+		"EXPLAIN ANALYZE CREATE TABLE explained_items AS SELECT 1 AS id",
+		"EXPLAIN (ANALYZE true, COSTS off) CREATE TABLE explained_items AS SELECT 1 AS id",
+	} {
+		normalized, err := normalizeDDL(sql)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !normalized.schema {
+			t.Fatalf("normalizeDDL(%q) did not mark executing CTAS as schema DDL", sql)
+		}
+		if !requiresFleetWriteOrder(sql, 2) {
+			t.Fatalf("requiresFleetWriteOrder(%q) = false, want true", sql)
+		}
+		if err := (&Server{}).validateAtomicFleetDDL(sql, 2); err == nil {
+			t.Fatalf("validateAtomicFleetDDL(%q) accepted execution without two-phase commit", sql)
+		}
+	}
+
+	for _, sql := range []string{
+		"EXPLAIN CREATE TABLE explained_items AS SELECT 1 AS id",
+		"EXPLAIN (ANALYZE false) CREATE TABLE explained_items AS SELECT 1 AS id",
+	} {
+		normalized, err := normalizeDDL(sql)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if normalized.schema {
+			t.Fatalf("normalizeDDL(%q) marked non-executing EXPLAIN as schema DDL", sql)
+		}
+		if requiresFleetWriteOrder(sql, 2) {
+			t.Fatalf("requiresFleetWriteOrder(%q) = true, want false", sql)
+		}
+	}
+}
+
+func TestValidateTransactionalFleetDDLRejectsUnsafeCommands(t *testing.T) {
+	for _, sql := range []string{
+		"CREATE DATABASE application",
+		"DROP DATABASE application",
+		"CREATE TABLESPACE fast LOCATION '/srv/postgres'",
+		"ALTER SYSTEM SET work_mem = '64MB'",
+		"CREATE INDEX CONCURRENTLY accounts_balance_idx ON accounts (balance)",
+		"DROP INDEX CONCURRENTLY accounts_balance_idx",
+		"CREATE FUNCTION widget_count() RETURNS bigint LANGUAGE SQL AS $$ SELECT count(*) FROM widgets $$",
+		"CREATE PROCEDURE refresh_widgets() LANGUAGE SQL AS $$ SELECT 1 $$",
+		"BEGIN; CREATE TABLE widgets (id bigint); COMMIT",
+	} {
+		if err := validateTransactionalFleetDDL(sql); err == nil {
+			t.Fatalf("validateTransactionalFleetDDL(%q) accepted unsafe fleet DDL", sql)
+		}
+	}
+}
+
+func TestValidateTransactionalFleetDDLAllowsTransactionalSchemaChanges(t *testing.T) {
+	for _, sql := range []string{
+		"CREATE TABLE widgets (id bigint)",
+		"ALTER TABLE widgets ADD COLUMN name text",
+		"CREATE INDEX widgets_name_idx ON widgets (name)",
+		"COMMENT ON TABLE widgets IS 'application data'",
+		"TRUNCATE widgets",
+		"DROP TABLE widgets",
+	} {
+		if err := validateTransactionalFleetDDL(sql); err != nil {
+			t.Fatalf("validateTransactionalFleetDDL(%q): %v", sql, err)
+		}
+	}
+}
+
+func TestAtomicFleetDDLRequiresTwoPhaseCommit(t *testing.T) {
+	server := &Server{}
+	if err := server.validateAtomicFleetDDL("CREATE FUNCTION hidden_write() RETURNS void LANGUAGE SQL AS $$ SELECT 1 $$", 1); err == nil || err.Error() != "user-defined functions and procedures are not supported across Burrows; use hamstergres-migrations" {
+		t.Fatalf("function validation error = %v", err)
+	}
+	if err := server.validateAtomicFleetDDL("CREATE TABLE widgets (id bigint)", 2); err == nil {
+		t.Fatal("multi-Burrow DDL was accepted with two-phase commit disabled")
+	}
+	if err := server.validateAtomicFleetDDL("CREATE TABLE widgets (id bigint)", 1); err != nil {
+		t.Fatalf("single-Burrow DDL unexpectedly required two-phase commit: %v", err)
+	}
+}
+
+func TestAtomicFleetDDLRejectsServerLocalDDLBeforeFleetOrdering(t *testing.T) {
+	server := &Server{twoPhaseCommit: true}
+	for _, sql := range []string{
+		"CREATE DATABASE isolated_database",
+		"CREATE TABLESPACE regress_tblspace LOCATION ''",
+		"ALTER SYSTEM SET work_mem = '64MB'",
+	} {
+		if err := server.validateAtomicFleetDDL(sql, 2); err == nil || err.Error() != "non-transactional fleet-wide DDL is not supported; use hamstergres-migrations" {
+			t.Fatalf("validateAtomicFleetDDL(%q) error = %v", sql, err)
+		}
+	}
+}
+
 func TestMergedCommandTagCountsSelectRows(t *testing.T) {
 	got := mergedCommandTag([]string{"SELECT 1", "SELECT 1"}, 2)
 	if got != "SELECT 2" {
@@ -512,6 +635,7 @@ func TestMergedCommandTagKeepsUniformCommands(t *testing.T) {
 func TestRequiresFleetWriteOrderForSchemaStatements(t *testing.T) {
 	for _, sql := range []string{
 		"CREATE TABLE sbtest1 (id int primary key)",
+		"SELECT 1 AS id INTO created_from_select",
 		"ALTER TABLE sbtest1 ADD COLUMN extra int",
 		"COMMENT ON COLUMN sbtest1.id IS 'hamstergres.shard_key'",
 		"DROP TABLE sbtest1",
@@ -528,6 +652,12 @@ func TestRequiresFleetWriteOrderForSchemaStatements(t *testing.T) {
 
 func TestRequiresFleetWriteOrderLeavesDMLReadsAndTransactionsUnlocked(t *testing.T) {
 	for _, sql := range []string{
+		"CREATE TEMP TABLE session_items (id bigint)",
+		"SELECT 1 AS id INTO TEMP TABLE session_items_from_select",
+		"CREATE TABLESPACE regress_tblspace LOCATION ''",
+		"DROP TABLESPACE regress_tblspace",
+		"CREATE DATABASE isolated_database",
+		"ALTER SYSTEM SET work_mem = '64MB'",
 		"INSERT INTO sbtest1 (id, k) VALUES ($1, $2)",
 		" /* sysbench */ update sbtest1 set k = k + 1 where id = $1",
 		"-- generated\ndelete from sbtest1 where id = $1",
@@ -544,6 +674,134 @@ func TestRequiresFleetWriteOrderLeavesDMLReadsAndTransactionsUnlocked(t *testing
 	}
 }
 
+func TestRequiresFleetWriteOrderClassifiesMixedBatchesPerStatement(t *testing.T) {
+	if !requiresFleetWriteOrder("CREATE TEMP TABLE session_items (id bigint); CREATE TABLE durable_items (id bigint)", 2) {
+		t.Fatal("temporary statement hid durable fleet DDL from ordering")
+	}
+	state := extendedState{}
+	temporary, err := state.validateAtomicFleetDDL(&Server{twoPhaseCommit: true}, "CREATE TEMP TABLE session_items (id bigint); ALTER TABLE session_items ADD COLUMN note text", 2)
+	if err != nil || !temporary {
+		t.Fatalf("wholly temporary batch classification = temporary %t, error %v", temporary, err)
+	}
+	temporary, err = state.validateAtomicFleetDDL(&Server{twoPhaseCommit: true}, "CREATE TEMP TABLE commit_drop_items (id bigint) ON COMMIT DROP; ALTER TABLE commit_drop_items ADD COLUMN note text", 2)
+	if err != nil || !temporary {
+		t.Fatalf("ON COMMIT DROP batch classification = temporary %t, error %v", temporary, err)
+	}
+}
+
+func TestExtendedStateTracksTemporaryRelationsAcrossDropStatements(t *testing.T) {
+	state := extendedState{}
+	create := "CREATE TEMP TABLE session_items (id bigint)"
+	if !state.referencesTemporaryDDL(create) {
+		t.Fatal("CREATE TEMP TABLE was not recognized as temporary DDL")
+	}
+	state.rememberTemporaryDDL(create)
+	if !state.referencesTemporaryDDL("ALTER TABLE session_items ADD COLUMN note text") {
+		t.Fatal("ALTER TABLE of a tracked temporary relation was not recognized as temporary DDL")
+	}
+	drop := "DROP TABLE session_items"
+	if !state.referencesTemporaryDDL(drop) {
+		t.Fatal("DROP TABLE of a tracked temporary relation was not recognized as temporary DDL")
+	}
+	state.rememberTemporaryDDL(drop)
+	if state.referencesTemporaryDDL(drop) {
+		t.Fatal("dropped temporary relation remained tracked")
+	}
+	if state.referencesTemporaryDDL("DROP TABLE permanent_items") {
+		t.Fatal("permanent relation was recognized as temporary DDL")
+	}
+	createAs := "CREATE TEMP TABLE selected_items AS SELECT 1 AS id"
+	state.rememberTemporaryDDL(createAs)
+	if !state.referencesTemporaryDDL("CREATE INDEX selected_items_id_idx ON selected_items (id)") {
+		t.Fatal("index on a temporary CREATE TABLE AS relation was not recognized as temporary DDL")
+	}
+}
+
+func TestExtendedStateRejectsMixedTemporaryAndDurableDDL(t *testing.T) {
+	state := extendedState{}
+	server := &Server{twoPhaseCommit: true}
+	for _, sql := range []string{
+		"CREATE TEMP TABLE session_items (id bigint); CREATE TABLE durable_items (id bigint)",
+		"CREATE TEMP TABLE session_items (id bigint); CREATE FUNCTION hidden_write() RETURNS void LANGUAGE SQL AS $$ SELECT 1 $$",
+	} {
+		if _, err := state.validateAtomicFleetDDL(server, sql, 2); err == nil {
+			t.Fatalf("mixed batch %q was accepted", sql)
+		}
+	}
+
+	state.rememberTemporaryDDL("CREATE TEMP TABLE session_items (id bigint)")
+	if _, err := state.validateAtomicFleetDDL(server, "ALTER TABLE session_items ADD COLUMN note text; CREATE FUNCTION hidden_write() RETURNS void LANGUAGE SQL AS $$ SELECT 1 $$", 2); err == nil {
+		t.Fatal("tracked temporary DDL hid a following function definition")
+	}
+	for _, sql := range []string{
+		"CREATE TABLE durable_copy AS SELECT * FROM session_items",
+		"CREATE TABLE durable_like (LIKE session_items INCLUDING ALL)",
+	} {
+		if _, err := state.validateAtomicFleetDDL(server, sql, 2); err == nil {
+			t.Fatalf("durable DDL reading a tracked temporary relation was accepted: %q", sql)
+		}
+	}
+	for _, sql := range []string{
+		"CREATE TEMP TABLE temporary_copy AS SELECT * FROM session_items",
+		"CREATE TEMP TABLE temporary_like (LIKE session_items INCLUDING ALL)",
+	} {
+		temporary, err := state.validateAtomicFleetDDL(server, sql, 2)
+		if err != nil || !temporary {
+			t.Fatalf("temporary target %q = temporary %t, error %v", sql, temporary, err)
+		}
+	}
+}
+
+func TestTemporaryRelationMatchingRespectsSchemaQualification(t *testing.T) {
+	state := extendedState{}
+	state.rememberTemporaryDDL("CREATE TEMP TABLE session_items (id bigint)")
+	if state.referencesTemporaryDDL("ALTER TABLE public.session_items ADD COLUMN note text") {
+		t.Fatal("qualified durable relation matched an unqualified temporary relation")
+	}
+	state.rememberTemporaryDDL("DROP TABLE public.session_items")
+	if !state.referencesTemporaryDDL("ALTER TABLE session_items ADD COLUMN note text") {
+		t.Fatal("qualified drop removed the unqualified temporary relation")
+	}
+	state.rememberTemporaryDDL("DROP TABLE pg_temp.session_items")
+	if state.referencesTemporaryDDL("ALTER TABLE session_items ADD COLUMN note text") {
+		t.Fatal("pg_temp-qualified drop left the temporary relation tracked")
+	}
+}
+
+func TestTemporaryRelationStateFollowsTransactionLifecycle(t *testing.T) {
+	state := extendedState{}
+	state.applySuccessfulSQLState("CREATE TEMP TABLE existing_items (id bigint)")
+	state.applySuccessfulSQLState("BEGIN; DROP TABLE existing_items; CREATE TEMP TABLE rolled_back_items (id bigint); ROLLBACK")
+	if !state.referencesTemporaryDDL("ALTER TABLE existing_items ADD COLUMN note text") {
+		t.Fatal("transaction rollback did not restore a dropped temporary relation")
+	}
+	if state.referencesTemporaryDDL("ALTER TABLE rolled_back_items ADD COLUMN note text") {
+		t.Fatal("transaction rollback retained a created temporary relation")
+	}
+
+	state.applySuccessfulSQLState("BEGIN; SAVEPOINT before_rename; ALTER TABLE existing_items RENAME TO renamed_items")
+	if !state.referencesTemporaryDDL("ALTER TABLE renamed_items ADD COLUMN note text") {
+		t.Fatal("temporary relation rename was not tracked")
+	}
+	state.applySuccessfulSQLState("ROLLBACK TO SAVEPOINT before_rename; COMMIT")
+	if !state.referencesTemporaryDDL("ALTER TABLE existing_items ADD COLUMN note text") || state.referencesTemporaryDDL("ALTER TABLE renamed_items ADD COLUMN note text") {
+		t.Fatal("savepoint rollback did not restore temporary relation names")
+	}
+
+	state.applySuccessfulSQLState("BEGIN; CREATE TEMP TABLE commit_drop_items (id bigint) ON COMMIT DROP; CREATE TEMP TABLE committed_items (id bigint); COMMIT")
+	if state.referencesTemporaryDDL("ALTER TABLE commit_drop_items ADD COLUMN note text") {
+		t.Fatal("ON COMMIT DROP relation remained tracked after commit")
+	}
+	if !state.referencesTemporaryDDL("ALTER TABLE committed_items ADD COLUMN note text") {
+		t.Fatal("committed temporary relation was not retained")
+	}
+
+	state.applySuccessfulSQLState("DISCARD TEMP")
+	if state.referencesTemporaryDDL("ALTER TABLE committed_items ADD COLUMN note text") || state.referencesTemporaryDDL("ALTER TABLE existing_items ADD COLUMN note text") {
+		t.Fatal("DISCARD TEMP left temporary relations tracked")
+	}
+}
+
 func TestRecordWriteParticipantsExcludesReadOnlyBurrows(t *testing.T) {
 	state := extendedState{transaction: true, writeParticipants: make(map[string]struct{})}
 	recordWriteParticipants(&state, "SELECT * FROM accounts", []string{"burrow-01", "burrow-02"})
@@ -557,6 +815,12 @@ func TestRecordWriteParticipantsExcludesReadOnlyBurrows(t *testing.T) {
 	}
 	if _, ok := state.writeParticipants["burrow-02"]; !ok || !state.mutated {
 		t.Fatalf("write participants = %#v, mutated = %t", state.writeParticipants, state.mutated)
+	}
+
+	state = extendedState{transaction: true, writeParticipants: make(map[string]struct{})}
+	recordWriteParticipants(&state, "ALTER TABLE accounts ADD COLUMN note text", []string{"burrow-01", "burrow-02"})
+	if len(state.writeParticipants) != 2 || !state.mutated {
+		t.Fatalf("DDL participants = %#v, mutated = %t; want both Burrows", state.writeParticipants, state.mutated)
 	}
 }
 
